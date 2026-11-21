@@ -34,6 +34,11 @@ SamplerState sm0:register(s0);SamplerState sm1:register(s1);SamplerState sm2:reg
 Texture2D tx0:register(t0);Texture2D tx1:register(t1);Texture2D tx2:register(t2);Texture2D tx3:register(t3);
 TextureCube cube0:register(t4);TextureCube cube1:register(t5);TextureCube cube2:register(t6);TextureCube cube3:register(t7);
 Texture3D vol0:register(t8);Texture3D vol1:register(t9);Texture3D vol2:register(t10);Texture3D vol3:register(t11);
+float4 apply_sample_flags(float4 value,uint flags) {
+ if(flags&2) value.a=1;
+ if((flags&1) && value.a==0) discard;
+ return value;
+}
 float4 finish(float4 result) {
  float a=round(saturate(result.a)*255);uint func=controls.w;
  bool accepted=func==0x207 || (func==0x201 && a<alpha.x) || (func==0x202 && a==alpha.x) ||
@@ -98,7 +103,8 @@ void write_alpha(inout R r,uint destination,float v) {
    } \
    if(enabled) sampled=tx##N.Sample(sm##N,uv); \
   } \
-  r.t##N=sampled;if(enabled && mode!=4 && mode!=5 && stages[N].w && sampled.a==0) discard; \
+  if(enabled && mode!=4 && mode!=5) sampled=apply_sample_flags(sampled,stages[N].w); \
+  r.t##N=sampled; \
  } \
 }
 float4 main(P p):SV_Target {
@@ -155,7 +161,7 @@ std::string shader_source(ShaderKind kind) {
             return source+"float4 main(P p):SV_Target {return finish((controls.x&255)?saturate(p.c):max(p.c,0));}";
         const auto sample=kind==ShaderKind::modulate2d?"tx0.Sample(sm0,p.t0.xy/p.t0.w)":
             kind==ShaderKind::modulate_cube?"cube0.Sample(sm0,p.t0.xyz)":"vol0.Sample(sm0,p.t0.xyz/p.t0.w)";
-        return source+std::format("float4 main(P p):SV_Target {{float4 t={};if(stages[0].w && t.a==0) discard;return finish(saturate(max(p.c,0)*t));}}",sample);
+        return source+std::format("float4 main(P p):SV_Target {{float4 t=apply_sample_flags({},stages[0].w);return finish(saturate(max(p.c,0)*t));}}",sample);
     }
     if(kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8)
         return std::format("#define COMBINER_COUNT {}\n",unsigned(kind)-unsigned(ShaderKind::combiner0))+std::string(combiner_source);

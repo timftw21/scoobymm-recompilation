@@ -54,7 +54,7 @@ struct RenderState {
     std::array<std::uint32_t, 4> textures{}, texture_modes{}; // NV097 texture shader modes.
     std::array<std::uint32_t, 4> texture_sources{}, texture_clip{};
     std::array<std::uint32_t, 4> texture_address{0x030303, 0x030303, 0x030303, 0x030303};
-    std::array<bool, 4> linear_filter{}, alpha_kill{};
+    std::array<bool, 4> linear_filter{}, alpha_kill{}, texture_alpha_one{};
     std::uint32_t combiner_control = 0;
     std::array<std::uint32_t, 8> color_inputs{}, alpha_inputs{}, color_outputs{}, alpha_outputs{};
     std::array<std::uint32_t, 8> factor0{}, factor1{};
@@ -122,6 +122,7 @@ public:
     void launch_program(std::uint32_t program, VertexConstants&, const ProgramVertex&);
     void begin(std::uint32_t argb = 0xFF000000, float depth = 1, bool clear_target = true);
     void clear(std::uint32_t argb, float depth = 1);
+    void clear_color(std::uint32_t target,std::uint32_t argb);
     void clear_buffers(std::uint32_t flags,std::uint32_t argb,float depth,std::uint8_t stencil,
                        std::span<const std::int32_t> rectangle={});
     void clear_stencil(std::uint8_t value = 0);

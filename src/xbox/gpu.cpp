@@ -6,6 +6,7 @@
 #include <chrono>
 #include <deque>
 #include <map>
+#include <optional>
 #include <tuple>
 
 namespace xbox_native {
@@ -45,8 +46,15 @@ struct Gpu::Impl {
     };
     std::vector<Draw> draws;
     unsigned draw_count=0;
-    struct Surface {std::uint32_t identifier,width,height;};
-    std::map<std::array<std::uint32_t,4>,Surface> targets;
+    using SurfaceKey = std::array<std::uint32_t,4>;
+    struct ColorClear {SurfaceKey key; std::uint32_t width,height,argb;};
+    struct Surface {
+        std::uint32_t identifier,width,height;
+        std::optional<ColorClear>* color_clear;
+    };
+    using Targets = std::map<SurfaceKey,Surface>;
+    Targets targets;
+    std::map<std::uint32_t,std::optional<ColorClear>> color_clears;
     std::map<std::array<std::uint64_t,6>,std::uint32_t> textures;
     struct Fence {ComPtr<ID3D11Query> query;std::uint32_t address=0,value=0;};
     std::array<Fence,64> fences;
@@ -81,15 +89,25 @@ struct Gpu::Impl {
         } catch(...) {renderer.end();draw_count=0;throw;}
         renderer.end();draw_count=0;
     }
-    static bool same_color(const std::array<std::uint32_t,4>& a,const std::array<std::uint32_t,4>& b) {
+    static bool same_color(const SurfaceKey& a,const SurfaceKey& b) {
         return a[0]==b[0] && (a[2]&~255U)==(b[2]&~255U) && ((a[2]&15)==3)==((b[2]&15)==3) &&
             (a[3]&0xFFFF)==(b[3]&0xFFFF);
     }
-    void grow_color(const std::array<std::uint32_t,4>& key,Surface& surface,std::uint32_t width,std::uint32_t height) {
+    static bool packed_color(const SurfaceKey& key,std::uint32_t width,std::uint32_t height) {
+        const auto bytes_per_pixel=(key[2]&15)==3?2U:4U;
+        return !(key[2]&0xF000) && std::has_single_bit(width) && std::has_single_bit(height) &&
+            ((key[2]&0xF00)==0x200 || (key[3]&0xFFFF)==width*bytes_per_pixel);
+    }
+    static bool matches_clear_alias(const SurfaceKey& key,const ColorClear& clear,std::uint32_t width,std::uint32_t height) {
+        return key[0]==clear.key[0] && ((key[2]^clear.key[2])&0xF00) && (key[2]&15)==(clear.key[2]&15) &&
+            width==clear.width && height==clear.height && packed_color(key,width,height);
+    }
+    void grow_color(const SurfaceKey& key,Surface& surface,std::uint32_t width,std::uint32_t height) {
         flush();renderer.grow_target(surface.identifier,width,height);
+        surface.color_clear->reset();
         for(auto& [other,image]:targets) if(same_color(key,other)) {image.width=width;image.height=height;}
     }
-    void select_target() {
+    const Targets::value_type& select_target() {
         const auto horizontal=reg(0x200),vertical=reg(0x204);
         const auto clip_width=horizontal>>16,clip_height=vertical>>16;
         if(!clip_width || !clip_height)
@@ -110,18 +128,47 @@ struct Gpu::Impl {
             for(const auto& [other,image]:targets) if(same_color(key,other) && image.width==width && image.height==height) {
                 shared=image.identifier;break;
             }
-            flush();found=targets.emplace(key,Surface{renderer.create_target(width,height,color==3?SurfaceColor::rgb565:SurfaceColor::rgba8,
-                zeta==1?SurfaceDepth::z16:SurfaceDepth::z24s8,shared),width,height}).first;
+            flush();
+            auto& clear=color_clears[key[0]];
+            const auto id=renderer.create_target(width,height,color==3?SurfaceColor::rgb565:SurfaceColor::rgba8,
+                zeta==1?SurfaceDepth::z16:SurfaceDepth::z24s8,shared);
+            if(shared==UINT32_MAX && clear && matches_clear_alias(key,*clear,width,height)) renderer.clear_color(id,clear->argb);
+            found=targets.emplace(key,Surface{id,width,height,&clear}).first;
         } else if(width>found->second.width || height>found->second.height) {
             flush();auto& surface=found->second;
             const auto w=std::max(width,surface.width),h=std::max(height,surface.height);
             grow_color(key,surface,w,h);
         }
         if(target!=found->second.identifier) {flush();target=found->second.identifier;renderer.set_target(target);}
+        return *found;
     }
-    std::uint32_t texture(unsigned stage,ProgramView& view) {
+    void clear_surface(std::uint32_t flags) {
+        flush();
+        const auto& [key,surface]=select_target();
+        const auto h=reg(0x1D98),v=reg(0x1D9C);
+        const std::array<std::int32_t,4> rectangle{std::int32_t(h&0xFFFF),std::int32_t(v&0xFFFF),
+            std::int32_t((h>>16)+1),std::int32_t((v>>16)+1)};
+        const auto value=reg(0x1D8C),argb=reg(0x1D90);
+        const auto depth=((key[2]>>4)&15)==1?value&0xFFFF:value>>8;
+        renderer.clear_buffers(flags,argb,float(depth)/depth_max(),static_cast<std::uint8_t>(value),rectangle);
+        ++statistics.clears;
+
+        if(!(flags&0xF0)) return;
+        auto& clear=*surface.color_clear;
+        clear.reset();
+        // A full clear of packed VRAM has the same color in either layout.
+        if((flags&0xF0)!=0xF0 || rectangle[0] || rectangle[1] || rectangle[2]<static_cast<std::int32_t>(surface.width) ||
+            rectangle[3]<static_cast<std::int32_t>(surface.height) || !packed_color(key,surface.width,surface.height)) return;
+        clear=ColorClear{key,surface.width,surface.height,argb};
+        for(auto it=targets.lower_bound(SurfaceKey{key[0]});it!=targets.end() && it->first[0]==key[0];++it) {
+            const auto& [alias,image]=*it;
+            if(matches_clear_alias(alias,*clear,image.width,image.height)) renderer.clear_color(image.identifier,argb);
+        }
+    }
+    std::uint32_t texture(unsigned stage,ProgramView& view,bool& alpha_one) {
         const auto method=0x1B00+stage*0x40,format=reg(method+4),image=reg(method+0x1C),pitch=reg(method+0x10)>>16;
         const auto code=(format>>8)&255;
+        const auto texture_format=static_cast<TextureFormat>(code);
         const bool linear=code==0x12 || code==0x1E;
         const auto width=linear?image>>16:1U<<((format>>20)&15),height=linear?image&0xFFFF:1U<<((format>>24)&15);
         const auto depth=((format>>4)&15)==3?1U<<(format>>28):1U;
@@ -137,6 +184,8 @@ struct Gpu::Impl {
             if(key[0]==(reg(method)&0x0FFFFFFF) && surface.width==width && surface.height==height && matching_color &&
                 ((surface_type==1)==linear) && (!linear || (key[3]&0xFFFF)==pitch)) {
                 if(linear) view.texture_scales[stage]={1.0f/width,1.0f/height,1,1};
+                // The native color surface retains alpha even when the guest samples it as RGBX.
+                alpha_one=texture_format==TextureFormat::xrgb8 || texture_format==TextureFormat::xrgb8_linear;
                 return surface.identifier;
             }
         }
@@ -163,7 +212,7 @@ struct Gpu::Impl {
         }
         const std::array<std::uint64_t,6> key{address,format,image,pitch,palette_register,palette_hash};
         auto found=textures.find(key);
-        if(found==textures.end()) found=textures.emplace(key,renderer.upload({width,height,static_cast<TextureFormat>(code),
+        if(found==textures.end()) found=textures.emplace(key,renderer.upload({width,height,texture_format,
             Bytes(static_cast<const std::byte*>(memory.access(address,static_cast<std::size_t>(size))),static_cast<std::size_t>(size)),
             mips,linear?pitch:0,cube,depth,palette})).first;
         if(linear) view.texture_scales[stage]={1.0f/width,1.0f/height,1.0f/depth,1};
@@ -198,7 +247,7 @@ struct Gpu::Impl {
             s.texture_clip[i]=(reg(0x17F8)>>(i*4))&15;s.texture_address[i]=reg(method+8);
             const auto filter=reg(method+0x14);
             s.linear_filter[i]=((filter>>24)&15)==2;s.alpha_kill[i]=(reg(method+12)&4)!=0;
-            if((reg(method+12)&0x40000000U) && s.texture_modes[i]) s.textures[i]=texture(i,view);
+            if((reg(method+12)&0x40000000U) && s.texture_modes[i]) s.textures[i]=texture(i,view,s.texture_alpha_one[i]);
         }
         return s;
     }
@@ -228,11 +277,12 @@ struct Gpu::Impl {
     }
     void draw(std::uint32_t first,std::uint32_t count,std::span<const std::uint32_t> elements={},bool inlined=false) {
         if(!primitive || !count || count>32768 || first>0xFFFFFF-count) throw std::runtime_error("Invalid NV097 draw range");
-        select_target();
+        const auto& surface=select_target().second;
         auto& draw=draws[draw_count];draw.stream_count=0;draw.view={};draw.packed.clear();
         draw.current=current;draw.constants=constants;draw.count=count;
         draw.view.depth_scale=depth_max();
         draw.state=state(draw.view);
+        if (draw.state.color_mask) surface.color_clear->reset();
         const auto mode=reg(0x1E94)&3;
         std::uint32_t shader;
         if(mode==2) shader=renderer.prepare_program(program);
@@ -339,10 +389,11 @@ struct Gpu::Impl {
                 throw std::runtime_error("Initial image blit must define complete rows from the origin");
             const auto color=bpp==2?SurfaceColor::rgb565:SurfaceColor::rgba8;
             const std::array key{destination,0U,bpp==2?0x123U:0x128U,destination_pitch|(destination_pitch<<16)};
-            to=targets.emplace(key,Surface{renderer.create_target(width,height,color),width,height}).first;
+            to=targets.emplace(key,Surface{renderer.create_target(width,height,color),width,height,&color_clears[destination]}).first;
         } else if(dx+width>to->second.width || dy+height>to->second.height)
             grow_color(to->first,to->second,std::max(dx+width,to->second.width),std::max(dy+height,to->second.height));
         renderer.copy_region(to->second.identifier,from->second.identifier,sx,sy,dx,dy,width,height);
+        to->second.color_clear->reset();
         ++statistics.blits;
     }
     void fence(std::uint32_t address,std::uint32_t value) {
@@ -490,14 +541,7 @@ struct Gpu::Impl {
             for(unsigned lane=0;lane<4;++lane) input.attributes[0][lane]=real(reg(0x1E80+lane*4));
             renderer.launch_program(renderer.prepare_program(launch,true),constants,input);
         } else if(method==0x1D94) {
-            flush();select_target();
-            const auto h=reg(0x1D98),v=reg(0x1D9C);
-            const std::array<std::int32_t,4> rectangle{std::int32_t(h&0xFFFF),std::int32_t(v&0xFFFF),
-                std::int32_t((h>>16)+1),std::int32_t((v>>16)+1)};
-            const auto value=reg(0x1D8C),zeta=(reg(0x208)>>4)&15;
-            const auto depth = zeta == 1 ? value & 0xFFFF : value >> 8;
-            renderer.clear_buffers(data,reg(0x1D90),float(depth)/depth_max(),static_cast<std::uint8_t>(value),rectangle);
-            ++statistics.clears;
+            clear_surface(data);
         } else if(method==0x1D70) {
             if(reg(0x1A4)!=8 || reg(0x1D6C)>92) throw std::runtime_error("Unbound NV097 semaphore DMA range");
             fence(semaphore_base+reg(0x1D6C),data);

@@ -981,11 +981,15 @@ void Renderer::launch_program(std::uint32_t program,VertexConstants& constants,c
 void Renderer::clear(std::uint32_t argb, float depth) {
     auto& r = *impl_;
     if (!std::isfinite(depth) || depth < 0 || depth > 1) throw std::runtime_error("Invalid clear depth");
-    const auto rgba = color(argb);
-    r.context->ClearRenderTargetView(r.rtv.Get(), rgba.data());
+    clear_color(r.current_target,argb);
     r.context->ClearDepthStencilView(r.dsv.Get(),D3D11_CLEAR_DEPTH|
         (r.targets.at(r.current_target).depth_format==SurfaceDepth::z16?0:D3D11_CLEAR_STENCIL),depth,0);
     if(!r.recording) r.ended=true;
+}
+void Renderer::clear_color(std::uint32_t target,std::uint32_t argb) {
+    auto& r=*impl_;
+    const auto rgba=color(argb);
+    r.context->ClearRenderTargetView(r.targets.at(target).color_view.Get(),rgba.data());
 }
 void Renderer::clear_buffers(std::uint32_t flags,std::uint32_t argb,float depth,std::uint8_t stencil,
                              std::span<const std::int32_t> rectangle) {
@@ -1016,7 +1020,7 @@ void Renderer::clear_buffers(std::uint32_t flags,std::uint32_t argb,float depth,
         auto buffer=r.clear_constants.Get();r.context->VSSetConstantBuffers(0,1,&buffer);r.context->PSSetConstantBuffers(0,1,&buffer);
         r.context->Draw(3,0);if(!r.recording) r.ended=true;return;
     }
-    if(flags&0xF0U) {const auto rgba=color(argb);r.context->ClearRenderTargetView(r.rtv.Get(),rgba.data());}
+    if(flags&0xF0U) clear_color(r.current_target,argb);
     const auto mask=((flags&1)?D3D11_CLEAR_DEPTH:0)|((flags&2)?D3D11_CLEAR_STENCIL:0);
     if(mask) r.context->ClearDepthStencilView(r.dsv.Get(),mask,depth,stencil);
     if(!r.recording) r.ended=true;
@@ -1154,7 +1158,8 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         if(sampled && r.texture_dimensions[state.textures[i]]!=(mode==3?3U:mode==2?2U:1U))
             throw std::runtime_error("Texture resource dimension does not match its shader mode");
         if(sampled) views[i+(mode==3?4:mode==2?8:0)] = r.textures[state.textures[i]].Get();
-        constants.stages[i]={mode,state.texture_sources[i],state.texture_clip[i],std::uint32_t(state.alpha_kill[i])};
+        const auto sample_flags=std::uint32_t(state.alpha_kill[i]) | (std::uint32_t(state.texture_alpha_one[i])<<1);
+        constants.stages[i]={mode,state.texture_sources[i],state.texture_clip[i],sample_flags};
         samplers[i] = pipeline.samplers[i].Get();
     }
     std::array<UINT,17> stream_offsets{},stream_strides{};
