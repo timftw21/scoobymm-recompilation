@@ -55,7 +55,13 @@ struct Gpu::Impl {
     using Targets = std::map<SurfaceKey,Surface>;
     Targets targets;
     std::map<std::uint32_t,std::optional<ColorClear>> color_clears;
-    std::map<std::array<std::uint64_t,6>,std::uint32_t> textures;
+    struct CachedTexture {
+        std::uint32_t id;
+        std::uint64_t last_draw;
+        std::vector<std::byte> texels, palette;
+    };
+    std::map<std::array<std::uint32_t,5>,CachedTexture> textures;
+    std::uint64_t texture_draw = 0;
     struct Fence {ComPtr<ID3D11Query> query;std::uint32_t address=0,value=0;};
     std::array<Fence,64> fences;
     unsigned fence_head=0,fence_count=0;
@@ -107,6 +113,14 @@ struct Gpu::Impl {
         surface.color_clear->reset();
         for(auto& [other,image]:targets) if(same_color(key,other)) {image.width=width;image.height=height;}
     }
+    void evict_texture(bool assembling_draw) {
+        const auto oldest = std::ranges::min_element(textures,{},[](const auto& item){return item.second.last_draw;});
+        if (oldest == textures.end() || (assembling_draw && oldest->second.last_draw == texture_draw))
+            throw std::runtime_error("Active textures exceed the renderer budget");
+        flush();
+        renderer.release_texture(oldest->second.id);
+        textures.erase(oldest);
+    }
     const Targets::value_type& select_target() {
         const auto horizontal=reg(0x200),vertical=reg(0x204);
         const auto clip_width=horizontal>>16,clip_height=vertical>>16;
@@ -129,6 +143,7 @@ struct Gpu::Impl {
                 shared=image.identifier;break;
             }
             flush();
+            if (!renderer.has_texture_slot()) evict_texture(false);
             auto& clear=color_clears[key[0]];
             const auto id=renderer.create_target(width,height,color==3?SurfaceColor::rgb565:SurfaceColor::rgba8,
                 zeta==1?SurfaceDepth::z16:SurfaceDepth::z24s8,shared);
@@ -198,27 +213,38 @@ struct Gpu::Impl {
             const auto w=std::max(1U,width>>level),h=std::max(1U,height>>level),d=std::max(1U,depth>>level);
             size+=(block?std::uint64_t((w+3)/4)*((h+3)/4)*block:std::uint64_t(linear?pitch:w*bpp)*h)*d;
         }
-        if(cube) size*=6;
+        if(cube) size += 5 * ((size + 127) & ~std::uint64_t(127));
         if(!size || size>64*1024*1024) throw std::runtime_error("NV097 texture payload exceeds its bound");
         const auto address=reg(method)&0x0FFFFFFF;
         const auto palette_register = reg(method+0x20);
         Bytes palette;
-        std::uint64_t palette_hash = 0;
         if (code == 0xB) {
             const auto palette_bytes = 1024U >> ((palette_register >> 2) & 3);
             palette = Bytes(static_cast<const std::byte*>(memory.access(palette_register & 0x0FFFFFC0, palette_bytes)), palette_bytes);
-            palette_hash = 14695981039346656037ULL;
-            for (const auto byte : palette) palette_hash = (palette_hash ^ std::to_integer<unsigned>(byte)) * 1099511628211ULL;
         }
-        const std::array<std::uint64_t,6> key{address,format,image,pitch,palette_register,palette_hash};
+        const std::array key{address,format,image,pitch,palette_register};
+        const Bytes texels(static_cast<const std::byte*>(memory.access(address,size)),static_cast<std::size_t>(size));
         auto found=textures.find(key);
-        if(found==textures.end()) found=textures.emplace(key,renderer.upload({width,height,texture_format,
-            Bytes(static_cast<const std::byte*>(memory.access(address,static_cast<std::size_t>(size))),static_cast<std::size_t>(size)),
-            mips,linear?pitch:0,cube,depth,palette})).first;
+        if (found != textures.end() &&
+            (std::memcmp(found->second.texels.data(),texels.data(),texels.size()) ||
+             !std::ranges::equal(found->second.palette,palette))) {
+            flush();
+            renderer.release_texture(found->second.id);
+            textures.erase(found);
+            found = textures.end();
+        }
+        if (found == textures.end()) {
+            const TextureData data{width,height,texture_format,texels,mips,linear?pitch:0,cube,depth,palette};
+            while (!renderer.can_upload(data)) evict_texture(true);
+            CachedTexture entry{renderer.upload(data),texture_draw,{texels.begin(),texels.end()},{palette.begin(),palette.end()}};
+            found = textures.emplace(key,std::move(entry)).first;
+        }
+        found->second.last_draw = texture_draw;
         if(linear) view.texture_scales[stage]={1.0f/width,1.0f/height,1.0f/depth,1};
-        return found->second;
+        return found->second.id;
     }
     RenderState state(ProgramView& view) {
+        ++texture_draw;
         RenderState s;
         const auto horizontal=reg(0x200),vertical=reg(0x204);
         s.scissor_test=true;s.scissor={std::int32_t(horizontal&0xFFFF),std::int32_t(vertical&0xFFFF),
@@ -245,8 +271,9 @@ struct Gpu::Impl {
             s.texture_modes[i]=(reg(0x1E70)>>(i*5))&31;
             s.texture_sources[i]=i<2?0:(reg(0x1E78)>>(8+i*4))&15;
             s.texture_clip[i]=(reg(0x17F8)>>(i*4))&15;s.texture_address[i]=reg(method+8);
-            const auto filter=reg(method+0x14);
-            s.linear_filter[i]=((filter>>24)&15)==2;s.alpha_kill[i]=(reg(method+12)&4)!=0;
+            s.texture_filter[i]=reg(method+0x14) & 0x0FFF1FFF;
+            s.texture_lod[i]=reg(method+12) & 0x3FFFFFF0;
+            s.alpha_kill[i]=(reg(method+12)&4)!=0;
             if((reg(method+12)&0x40000000U) && s.texture_modes[i]) s.textures[i]=texture(i,view,s.texture_alpha_one[i]);
         }
         return s;
@@ -278,10 +305,12 @@ struct Gpu::Impl {
     void draw(std::uint32_t first,std::uint32_t count,std::span<const std::uint32_t> elements={},bool inlined=false) {
         if(!primitive || !count || count>32768 || first>0xFFFFFF-count) throw std::runtime_error("Invalid NV097 draw range");
         const auto& surface=select_target().second;
-        auto& draw=draws[draw_count];draw.stream_count=0;draw.view={};draw.packed.clear();
+        ProgramView view{};
+        view.depth_scale=depth_max();
+        const auto render_state=state(view);
+        auto& draw=draws[draw_count];draw.stream_count=0;draw.view=view;draw.packed.clear();
         draw.current=current;draw.constants=constants;draw.count=count;
-        draw.view.depth_scale=depth_max();
-        draw.state=state(draw.view);
+        draw.state=render_state;
         if (draw.state.color_mask) surface.color_clear->reset();
         const auto mode=reg(0x1E94)&3;
         std::uint32_t shader;

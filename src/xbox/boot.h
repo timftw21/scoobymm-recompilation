@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iosfwd>
+#include <string_view>
 #include <vector>
 
 namespace xbox_native {
@@ -27,11 +28,14 @@ struct DiagnosticOptions {
 struct PlayOptions {
     std::filesystem::path xbe, disc, shader_cache, capture, storage;
     std::uint32_t capture_index = 1, frames = 0;
+    std::uint32_t language = 1;
     bool hidden = false, fullscreen = false, audio = true, vsync = true;
     InputScript input;
     DiagnosticOptions diagnostics;
 };
 
 int boot_command(int argc, char* argv[]);
+int check_dialogue_stream(const std::filesystem::path& xbe, const std::filesystem::path& disc);
+std::uint32_t xbox_language(std::string_view code);
 int play_game(const PlayOptions&, std::ostream& report);
 }

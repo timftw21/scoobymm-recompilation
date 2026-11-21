@@ -46,6 +46,7 @@ public:
     bool restores = false;
     bool returns = false;
     bool floating = false;
+    bool divide_faults = false;
     std::set<std::uint32_t> loop_headers;
     std::set<std::uint32_t> jump_continuations;
     std::map<std::string,std::string> native_helpers;
@@ -329,6 +330,31 @@ public:
              (ins.attributes & (ZYDIS_ATTRIB_HAS_SEGMENT_FS | ZYDIS_ATTRIB_HAS_SEGMENT_GS))))
             throw std::runtime_error("Instruction prefixes need an implementation");
         body << label(instruction.address) << ": { // " << instruction.text << '\n';
+        // The supported title drains two read buffers through three DirectSound slots.
+        // Its EOF path can see an idle voice while a completed read still awaits submission.
+        if (!relocatable && instruction.address == 0x29445)
+            body << "    if (eax == 1 && memory.load<std::uint8_t>(esi + 0x2F9)) goto i_00029456;\n";
+        if (!relocatable && instruction.address == 0x29473) {
+            // Re-read the current descriptor for every slot, including immediately after a rotation.
+            // The original consumer initializes +AC to capacity, before the first file read completes.
+            body << R"(    const auto bank = memory.load<std::uint32_t>(esi + 0x9C);
+    if (!memory.load<std::uint8_t>(esi + 0x2F9) || !memory.load<std::uint8_t>(esi + 0x38 + bank))
+        goto i_00029490;
+    const auto descriptor = esi + 8 + 24 * bank;
+    const auto length = memory.load<std::uint32_t>(descriptor + 4);
+    const auto consumed = memory.load<std::uint32_t>(esi + 0xA8) - memory.load<std::uint32_t>(descriptor);
+    if (consumed > length) throw NativeBoundary(0x29473, "Stream cursor exceeds the completed read");
+    const bool final_bank = memory.load<std::uint32_t>(esi + 0xD8) == 6 &&
+                            memory.load<std::uint32_t>(esi + 0xA0) == bank;
+    memory.store<std::uint8_t>(esi + 0x2FA, final_bank);
+    memory.store(esi + 0xAC, length - consumed);
+    if (consumed == length && final_bank) {
+        memory.store<std::uint8_t>(esi + 0x38 + bank, 0);
+        memory.store<std::uint8_t>(esi + 0x2F9, 0);
+        goto i_00029490;
+    }
+)";
+        }
         const auto visible = std::span(operands).first(ins.operand_count_visible);
         if (ins.mnemonic != ZYDIS_MNEMONIC_LEA && std::ranges::any_of(visible, [](const auto& operand) {
                 return operand.type == ZYDIS_OPERAND_TYPE_MEMORY && operand.mem.base == ZYDIS_REGISTER_NONE &&
@@ -787,8 +813,12 @@ public:
             const auto dividend = bits == 8 ? read_reg(ZYDIS_REGISTER_AX) :
                 "(std::uint64_t(" + read_reg(bits == 16 ? ZYDIS_REGISTER_DX : ZYDIS_REGISTER_EDX) + ") << " +
                 std::to_string(bits) + ") | " + read_reg(accumulator);
-            body << "    const auto quotient = xbox_native::divide<" << bits << ", "
-                 << (ins.mnemonic == ZYDIS_MNEMONIC_IDIV ? "true" : "false") << ">(" << dividend << ", " << read(operands[0]) << ");\n";
+            divide_faults = calls = restores = true;
+            body << "    xbox_native::Quotient quotient;\n    try { quotient = xbox_native::divide<" << bits << ", "
+                 << (ins.mnemonic == ZYDIS_MNEMONIC_IDIV ? "true" : "false") << ">(" << dividend << ", " << read(operands[0])
+                 << ", " << pc(instruction.address) << "); } catch (const xbox_native::GuestTrap&) {\n"
+                 << "        commit(); xbox_native::dispatch_divide_fault(cpu, memory, " << pc(instruction.address)
+                 << "); restore(); goto resume_fault;\n    }\n";
             ZydisDecodedOperand dest{};
             dest.type = ZYDIS_OPERAND_TYPE_REGISTER;
             dest.reg.value = accumulator;
@@ -957,6 +987,12 @@ LoweredFunction lower(const Function& function) {
         out << "    default: goto " << label(function.entry) << ";\n    }\n";
     } else {
         out << "    goto " << label(function.entry) << ";\n";
+    }
+    if (emitter.divide_faults) {
+        out << "resume_fault:\n    switch (" << (function.relocatable ? "cpu.eip - code_base" : "cpu.eip") << ") {\n";
+        for (const auto& [address, instruction] : function.instructions)
+            out << "    case " << constant(address) << ": goto " << label(address) << ";\n";
+        out << "    default: xbox_native::invoke_native(cpu,memory,cpu.eip); return;\n    }\n";
     }
     out << emitter.body.str();
     if(emitter.returns) {

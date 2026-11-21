@@ -205,6 +205,9 @@ void GuestAudio::complete_packet(Cpu& cpu, Word callback, Word context, const Pa
     if (callback) {
         const std::array arguments{context, packet.context, status};
         call_guest(cpu, callback, arguments);
+    } else if (packet.context) {
+        const std::array arguments{packet.context,0U};
+        call_guest(cpu, 0xFFF00000U + 225 * 16, arguments); // NtSetEvent
     }
 }
 
@@ -418,7 +421,6 @@ bool GuestAudio::invoke(PlatformApi api, Cpu& cpu, std::uint64_t checkpoints) {
         const Packet packet{memory_.load<Word>(input + 4), memory_.load<Word>(input + 8),
                             memory_.load<Word>(input + 12), memory_.load<Word>(input + 16)};
         if (!data || !packet.size) return done(3, invalid_argument);
-        if (!stream.callback && packet.context) throw NativeBoundary(cpu.eip, "Audio stream packet requires event signaling");
         const auto bytes = std::span(static_cast<const std::byte*>(memory_.access(data, packet.size)), packet.size);
         stream.pending.push_back(packet);
         try {

@@ -37,6 +37,7 @@ void usage() {
                  "  Omit both media paths to use this project's verified Xbox files.\n"
                  "  --shader-cache DIR   Cached native shaders\n"
                  "  --storage DIR        Playtest save directory (default data/user)\n"
+                 "  --language en|fr|de   Xbox game language\n"
                  "  --report JSON        New session report\n"
                  "  --frame PNG [--frame-index N]   Save a scanout\n"
                  "  --capture-frame DIR [--capture-at N]   Request an F8 capture after scanout N\n"
@@ -56,7 +57,7 @@ int wmain(int argc, wchar_t* argv[]) {
     if (argc == 2 && std::wstring_view(argv[1]) == L"--help") { usage(); return 0; }
     try {
         xbox_native::PlayOptions options;
-        std::filesystem::path root;
+        const auto root = application_root();
         int next = 1;
         if (argc > 1 && !std::wstring_view(argv[1]).starts_with(L"--")) {
             if (argc < 3 || std::wstring_view(argv[2]).starts_with(L"--")) {
@@ -66,7 +67,6 @@ int wmain(int argc, wchar_t* argv[]) {
             options.disc = argv[2];
             next = 3;
         } else {
-            root = application_root();
             options.xbe = root / "data/local/default.xbe";
             options.disc = root / "Scooby-Doo! Mystery Mayhem/Scooby-Doo! Mystery Mayhem (USA, Europe) (En,Fr,De).xiso.iso";
         }
@@ -106,6 +106,7 @@ int wmain(int argc, wchar_t* argv[]) {
             else if (option == L"--frames") options.frames = nonzero();
             else if (option == L"--shader-cache") options.shader_cache = argument();
             else if (option == L"--storage") options.storage = argument();
+            else if (option == L"--language") options.language = xbox_native::xbox_language(std::filesystem::path(argument()).string());
             else if (option == L"--report") report_path = argument();
             else if (option == L"--frame") options.capture = argument();
             else if (option == L"--frame-index") { options.capture_index = nonzero(); explicit_frame_index = true; }

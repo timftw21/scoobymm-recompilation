@@ -54,7 +54,8 @@ struct RenderState {
     std::array<std::uint32_t, 4> textures{}, texture_modes{}; // NV097 texture shader modes.
     std::array<std::uint32_t, 4> texture_sources{}, texture_clip{};
     std::array<std::uint32_t, 4> texture_address{0x030303, 0x030303, 0x030303, 0x030303};
-    std::array<bool, 4> linear_filter{}, alpha_kill{}, texture_alpha_one{};
+    std::array<std::uint32_t,4> texture_filter{}, texture_lod{};
+    std::array<bool, 4> alpha_kill{}, texture_alpha_one{};
     std::uint32_t combiner_control = 0;
     std::array<std::uint32_t, 8> color_inputs{}, alpha_inputs{}, color_outputs{}, alpha_outputs{};
     std::array<std::uint32_t, 8> factor0{}, factor1{};
@@ -97,6 +98,9 @@ public:
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
     std::uint32_t upload(const TextureData&);
+    bool can_upload(const TextureData&) const;
+    bool has_texture_slot() const;
+    void release_texture(std::uint32_t id);
     std::uint32_t create_target(std::uint32_t width,std::uint32_t height,
                                 SurfaceColor=SurfaceColor::rgba8,SurfaceDepth=SurfaceDepth::z24s8,
                                 std::uint32_t shared_color=UINT32_MAX);

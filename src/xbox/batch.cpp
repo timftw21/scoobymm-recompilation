@@ -7,6 +7,7 @@
 #include "../analysis_map.h"
 
 #include <algorithm>
+#include <fstream>
 #include <format>
 #include <iostream>
 #include <queue>
@@ -379,7 +380,7 @@ LogicIndex logic_records(Disc& disc) {
     return index;
 }
 
-struct GeneratedModules { std::string summary; std::size_t xbr_files{}, object_instances{}; };
+struct GeneratedModules { std::string summary; std::size_t xbr_files{}, object_instances{}, unresolved_calls{}; };
 
 GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Decoder& decoder, const Path& staging,
                                   std::map<std::string, std::string>& assembly) {
@@ -399,7 +400,8 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
         }
     }
     std::ostringstream declarations, index, summary;
-    std::size_t count = 0, registry_size = 0;
+    std::size_t count = 0, registry_size = 0, unresolved_calls = 0;
+    std::ofstream unresolved;
     for (const auto& entry : inventory.records) {
         std::vector<std::byte> bytes(entry.size);
         media->read(entry.file, entry.object, bytes);
@@ -418,7 +420,19 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
         for (auto address : module.functions) {
             const auto lowered = [&] {
                 try {
-                    return lower(module_function(address, module, decoder));
+                    const auto fn = module_function(address, module, decoder);
+                    for (const auto& [pc, ins] : fn.instructions) {
+                        if (ins.decoded.meta.category != ZYDIS_CATEGORY_CALL || ins.target()) continue;
+                        if (!unresolved_calls) {
+                            unresolved.exceptions(std::ios::failbit | std::ios::badbit);
+                            unresolved.open(staging / "module-indirect.tsv");
+                            unresolved << "object_sha256\tfunction_offset\tsite_offset\tbytes\n";
+                        }
+                        ++unresolved_calls;
+                        unresolved << entry.hash << '\t' << hex32(address) << '\t' << hex32(pc) << '\t'
+                                   << hex_bytes(Bytes(ins.bytes).first(ins.decoded.length)) << '\n';
+                    }
+                    return lower(fn);
                 } catch (const std::runtime_error& error) {
                     throw std::runtime_error(entry.path + " (" + entry.name + " at " + hex32(address) + "): " + error.what());
                 }
@@ -464,7 +478,8 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
         "const std::array<CompiledModule, {}> modules{{{{\n{}}}}};\n}}\n"
         "const std::span<const CompiledModule> compiled_modules{{modules}};\n}}\n", declarations.str(), registry_size, index.str());
     write_text(staging / "game.module.cpp", module_index);
-    return {summary.str(),inventory.files,inventory.instances};
+    if (unresolved.is_open()) unresolved.close();
+    return {summary.str(),inventory.files,inventory.instances,unresolved_calls};
 }
 
 struct Program;
@@ -1027,7 +1042,8 @@ Function build_function(Word entry, Unit& unit, const Program& program, const Ju
 
 std::string symbol(Word address) { return std::format("guest_{:08X}", address); }
 
-std::string report(const Xbe& image, const Program& program, std::size_t helpers, bool complete, const GeneratedModules& modules) {
+std::string report(const Xbe& image, const Program& program, std::size_t helpers, bool complete,
+                   bool targets_verified, const GeneratedModules& modules) {
     std::map<std::string, std::size_t> totals, bindings;
     std::size_t lowered{}, closed{};
     std::ostringstream functions;
@@ -1076,6 +1092,9 @@ std::string report(const Xbe& image, const Program& program, std::size_t helpers
     std::ostringstream out;
     out << "{\n  \"format\":\"xbox-native-batch-v2\",\n  \"sha256\":" << json(image.sha256)
         << ",\n  \"entry\":" << json(hex32(image.entry)) << ",\n  \"complete\":" << (complete ? "true" : "false")
+        << ",\n  \"xbe_closed\":" << (closed == program.units.size() ? "true" : "false")
+        << ",\n  \"per_site_targets_verified\":" << (targets_verified ? "true" : "false")
+        << ",\n  \"disc_modules_verified\":" << (modules.object_instances ? "true" : "false")
         << ",\n  \"functions_mapped\":" << program.units.size() << ",\n  \"functions_lowered\":" << lowered
         << ",\n  \"functions_closed\":" << closed << ",\n  \"mapped_instruction_rows\":" << program.mapped_rows
         << ",\n  \"boot_recovered_instructions\":" << program.recovered_instructions
@@ -1096,7 +1115,9 @@ std::string report(const Xbe& image, const Program& program, std::size_t helpers
     write_counts("issue_counts", totals);
     write_counts("binding_counts", bindings);
     out << ",\n  \"xbr_files_indexed\":" << modules.xbr_files << ",\n  \"logic_object_instances\":" << modules.object_instances
-        << ",\n  \"logic_modules\":[" << modules.summary << "],\n  \"functions\":[" << functions.str() << "\n  ]\n}\n";
+        << ",\n  \"unresolved_module_calls\":" << modules.unresolved_calls;
+    if (modules.unresolved_calls) out << ",\n  \"module_indirect_sites\":\"module-indirect.tsv\"";
+    out << ",\n  \"logic_modules\":[" << modules.summary << "],\n  \"functions\":[" << functions.str() << "\n  ]\n}\n";
     return out.str();
 }
 
@@ -1192,14 +1213,24 @@ int recompile_xbe(const Path& input, const Path& maps, const Path& output, bool 
     header << "}\n";
     index << "}};\n}\nconst std::span<const CompiledFunction> compiled_batch{functions};\n}\n";
     close_dependencies(program.units);
-    const bool complete = std::ranges::all_of(program.units, [](const auto& pair) { return pair.second.closed; });
+    const bool closed = std::ranges::all_of(program.units, [](const auto& pair) { return pair.second.closed; });
+    const bool xbe_targets_verified = std::ranges::none_of(program.units, [](const auto& pair) {
+        if (!pair.second.sites.empty()) return true;
+        return std::ranges::any_of(pair.second.bindings, [](const Site& site) {
+            // Initial values and observed assignments do not bound future writes to callback slots.
+            return site.kind == "runtime_dispatch" || site.kind == "callback_slot";
+        });
+    });
+    bool complete = false;
 
     auto staging = output;
     staging += ".tmp";
     if (!std::filesystem::create_directory(staging)) throw std::runtime_error("Cannot create batch staging directory");
     try {
-        const auto modules = (complete || allow_partial) ? generate_modules(disc, image, decoder, staging, assembly) : GeneratedModules{};
-        const auto summary = report(image, program, assembly.size(), complete, modules);
+        const auto modules = (closed || allow_partial) ? generate_modules(disc, image, decoder, staging, assembly) : GeneratedModules{};
+        const bool targets_verified = xbe_targets_verified && modules.object_instances && !modules.unresolved_calls;
+        complete = closed && targets_verified;
+        const auto summary = report(image, program, assembly.size(), complete, targets_verified, modules);
         write_text(staging / "batch.json", summary);
         if (complete || allow_partial) {
             std::ostringstream helpers;
@@ -1219,6 +1250,10 @@ int recompile_xbe(const Path& input, const Path& maps, const Path& output, bool 
             }
             write_text(staging / "game.cpp", banner(image) + "#include \"game.h\"\n#include <array>\nnamespace xbox_native {\n"
                        + index_declarations.str() + index.str());
+        } else {
+            // The staging directory is new and contains only this generation's output.
+            for (const auto& file : std::filesystem::directory_iterator(staging))
+                if (file.path().extension() == ".cpp") std::filesystem::remove(file.path());
         }
         if (std::filesystem::exists(output)) throw std::runtime_error("Output directory already exists");
         std::filesystem::rename(staging, output);

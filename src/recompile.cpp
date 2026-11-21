@@ -391,6 +391,8 @@ int main(int argc, char* argv[]) {
     if (argc > 1 && std::string_view(argv[1]) == "boot") {
         return xbox_native::boot_command(argc, argv);
     }
+    if (argc == 4 && std::string_view(argv[1]) == "check-dialogue")
+        return xbox_native::check_dialogue_stream(argv[2], argv[3]);
 #endif
     if (argc >= 5 && std::string_view(argv[1]) == "xbe") {
         try {
@@ -412,7 +414,8 @@ int main(int argc, char* argv[]) {
         std::cout << "Usage: native-recompiler IMAGE.bin BASE_ADDRESS MAP_DIRECTORY NEW_OUTPUT.cpp\n"
                      "       native-recompiler xbe DEFAULT.xbe MAP_DIRECTORY NEW_OUTPUT_DIRECTORY [--allow-partial] [--disc XISO]\n"
 #ifdef XBOX_OFFLINE_BOOT
-                     "       native-recompiler boot DEFAULT.xbe CHECKPOINT_BUDGET [STOP_ADDRESS] [--disc XISO] [--audio] [--frame PNG] [--frame-index N] [--start-at-scanout N] [--shader-cache DIR]\n"
+                     "       native-recompiler check-dialogue DEFAULT.xbe DISC.xiso\n"
+                     "       native-recompiler boot DEFAULT.xbe CHECKPOINT_BUDGET [STOP_ADDRESS] [--disc XISO] [--language en|fr|de] [--audio] [--frame PNG] [--frame-index N] [--start-at-scanout N] [--shader-cache DIR]\n"
 #endif
                      "Reads functions.tsv, function-ranges.tsv and instructions.tsv for a flat 32-bit x86 image.\n"
                      "Generated C++ uses native_cpu.h. Exit code 3 reports unsupported instructions or flow.\n";

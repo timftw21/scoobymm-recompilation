@@ -16,6 +16,7 @@ public:
     bool invoke(PlatformApi api, Cpu& cpu);
     bool ready() const { return renderer_ != nullptr; }
     bool captured() const { return captured_; }
+    bool capture_pending() const { return !capture_.empty() && !captured_; }
     void diagnostics(PlayDiagnostics* value) { diagnostics_ = value; }
     GpuStats stats() const { return gpu_ ? gpu_->stats() : GpuStats{}; }
     void advance_display(std::uint64_t now);

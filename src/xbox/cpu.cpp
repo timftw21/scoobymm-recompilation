@@ -50,6 +50,59 @@ void invoke_native(Cpu& cpu, Memory& memory, std::uint32_t address) {
     throw NativeBoundary(address, std::format("call or jump from 0x{:08X} has no mapped entry", caller));
 }
 
+namespace {
+using Word = std::uint32_t;
+struct Context32 {
+    Word flags;
+    std::array<Word, 34> debug_and_x87;
+    Word gs, fs, es, ds, edi, esi, ebx, edx, ecx, eax, ebp, eip, cs, eflags, esp, ss;
+    std::array<std::byte, 512> extended;
+};
+static_assert(sizeof(Context32) == 716 && offsetof(Context32, eip) == 184);
+}
+
+void dispatch_divide_fault(Cpu& cpu, Memory& memory, Word site) {
+    cpu.eip = site;
+    if (!cpu.fs_base) throw GuestTrap(0, site, site);
+    const auto stack = cpu.registers[esp], low = memory.load<Word>(cpu.fs_base + 8), high = memory.load<Word>(cpu.fs_base + 4);
+    constexpr Word scratch = 80 + sizeof(Context32) + 24;
+    if (stack > high || stack < low || stack - low < scratch) throw GuestTrap(0,site,site);
+    const Word record = stack - 80, context = record - static_cast<Word>(sizeof(Context32)), call = context - 24;
+    const auto saved = cpu.registers;
+    const auto flags = cpu.flags;
+    Context32 state{0x10007, {}, cpu.gs_selector,cpu.fs_selector,cpu.ds_selector,cpu.ds_selector,
+        saved[edi],saved[esi],saved[ebx],saved[edx],saved[ecx],saved[eax],saved[ebp],site,cpu.cs_selector,flags,stack,cpu.ss_selector,{}};
+    std::memcpy(memory.access(static_cast<Word>(context),sizeof(state)), &state,sizeof(state));
+    std::memset(memory.access(record,80),0,80);
+    memory.store(record,0xC0000094U);
+    memory.store(record+12,site);
+    for (auto frame = memory.load<Word>(cpu.fs_base); frame != UINT32_MAX;) {
+        if ((frame & 3) || frame < stack || frame > high - 8) throw GuestTrap(0,site,site);
+        const auto next = memory.load<Word>(frame);
+        if (next <= frame) throw GuestTrap(0,site,site);
+        constexpr Word returned = 0xFFFFFFD4;
+        const Word args[]{returned, record, frame, static_cast<Word>(context), call + 20, frame};
+        std::memcpy(memory.access(call,sizeof(args)),args,sizeof(args));
+        cpu.registers[esp] = call;
+        invoke_native(cpu,memory,memory.load<Word>(frame+4));
+        const auto disposition = cpu.registers[eax];
+        if (cpu.eip != returned || cpu.registers[esp] != call + 4) throw NativeBoundary(site,"Invalid exception handler return");
+        cpu.registers = saved;
+        cpu.flags = flags;
+        cpu.eip = site;
+        if (disposition == 0) {
+            std::memcpy(&state,memory.access(static_cast<Word>(context),sizeof(state)),sizeof(state));
+            cpu.registers = {state.eax,state.ecx,state.edx,state.ebx,state.esp,state.ebp,state.esi,state.edi};
+            cpu.flags = state.eflags;
+            cpu.eip = state.eip;
+            return;
+        }
+        if (disposition != 1) throw NativeBoundary(site,"Invalid divide exception disposition");
+        frame = next;
+    }
+    throw GuestTrap(0,site,site);
+}
+
 void unwind_guest(Cpu& cpu, Memory& memory, std::uint32_t target, std::uint32_t resume,
                   std::uint32_t record, std::uint32_t value) {
     using Word = std::uint32_t;
@@ -78,13 +131,6 @@ void unwind_guest(Cpu& cpu, Memory& memory, std::uint32_t target, std::uint32_t 
     constexpr Word unwinding = 2; // EXCEPTION_UNWINDING
     if (record) memory.store(record + 4, memory.load<Word>(record + 4) | unwinding);
     if (frame != target) {
-        struct Context32 {
-            Word flags;
-            std::array<Word, 34> debug_and_x87;
-            Word gs, fs, es, ds, edi, esi, ebx, edx, ecx, eax, ebp, eip, cs, eflags, esp, ss;
-            std::array<std::byte, 512> extended;
-        };
-        static_assert(sizeof(Context32) == 716 && offsetof(Context32, eip) == 184);
         constexpr Word record_size = 80, context_size = sizeof(Context32), dispatch_size = 4, call_size = 20;
         constexpr Word scratch_size = record_size + context_size + dispatch_size + call_size;
         if (stack - low < scratch_size) throw NativeBoundary(site, "RtlUnwind ran out of guest stack");

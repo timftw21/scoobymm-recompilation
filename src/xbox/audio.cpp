@@ -46,6 +46,12 @@ void validate(AudioFormat format,bool bus=false) {
                 format.channels, format.rate, format.bits, format.block_align, format.samples_per_block));
     } else throw std::runtime_error("Unsupported audio codec");
 }
+float pcm_sample(const std::byte* source, unsigned bits) {
+    if (bits == 8) return (std::to_integer<int>(*source) - 128) / 128.0f;
+    std::int16_t sample;
+    std::memcpy(&sample, source, sizeof(sample));
+    return sample / 32768.0f;
+}
 bool decode_adpcm(AudioFormat format,const std::byte* source,std::span<float> result) {
     for(unsigned channel=0;channel<format.channels;++channel) {
         std::int16_t initial;std::memcpy(&initial,source+channel*4,2);
@@ -294,22 +300,25 @@ std::array<float,2> Audio::sample(Voice& value,std::uint32_t frame) {
             const auto offset=std::size_t(block)*format.block_align;
             if(offset+format.block_align>value.source.size()) throw std::runtime_error("Xbox ADPCM block exceeds the bound buffer");
             if(!decode_adpcm(format,value.source.data()+offset,value.block)) {
-                // Each block has its own predictor. Keep its duration and resume at the next header.
-                value.block.fill(0);
                 if(!first_invalid_adpcm_block_) {
                     AdpcmBlockError error{static_cast<std::uint32_t>(&value-voices_.data()+1),value.source_address,
                         static_cast<std::uint32_t>(offset),format.channels};
                     std::ranges::copy(value.source.subspan(offset,format.channels*4),error.header.begin());
                     first_invalid_adpcm_block_=error;
                 }
+                const auto header = value.source.subspan(offset,4U * format.channels);
+                std::string bytes;
+                for (auto byte : header) bytes += std::format("{:02X}",std::to_integer<unsigned>(byte));
+                throw std::runtime_error(std::format("Invalid Xbox ADPCM on voice {}, {} channels, packet {} bytes, "
+                    "source 0x{:08X} + {}, header {}",&value - voices_.data() + 1,format.channels,
+                    value.source.size(),value.source_address,offset,bytes));
             }
             value.cached_block=block;
         }
         for(unsigned channel=0;channel<format.channels;++channel) result[channel]=value.block[(frame%64)*format.channels+channel];
     } else for(unsigned channel=0;channel<format.channels;++channel) {
         const auto offset=(std::size_t(frame)*format.channels+channel)*(format.bits/8);
-        if(format.bits==8) result[channel]=(std::to_integer<int>(value.source[offset])-128)/128.0f;
-        else {std::int16_t sample;std::memcpy(&sample,value.source.data()+offset,2);result[channel]=sample/32768.0f;}
+        result[channel]=pcm_sample(value.source.data()+offset,format.bits);
     }
     return result;
 }
@@ -488,7 +497,14 @@ void Audio::mix_bins(std::span<float> output,unsigned frame_count) {
             if(value.loop && second>=value.loop_start+value.loop_frames) second=value.loop_start;
             else second=std::min(second,value.play_frames-1);
             const auto blend=static_cast<float>(value.cursor-first);
-            const auto a=sample(value,value.play_start+first),b=sample(value,value.play_start+second);
+            const auto a=sample(value,value.play_start+first);
+            auto b=sample(value,value.play_start+second);
+            if (blend && second == first && value.packets && value.packets->size() > 1 && !value.packets->front().ends_segment) {
+                const auto* next = (*value.packets)[1].bytes.data();
+                const bool adpcm = value.format.tag == 0x69;
+                for (unsigned channel = 0; channel < channels; ++channel)
+                    b[channel] = pcm_sample(next + channel * (adpcm ? 4 : value.format.bits / 8), adpcm ? 16 : value.format.bits);
+            }
             const auto level = value.release_remaining ? value.release_gain : envelope_gain(value);
             for(unsigned channel=0;channel<channels;++channel) samples[count][channel]=(a[channel]+(b[channel]-a[channel])*blend)*level;
             value.cursor+=value.step*value.spatial_pitch;

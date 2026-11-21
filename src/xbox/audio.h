@@ -73,7 +73,7 @@ public:
     void route(std::uint32_t,std::uint32_t destination);
     void spatial(std::uint32_t,const SpatialResult&);
     void mix(std::span<float> stereo);
-    std::uint32_t sample_clock() const {return frames_processed_.load(std::memory_order_relaxed);}
+    std::uint64_t sample_clock() const {return frames_processed_.load(std::memory_order_relaxed);}
     float output_peak() const {return output_peak_.load(std::memory_order_relaxed);}
     std::string failure();
     std::optional<AdpcmBlockError> first_invalid_adpcm_block();
@@ -130,7 +130,7 @@ private:
     SDL_AudioStream* stream_=nullptr;
     std::array<Voice,256> voices_{};
     std::array<std::uint32_t,32> bin_headroom_{};
-    std::atomic<std::uint32_t> frames_processed_{0};
+    std::atomic<std::uint64_t> frames_processed_{0};
     std::atomic<float> output_peak_{};
     std::atomic<bool> recording_{false};
     std::atomic<std::uint64_t> batches_{0},mix_ns_{0},overruns_{0};

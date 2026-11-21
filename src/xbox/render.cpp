@@ -143,7 +143,7 @@ D3D11_STENCIL_OP stencil_operation(std::uint32_t value) {
     default:throw std::runtime_error("Unsupported stencil operation");
     }
 }
-using PipelineKey = std::array<std::uint32_t, 32>;
+using PipelineKey = std::array<std::uint32_t, 36>;
 PipelineKey pipeline_key(const RenderState& state) {
     PipelineKey key{};
     std::size_t i = 0;
@@ -151,7 +151,7 @@ PipelineKey pipeline_key(const RenderState& state) {
          std::uint32_t(state.cull), std::uint32_t(state.front_ccw),
          state.depth_function, state.blend_source, state.blend_destination, state.blend_equation,
          state.cull_face, state.color_mask}) key[i++] = value;
-    for (unsigned n = 0; n < 4; ++n) for (auto value : {state.texture_address[n], std::uint32_t(state.linear_filter[n])}) key[i++] = value;
+    for (unsigned n = 0; n < 4; ++n) for (auto value : {state.texture_address[n],state.texture_filter[n],state.texture_lod[n]}) key[i++] = value;
     for(auto value : {std::uint32_t(state.stencil_test),state.stencil_function,state.stencil_read_mask,state.stencil_write_mask,
         state.stencil_fail,state.stencil_depth_fail,state.stencil_pass,std::uint32_t(state.polygon_offset),
         std::bit_cast<std::uint32_t>(state.polygon_offset_scale),std::bit_cast<std::uint32_t>(state.polygon_offset_bias),std::uint32_t(state.scissor_test)}) key[i++]=value;
@@ -317,6 +317,20 @@ struct Renderer::Impl {
     std::uint32_t width, height;
     RenderStats stats;
     std::size_t texture_bytes = 0;
+    std::map<unsigned,std::size_t> uploaded_bytes;
+    std::vector<unsigned> free_textures;
+    unsigned store_texture(ComPtr<ID3D11ShaderResourceView> view, unsigned dimension) {
+        if (free_textures.empty()) {
+            textures.push_back(std::move(view));
+            texture_dimensions.push_back(dimension);
+            return static_cast<unsigned>(textures.size() - 1);
+        }
+        const auto id = free_textures.back();
+        free_textures.pop_back();
+        textures[id] = std::move(view);
+        texture_dimensions[id] = dimension;
+        return id;
+    }
     bool recording = false, ended = false;
     static constexpr UINT max_vertices = 32768, max_indices = max_vertices * 6;
     Bytes shader(ShaderKind kind,const VertexProgram* program=nullptr) {
@@ -493,14 +507,13 @@ std::uint32_t Renderer::create_target(std::uint32_t width,std::uint32_t height,S
     auto& r=*impl_;extent(width,height);
     if(r.recording) throw std::runtime_error("Create render targets before frame submission");
     const auto required=std::size_t(width)*height*12;
-    if(r.textures.size()>=4096 || required>256*1024*1024-r.target_bytes)
+    if(!has_texture_slot() || required>256*1024*1024-r.target_bytes)
         throw std::runtime_error("Render target resource limit reached");
     const auto shared=r.targets.find(shared_color);
     if(shared_color!=UINT32_MAX && (!shared_color || shared==r.targets.end()))
         throw std::runtime_error("Share the color image of an existing auxiliary target");
     auto output=r.make_target(width,height,color,depth,shared==r.targets.end()?nullptr:&shared->second);
-    const auto id=static_cast<std::uint32_t>(r.textures.size());
-    r.textures.push_back(output.texture_view);r.texture_dimensions.push_back(1);
+    const auto id=r.store_texture(output.texture_view,1);
     r.targets.emplace(id,std::move(output));r.target_bytes+=required;
     if(color==SurfaceColor::rgb565) {
         RenderState conversion;conversion.texture_modes[0]=1;conversion.textures[0]=id;conversion.final_inputs={0x00000008,0x00001800};
@@ -702,6 +715,23 @@ void Renderer::present(bool vsync) {
     checked(r.swapchain->Present(vsync?1:0,0),"Window presentation");r.displaying=false;
 }
 
+static std::size_t resident_size(const TextureData& texture) {
+    return texture.bytes.size() * (texture.format == TextureFormat::indexed8 ? 4U : texture.format == TextureFormat::a8l8 ? 2U : 1U);
+}
+bool Renderer::can_upload(const TextureData& texture) const {
+    const auto& r = *impl_;
+    return has_texture_slot() && resident_size(texture) <= 256*1024*1024 - r.texture_bytes;
+}
+bool Renderer::has_texture_slot() const {
+    return !impl_->free_textures.empty() || impl_->textures.size() < 4096;
+}
+void Renderer::release_texture(std::uint32_t id) {
+    auto& r = *impl_;
+    r.texture_bytes -= r.uploaded_bytes.at(id);
+    r.uploaded_bytes.erase(id);
+    r.textures[id].Reset();
+    r.free_textures.push_back(id);
+}
 std::uint32_t Renderer::upload(const TextureData& texture) {
     auto& r = *impl_;
     if (r.recording) throw std::runtime_error("Upload textures before frame submission");
@@ -735,12 +765,9 @@ std::uint32_t Renderer::upload(const TextureData& texture) {
         throw std::runtime_error("BC top-level dimensions must be multiples of four");
     if (texture.pitch && (swizzled || block || texture.mip_levels != 1))
         throw std::runtime_error("An explicit pitch requires a single linear mip");
-    if (r.textures.size() >= 4096) throw std::runtime_error("Texture resource limit reached");
     if (indexed && (texture.palette.size() < 128 || texture.palette.size() > 1024 || !std::has_single_bit(texture.palette.size())))
         throw std::runtime_error("Invalid palette size for NV097 indexed texture");
-    const auto resident_bytes=texture.bytes.size()*(indexed?4U:expand_luminance?2U:1U);
-    if (resident_bytes > 256 * 1024 * 1024 - r.texture_bytes)
-        throw std::runtime_error("Texture resources exceed 256 MiB");
+    if (!can_upload(texture)) throw std::runtime_error("Texture resource limit reached");
     if(texture.cubemap && (texture.width!=texture.height || texture.depth!=1)) throw std::runtime_error("Cubemap faces must be square and two-dimensional");
     const auto faces=texture.cubemap?6U:1U;
     std::vector<D3D11_SUBRESOURCE_DATA> data(texture.mip_levels*faces);
@@ -748,6 +775,7 @@ std::uint32_t Renderer::upload(const TextureData& texture) {
     std::size_t offset = 0;
     for(unsigned face=0;face<faces;++face) for (unsigned mip = 0; mip < texture.mip_levels; ++mip) {
         const auto subresource=face*texture.mip_levels+mip;
+        if (face && !mip) offset = (offset + 127) & ~std::size_t(127);
         const auto w = std::max(1U, texture.width >> mip), h = std::max(1U, texture.height >> mip), d=std::max(1U,texture.depth>>mip);
         const auto pitch = texture.pitch ? texture.pitch : block ? ((w + 3) / 4) * block : w * bpp;
         if (pitch < w * bpp) throw std::runtime_error("Texture pitch is shorter than a row");
@@ -812,10 +840,10 @@ std::uint32_t Renderer::upload(const TextureData& texture) {
         checked(r.device->CreateTexture2D(&desc, data.data(), &resource), "Texture upload");
         checked(r.device->CreateShaderResourceView(resource.Get(), nullptr, &view), "Texture view");
     }
-    r.textures.push_back(std::move(view));
-    r.texture_dimensions.push_back(texture.cubemap?3U:texture.depth>1?2U:1U);
-    r.texture_bytes += resident_bytes;
-    return static_cast<std::uint32_t>(r.textures.size() - 1);
+    const auto id = r.store_texture(std::move(view),texture.cubemap?3U:texture.depth>1?2U:1U);
+    r.uploaded_bytes.emplace(id,resident_size(texture));
+    r.texture_bytes += resident_size(texture);
+    return id;
 }
 void Renderer::prepare(const RenderState& state) {
     auto& r = *impl_;
@@ -864,12 +892,22 @@ void Renderer::prepare(const RenderState& state) {
     checked(r.device->CreateRasterizerState(&raster, &pipeline.raster), "Rasterizer state");
     for (unsigned i = 0; i < 4; ++i) {
         D3D11_SAMPLER_DESC sampler{};
-        sampler.Filter = state.linear_filter[i] ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
+        const auto filter = state.texture_filter[i], control = state.texture_lod[i];
+        const auto min = (filter >> 16) & 255, mag = (filter >> 24) & 15;
+        if (state.texture_modes[i] && (min > 6 || mag > 2)) throw std::runtime_error("Unsupported NV097 convolution filter");
+        const auto min_type = min == 2 || min == 4 || min == 6 ? D3D11_FILTER_TYPE_LINEAR : D3D11_FILTER_TYPE_POINT;
+        const auto mag_type = mag == 2 ? D3D11_FILTER_TYPE_LINEAR : D3D11_FILTER_TYPE_POINT;
+        const auto mip_type = min >= 5 ? D3D11_FILTER_TYPE_LINEAR : D3D11_FILTER_TYPE_POINT;
+        sampler.Filter = D3D11_ENCODE_BASIC_FILTER(min_type,mag_type,mip_type,D3D11_FILTER_REDUCTION_TYPE_STANDARD);
+        sampler.MipLODBias = (static_cast<int>((filter & 0x1FFF) ^ 0x1000) - 0x1000) / 256.0f;
+        sampler.MinLOD = min > 2 ? ((control >> 18) & 0xFFF) / 256.0f : 0;
+        sampler.MaxLOD = min > 2 ? std::max(sampler.MinLOD,((control >> 6) & 0xFFF) / 256.0f) : 0;
         sampler.AddressU = address_mode(state.texture_address[i] & 15);
         sampler.AddressV = address_mode((state.texture_address[i] >> 8) & 15);
         sampler.AddressW = address_mode((state.texture_address[i] >> 16) & 15);
-        sampler.MaxAnisotropy = 1; sampler.ComparisonFunc = D3D11_COMPARISON_NEVER;
-        sampler.MaxLOD = D3D11_FLOAT32_MAX;
+        sampler.MaxAnisotropy = 1U << ((control >> 4) & 3);
+        if (sampler.MaxAnisotropy > 1) sampler.Filter = D3D11_FILTER_ANISOTROPIC;
+        sampler.ComparisonFunc = D3D11_COMPARISON_NEVER;
         checked(r.device->CreateSamplerState(&sampler, &pipeline.samplers[i]), "Sampler state");
     }
     r.pipelines.emplace(key, std::move(pipeline));

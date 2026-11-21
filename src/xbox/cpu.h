@@ -196,8 +196,9 @@ public:
         }
         auto* to = pointer(static_cast<std::uint32_t>(destination - displacement), size);
         const auto* from = pointer(static_cast<std::uint32_t>(source - displacement), size);
-        const auto distance = destination > source ? destination - source : source - destination;
-        if (distance >= size || (descending ? destination >= source : destination <= source)) {
+        const auto dest = reinterpret_cast<std::uintptr_t>(to), src = reinterpret_cast<std::uintptr_t>(from);
+        const auto distance = dest > src ? dest - src : src - dest;
+        if (distance >= size || (descending ? dest >= src : dest <= src)) {
             std::memmove(to, from, static_cast<std::size_t>(size));
         } else {
             // An overlapping REP MOVS can read data written by an earlier element.
@@ -437,9 +438,10 @@ template<unsigned Bits, bool Signed> constexpr Product multiply(std::uint32_t fl
 }
 
 struct Quotient { std::uint32_t value, remainder; };
-template<unsigned Bits, bool Signed> Quotient divide(std::uint64_t dividend, std::uint32_t divisor) {
+void dispatch_divide_fault(Cpu&, Memory&, std::uint32_t site);
+template<unsigned Bits, bool Signed> Quotient divide(std::uint64_t dividend, std::uint32_t divisor, std::uint32_t site = 0) {
     divisor &= mask<Bits>;
-    if (!divisor) throw std::runtime_error("Guest integer division by zero");
+    if (!divisor) throw GuestTrap(0,site,site);
     if constexpr (Signed) {
         std::int64_t numerator;
         if constexpr (Bits == 32) numerator = std::bit_cast<std::int64_t>(dividend);
@@ -448,14 +450,14 @@ template<unsigned Bits, bool Signed> Quotient divide(std::uint64_t dividend, std
             numerator = static_cast<std::int64_t>((dividend & ((high << 1) - 1)) ^ high) - static_cast<std::int64_t>(high);
         }
         const auto denominator = std::bit_cast<std::int32_t>(sign_extend<Bits>(divisor));
-        if (numerator == INT64_MIN && denominator == -1) throw std::runtime_error("Guest integer division overflow");
+        if (numerator == INT64_MIN && denominator == -1) throw GuestTrap(0,site,site);
         const auto quotient = numerator / denominator;
         if (quotient < -(1LL << (Bits - 1)) || quotient > (1LL << (Bits - 1)) - 1)
-            throw std::runtime_error("Guest integer division overflow");
+            throw GuestTrap(0,site,site);
         return {static_cast<std::uint32_t>(quotient) & mask<Bits>, static_cast<std::uint32_t>(numerator % denominator) & mask<Bits>};
     } else {
         const auto quotient = dividend / divisor;
-        if (quotient > mask<Bits>) throw std::runtime_error("Guest integer division overflow");
+        if (quotient > mask<Bits>) throw GuestTrap(0,site,site);
         return {static_cast<std::uint32_t>(quotient), static_cast<std::uint32_t>(dividend % divisor)};
     }
 }

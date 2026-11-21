@@ -41,6 +41,12 @@ constexpr Word name_missing = 0xC0000034, name_conflict = 0xC0000035, address_co
 constexpr Word write_protected = 0xC00000A2, no_disc = 0xC0000013, end_of_file = 0xC0000011;
 constexpr Word info_length_mismatch = 0xC0000004, access_denied = 0xC0000022, delete_pending = 0xC0000056;
 constexpr Word delete_access = 0x10010000, share_delete = 4;
+constexpr Word read_data = 0x90000001, write_data = 0x50000002, append_data = 0x50000004;
+Word share_required(Word access) {
+    return ((access & (read_data | 0x20000020U)) ? 1U : 0U) |
+           ((access & (write_data | append_data)) ? 2U : 0U) |
+           ((access & delete_access) ? share_delete : 0U);
+}
 constexpr Word wait_timeout = 0x00000102;
 constexpr std::string_view cdrom = "\\DEVICE\\CDROM0", disk = "\\DEVICE\\HARDDISK0\\PARTITION1";
 constexpr std::string_view disk_prefix = "\\DEVICE\\HARDDISK0\\PARTITION";
@@ -82,6 +88,7 @@ struct Thread {
     OfflineBoot* boot{};
     void* fiber{};
     Word id, object, routine, system, exit_status{};
+    Word stack_bytes{}, waiters{};
     bool suspended{}, started{}, exited{}, returned{};
     Cpu cpu;
     std::function<bool()> wake;
@@ -125,12 +132,12 @@ public:
     OfflineBoot(Xbe& image, Disc* disc, std::uint64_t budget, Word breakpoint, bool audio_output,
                 std::filesystem::path capture, Word capture_index, InputScript input,
                 PlayWindow* window = nullptr, bool vsync = true, Word frames = 0, std::filesystem::path storage = {},
-                const DiagnosticOptions* diagnostics = nullptr)
+                const DiagnosticOptions* diagnostics = nullptr, Word language = 1)
         : image_(image), disc_(disc), ram_(ram_end - guest_base), kernel_(0x10000), memory_(guest_base, ram_),
           arena_start_(align_up(image.image_end, 0x10000)), stack_bottom_(ram_end),
           audio_(memory_, platform_allocator(), audio_output),
           graphics_(memory_, platform_allocator(), std::move(capture), capture_index, window ? window->native_handle() : nullptr, vsync),
-          window_(window), frame_limit_(frames), input_(std::move(input)), storage_(std::move(storage)) {
+          window_(window), frame_limit_(frames), input_(std::move(input)), storage_(std::move(storage)), language_(language) {
         if (compiled_batch.empty() || !std::ranges::all_of(compiled_batch, [&](const auto& function) {
                 return function.source_sha256 == image.sha256;
             })) {
@@ -173,7 +180,7 @@ public:
             diagnostics_ = std::make_unique<PlayDiagnostics>(*diagnostics, *window, vsync,
                 [this](const std::filesystem::path& dir) { capture_state(dir); },
                 [this](FrameCounters& counters) {
-                    counters.checkpoints = diagnostic_.visits;
+                    counters.checkpoints = checkpoints();
                     counters.audio_frames = audio_.frames();
                     // The loop at 0x00018D25 increments this counter at 0x00018EC9.
                     constexpr Word engine_slot = 0x01EED350, updates_offset = 0x298;
@@ -239,11 +246,17 @@ public:
             reason += stop.what();
             status = "guest_error";
         }
-        if (diagnostics_ && !diagnostics_->finish() && reason.empty()) {
-            status = "diagnostic_error";
-            reason = "A requested capture did not complete";
+        const bool unfinished = diagnostics_ && !diagnostics_->finish();
+        if (unfinished) {
+            if (!reason.empty()) reason += ". ";
+            reason += "A requested diagnostic capture did not complete";
+        }
+        if (graphics_.capture_pending()) {
+            if (!reason.empty()) reason += ". ";
+            reason += "The requested frame was never captured";
         }
         report(output, status, reason, boot_thread);
+        if (unfinished || graphics_.capture_pending()) return 3;
         return status == "returned" || status == "breakpoint" || status == "closed" || status == "frame_limit" ? 0 : status == "budget" ? 4 : 3;
     }
 
@@ -257,6 +270,9 @@ private:
     std::set<Word> virtual_allocations_;
     std::array<std::uint8_t, (ram_end - guest_base) / page> blocked_pages_{};
     std::deque<Thread> threads_;
+    std::uint64_t completed_quanta_ = 0;
+    std::map<Word,Word> free_stacks_;
+    Word next_thread_id_ = 4;
     std::map<Word, Thread*> handles_;
     std::map<Word, std::shared_ptr<Event>> events_;
     std::map<Word, std::string> link_handles_;
@@ -307,6 +323,7 @@ private:
     std::uint64_t idle_time_{};
     std::uint64_t epoch_ = 133801632000000000ULL;
     std::filesystem::path storage_;
+    Word language_;
     std::unique_ptr<void, decltype(&CloseHandle)> storage_lock_{nullptr, CloseHandle};
     std::array<std::byte,16> storage_key_{};
     Word storage_volume_serial_{};
@@ -322,6 +339,12 @@ private:
     }
 
     std::uint64_t interrupt_time() const { return window_ ? window_->time() : idle_time_ + diagnostic_.visits * 100; }
+    std::uint64_t checkpoints() const {
+        auto count = diagnostic_.visits + completed_quanta_;
+        for (const auto& thread : threads_)
+            if (!thread.cpu.diagnostic && thread.stack_bytes) count += 1024 - thread.cpu.quantum_remaining;
+        return count;
+    }
     std::uint64_t system_time() const { return epoch_ + interrupt_time(); }
 
     template<std::size_t Ordinal>
@@ -391,33 +414,48 @@ private:
     }
 
     Thread& create(Word routine, Word context, Word system, Word stack_size, Word tls, bool suspended) {
-        if (threads_.size() >= 64 || stack_size > ram_end - arena_start_ || tls >= ram_end - arena_start_) {
+        auto slot = std::ranges::find_if(threads_, [](const Thread& t){return t.exited && !t.stack_bytes;});
+        if ((slot == threads_.end() && threads_.size() >= 64) || stack_size > ram_end - arena_start_ || tls >= ram_end - arena_start_) {
             throw std::runtime_error("Offline guest thread memory limit");
         }
         const auto size = align_up(stack_size ? stack_size : image_.stack_commit, page);
-        if (size < 32 || tls > size - 32 || size + page > stack_bottom_ - arena_start_ ||
-            (!allocations_.empty() && allocations_.rbegin()->first + allocations_.rbegin()->second > stack_bottom_ - size - page)) {
-            throw std::runtime_error("Insufficient guest stack or TLS memory");
+        if (size < 32 || tls > size - 32) throw std::runtime_error("Invalid guest stack or TLS size");
+        const auto needed = size + page;
+        const auto hole = std::ranges::find_if(free_stacks_,[&](const auto& h){return h.second >= needed;});
+        Word base;
+        if (hole != free_stacks_.end()) {
+            base = hole->first;
+            auto remaining = hole->second - needed;
+            free_stacks_.erase(hole);
+            if (remaining) free_stacks_.emplace(base + needed,remaining);
+        } else {
+            if (needed > stack_bottom_ - arena_start_ || (!allocations_.empty() &&
+                allocations_.rbegin()->first + allocations_.rbegin()->second > stack_bottom_ - needed))
+                throw std::runtime_error("Insufficient guest stack memory");
+            base = stack_bottom_ -= needed;
         }
-        const auto stack_top = stack_bottom_;
-        stack_bottom_ -= size + page;
-        const auto object = stack_bottom_ | 0x80000000U;
+        std::memset(memory_.access(base,needed),0,needed);
+        const auto stack_top = base + needed;
+        const auto object = base | 0x80000000U;
         const auto tib = object + 0x400;
-        Thread& thread = threads_.emplace_back();
+        Thread& thread = slot == threads_.end() ? threads_.emplace_back() : *slot;
+        thread = Thread{};
+        thread.stack_bytes = needed;
         thread.boot = this;
-        thread.id = 4 * static_cast<Word>(threads_.size());
+        thread.id = next_thread_id_;
+        next_thread_id_ += 4;
         thread.routine = routine;
         thread.system = system;
         thread.suspended = suspended;
         thread.object = object;
         memory_.store<std::uint8_t>(object, 6);
         memory_.store<Word>(object + 0x1C, stack_top);
-        memory_.store<Word>(object + 0x20, stack_bottom_ + page);
+        memory_.store<Word>(object + 0x20, base + page);
         memory_.store<Word>(object + 0x28, tls ? stack_top - tls : 0);
         memory_.store<Word>(object + 0x12C, thread.id);
         memory_.store<Word>(tib, UINT32_MAX);
         memory_.store<Word>(tib + 4, stack_top);
-        memory_.store<Word>(tib + 8, stack_bottom_ + page);
+        memory_.store<Word>(tib + 8, base + page);
         memory_.store<Word>(tib + 0x18, tib);
         memory_.store<Word>(tib + 0x20, object);
         memory_.store<Word>(tib + 0x28, object);
@@ -427,6 +465,8 @@ private:
         cpu.diagnostic = &diagnostic_;
         cpu.preempt = [](Cpu& cpu) {
             auto& boot = *static_cast<OfflineBoot*>(cpu.kernel->context);
+            if (!cpu.diagnostic) boot.completed_quanta_ += 1024;
+            if (boot.window_ && boot.diagnostic_.reached_watch) cpu.diagnostic = nullptr;
             if ((cpu.flags & 0x200) && boot.memory_.load<std::uint8_t>(cpu.fs_base + 0x24) <= 1) {
                 HostFloatingScope host(cpu.floating);
                 boot.yield(cpu);
@@ -444,7 +484,11 @@ private:
         memory_.store(sp + 4, system ? routine : context);
         if (system) memory_.store(sp + 8, context);
         thread.fiber = CreateFiberEx(0, 8 * 1024 * 1024, FIBER_FLAG_FLOAT_SWITCH, fiber_entry, &thread);
-        if (!thread.fiber) throw std::runtime_error("Cannot allocate a guest thread fiber");
+        if (!thread.fiber) {
+            thread.exited = true;
+            retire_thread(thread);
+            throw std::runtime_error("Cannot allocate a guest thread fiber");
+        }
         return thread;
     }
 
@@ -479,6 +523,30 @@ private:
     }
 
     void schedule();
+    void retire_thread(Thread& thread) {
+        if (!thread.exited) return;
+        if (thread.fiber) DeleteFiber(std::exchange(thread.fiber,nullptr));
+        if (&thread == &threads_.front() || !thread.stack_bytes || thread.waiters ||
+            std::ranges::any_of(handles_,[&](const auto& h){return h.second == &thread;})) return;
+        auto base = thread.object & 0x7FFFFFFFU;
+        auto bytes = std::exchange(thread.stack_bytes,0U);
+        if (!thread.cpu.diagnostic) completed_quanta_ += 1024 - thread.cpu.quantum_remaining;
+        auto after = free_stacks_.lower_bound(base);
+        if (after != free_stacks_.end() && base + bytes == after->first) {
+            bytes += after->second;
+            after = free_stacks_.erase(after);
+        }
+        if (after != free_stacks_.begin()) {
+            auto before = std::prev(after);
+            if (before->first + before->second == base) {
+                base = before->first;
+                bytes += before->second;
+                free_stacks_.erase(before);
+            }
+        }
+        if (base == stack_bottom_) stack_bottom_ += bytes;
+        else free_stacks_.emplace(base,bytes);
+    }
     void capture_state(const std::filesystem::path&) const;
     void stop_threads() {
         stopping_ = true;
@@ -536,6 +604,7 @@ private:
     }
     void trace_io(const Cpu& cpu, Word ordinal, Word status, Word detail, Word information,
                   std::optional<std::uint64_t> file_offset = {}) {
+        if (window_ && !(diagnostics_ && (diagnostics_->measuring() || diagnostics_->capturing()))) return;
         if (io_.size() == 64) io_.pop_front();
         io_.push_back({cpu.eip, ordinal, status, detail, information, last_io_path_, file_offset});
     }
@@ -747,6 +816,7 @@ void OfflineBoot::schedule() {
             current_ = selected;
             last_cpu_ = &selected->cpu;
             SwitchToFiber(selected->fiber);
+            if (selected->exited) retire_thread(*selected);
             if (thread_failure_) std::rethrow_exception(thread_failure_);
             continue;
         }
@@ -982,8 +1052,12 @@ Word OfflineBoot::open_file(Cpu& cpu, bool create) {
     const auto path = object_name(arg(2));
     last_io_path_ = path;
     const auto access = arg(1), share = arg(create ? 6 : 4), options = arg(create ? 8 : 5), disposition = create ? arg(7) : 1;
-    if (path.empty() || disposition > 5) return bad_parameter;
+    if (path.empty() || disposition > 5 || (options & 0x41) == 0x41) return bad_parameter;
     if (pending_deletions_.contains(path)) return delete_pending;
+    for (const auto& [handle, open] : files_) {
+        if (open.path == path && ((share_required(access) & ~open.share) || (share_required(open.access) & ~share)))
+            return 0xC0000043; // STATUS_SHARING_VIOLATION
+    }
     OpenFile file{path, {}, access, share};
     Word information = 1;
     if (path == cdrom || (path.starts_with(cdrom) && path[cdrom.size()] == '\\')) {
@@ -1004,8 +1078,16 @@ Word OfflineBoot::open_file(Cpu& cpu, bool create) {
     } else if (path == disk || (path.starts_with(disk) && path[disk.size()] == '\\')) {
         if (directories_.contains(path) || scratch_files_.contains(path)) {
             if (disposition == 2) return name_conflict;
+            if (disposition == 0 || disposition == 4 || disposition == 5) {
+                if (directories_.contains(path)) return 0xC00000BA;
+                if (options & 1) return 0xC0000103;
+                if (!(access & (disposition == 0 ? delete_access : write_data))) return access_denied;
+                scratch_files_.at(path).clear();
+                file_written(file);
+                information = disposition == 0 ? 0 : 3;
+            }
         } else {
-            if (disposition != 2 && disposition != 3) return name_missing;
+            if (disposition == 1 || disposition == 4) return name_missing;
             const auto parent = path.substr(0, path.rfind('\\'));
             if (pending_deletions_.contains(parent)) return delete_pending;
             if (!directories_.contains(parent)) return 0xC000003A;
@@ -1218,7 +1300,8 @@ void OfflineBoot::service(unsigned ordinal, Cpu& cpu) {
     case 24: { // Offline NTSC-M retail profile, matching the reference boot.
         std::optional<Word> value;
         switch (arg(0)) {
-        case 7: case 0x104: value = 1; break;
+        case 7: value = language_; break;
+        case 0x104: value = 1; break;
         case 8: case 9: case 10: case 17: value = 0; break;
         case 0x103: value = 0x00400100; break;
         }
@@ -1268,7 +1351,13 @@ void OfflineBoot::service(unsigned ordinal, Cpu& cpu) {
             if ((modified || deleted) && persistent_path(path) && !storage_writes_open()) flush_storage();
             return finish(cpu, 1, 0);
         }
-        return finish(cpu, 1, (handles_.erase(arg(0)) || link_handles_.erase(arg(0)) ||
+        if (const auto h = handles_.find(arg(0)); h != handles_.end()) {
+            auto* thread = h->second;
+            handles_.erase(h);
+            retire_thread(*thread);
+            return finish(cpu,1,0);
+        }
+        return finish(cpu, 1, (link_handles_.erase(arg(0)) ||
                               events_.erase(arg(0))) ? 0 : bad_handle);
     }
     case 189: {
@@ -1572,7 +1661,8 @@ void OfflineBoot::service(unsigned ordinal, Cpu& cpu) {
         if (arg(1) && event == events_.end()) return finish(cpu, 8, bad_handle);
         Word bytes = 0, result = valid ? 0 : bad_handle;
         std::optional<std::uint64_t> file_offset;
-        if (valid) {
+        if (valid && !(file->second.access & read_data)) result = access_denied;
+        else if (valid) {
             auto& opened = file->second;
             const auto offset = arg(7) ? memory_.load<std::uint64_t>(arg(7)) : opened.offset;
             file_offset = offset;
@@ -1602,9 +1692,11 @@ void OfflineBoot::service(unsigned ordinal, Cpu& cpu) {
             auto& opened = file->second;
             last_io_path_ = opened.path;
             result = write_protected;
-            if (!opened.disc_entry) {
+            if (!opened.disc_entry && !(opened.access & (write_data | append_data))) result = access_denied;
+            else if (!opened.disc_entry) {
                 auto& data = scratch_files_.at(opened.path);
-                const auto offset = arg(7) ? memory_.load<std::uint64_t>(arg(7)) : opened.offset;
+                const auto requested = arg(7) ? memory_.load<std::uint64_t>(arg(7)) : opened.offset;
+                const auto offset = !(opened.access & write_data) || requested == UINT64_MAX ? data.size() : requested;
                 if (offset > file_limit || arg(6) > file_limit - offset) break;
                 bytes = arg(6);
                 if (bytes) {
@@ -1632,8 +1724,12 @@ void OfflineBoot::service(unsigned ordinal, Cpu& cpu) {
             return finish(cpu, count, result);
         }
         if (const auto thread = handles_.find(handle); thread != handles_.end()) {
-            const auto* target = thread->second;
-            return finish(cpu, count, wait(cpu, timeout, [&] { return target->exited; }));
+            auto* target = thread->second;
+            ++target->waiters;
+            const auto result = wait(cpu,timeout,[target]{return target->exited;});
+            --target->waiters;
+            retire_thread(*target);
+            return finish(cpu,count,result);
         }
         return finish(cpu, count, bad_handle);
     }
@@ -1642,7 +1738,13 @@ void OfflineBoot::service(unsigned ordinal, Cpu& cpu) {
         const auto type = memory_.load<std::uint8_t>(object);
         if (type > 1 && type != 6 && type != 8 && type != 9) break;
         const auto next_signal = graphics_.ready() && object == GuestGraphics::vblank_event ? graphics_.next_vblank() : UINT64_MAX;
+        Thread* target = nullptr;
+        if (type == 6) {
+            auto found = std::ranges::find_if(threads_,[&](const Thread& t){return t.stack_bytes && t.object == object;});
+            if (found != threads_.end()) { target = &*found; ++target->waiters; }
+        }
         const auto result = wait(cpu, arg(4), [&] { return memory_.load<Word>(object + 4) != 0; }, next_signal);
+        if (target) { --target->waiters; retire_thread(*target); }
         if (!result && (type == 1 || type == 9)) memory_.store<Word>(object + 4, 0);
         return finish(cpu, 5, result);
     }
@@ -1830,7 +1932,7 @@ void OfflineBoot::report(std::ostream& output, std::string_view status, std::str
         << ",\"entry\":" << json(hex32(image_.entry)) << ",\"status\":" << json(status)
         << ",\"entry_returned\":" << (boot_thread.returned ? "true" : "false")
         << ",\"game_main_reached\":" << (main_reached ? "true" : "false")
-        << ",\"checkpoints\":" << diagnostic_.visits << ",\"eip\":" << json(hex32(stop_address_.value_or(cpu.eip)))
+        << ",\"checkpoints\":" << checkpoints() << ",\"eip\":" << json(hex32(stop_address_.value_or(cpu.eip)))
         << ",\"reason\":" << json(reason);
     if (failure_ordinal_) {
         out << ",\"kernel_ordinal\":" << *failure_ordinal_ << ",\"kernel_name\":" << json(kernel_name(*failure_ordinal_));
@@ -1924,6 +2026,13 @@ void OfflineBoot::report(std::ostream& output, std::string_view status, std::str
 }
 }
 
+std::uint32_t xbox_language(std::string_view code) {
+    // The XGetLanguage switch at 0x11480 indexes the title's EN/DE/FR strings.
+    if (code == "en") return 1;
+    if (code == "de") return 3;
+    if (code == "fr") return 4;
+    throw std::invalid_argument("Supported languages are en, fr and de");
+}
 int play_game(const PlayOptions& options, std::ostream& report) {
     Xbe image(options.xbe);
     Disc disc(options.disc);
@@ -1931,7 +2040,7 @@ int play_game(const PlayOptions& options, std::ostream& report) {
     use_shader_cache(options.shader_cache);
     PlayWindow window(options.hidden, options.fullscreen);
     return OfflineBoot(image, &disc, UINT64_MAX, 0, options.audio, options.capture, options.capture_index,
-                       options.input, &window, options.vsync, options.frames, options.storage, &options.diagnostics).run(report);
+                       options.input, &window, options.vsync, options.frames, options.storage, &options.diagnostics, options.language).run(report);
 }
 
 int boot_command(int argc, char* argv[]) {
@@ -1945,6 +2054,7 @@ int boot_command(int argc, char* argv[]) {
         Xbe image(argv[2]);
         std::optional<Disc> disc;
         bool audio_output = false;
+        Word language = 1;
         std::filesystem::path capture;
         std::filesystem::path shader_cache;
         InputScript input;
@@ -1954,6 +2064,8 @@ int boot_command(int argc, char* argv[]) {
             if (option == "--disc" && !disc && next < argc) {
                 disc.emplace(argv[next++]);
                 if (disc->executable_sha256() != image.sha256) throw std::runtime_error("XISO executable differs from the verified XBE");
+            } else if (option == "--language" && next < argc) {
+                language = xbox_language(argv[next++]);
             } else if (option == "--audio" && !audio_output) {
                 audio_output = true;
             } else if (option == "--frame" && capture.empty() && next < argc) {
@@ -1978,7 +2090,7 @@ int boot_command(int argc, char* argv[]) {
         if (capture_index && capture.empty()) throw std::runtime_error("Frame index requires --frame");
         use_shader_cache(std::move(shader_cache));
         return OfflineBoot(image, disc ? &*disc : nullptr, budget, breakpoint, audio_output,
-                           std::move(capture), capture_index ? capture_index : 1, std::move(input)).run();
+                           std::move(capture), capture_index ? capture_index : 1, std::move(input), nullptr,true,0,{},nullptr,language).run();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
