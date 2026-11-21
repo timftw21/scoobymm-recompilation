@@ -1,0 +1,10 @@
+#pragma once
+#include <cstdint>
+#include <string_view>
+
+namespace xbox_native::target {
+inline constexpr std::uint64_t file_size = @target_file_size@;
+inline constexpr std::string_view sha256 = "@target_file_sha256@";
+inline constexpr std::uint32_t entry_point = @target_entry_point@;
+inline constexpr std::uint32_t kernel_thunks = @target_kernel_thunks@;
+}

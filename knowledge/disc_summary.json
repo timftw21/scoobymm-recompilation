@@ -1,0 +1,97 @@
+{
+  "format": "scoobymm-disc-inventory-v1",
+  "complete": true,
+  "disc_size": 3573284864,
+  "disc_sha256": "17B0A027507AB82828D1CB63D3C30058B52EE6A95F833D8FA3BCF280CA69BE97",
+  "executable_sha256": "6B2451C01E2432BAB5E3AA0C9DFE2EB03F842C67F1417CBA158DD7A5C4AED75B",
+  "files": 5473,
+  "directories": 806,
+  "file_bytes": 3564752982,
+  "extensions": [
+    {
+      "extension": ".bin",
+      "files": 2,
+      "bytes": 32276
+    },
+    {
+      "extension": ".ft",
+      "files": 396,
+      "bytes": 1089224
+    },
+    {
+      "extension": ".ini",
+      "files": 1,
+      "bytes": 395
+    },
+    {
+      "extension": ".ls",
+      "files": 117,
+      "bytes": 5481
+    },
+    {
+      "extension": ".pal",
+      "files": 594,
+      "bytes": 125928
+    },
+    {
+      "extension": ".png",
+      "files": 1,
+      "bytes": 21922
+    },
+    {
+      "extension": ".sbb",
+      "files": 336,
+      "bytes": 286725960
+    },
+    {
+      "extension": ".sbh",
+      "files": 336,
+      "bytes": 11335188
+    },
+    {
+      "extension": ".tsc",
+      "files": 336,
+      "bytes": 118392
+    },
+    {
+      "extension": ".tse",
+      "files": 336,
+      "bytes": 1454442
+    },
+    {
+      "extension": ".tx",
+      "files": 195,
+      "bytes": 6198307
+    },
+    {
+      "extension": ".txd",
+      "files": 361,
+      "bytes": 428995171
+    },
+    {
+      "extension": ".xb",
+      "files": 2348,
+      "bytes": 336101208
+    },
+    {
+      "extension": ".xbe",
+      "files": 1,
+      "bytes": 1486848
+    },
+    {
+      "extension": ".xbr",
+      "files": 66,
+      "bytes": 370507744
+    },
+    {
+      "extension": ".xbx",
+      "files": 1,
+      "bytes": 18432
+    },
+    {
+      "extension": ".xmv",
+      "files": 46,
+      "bytes": 2120536064
+    }
+  ]
+}

@@ -1,0 +1,134 @@
+#pragma once
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <span>
+#include <string>
+#include <vector>
+
+struct SDL_AudioStream;
+namespace xbox_native {
+
+struct SpatialResult { float gain=1; std::array<float,2> pan{1,1},front_back{1,0},environment_gain{1,0},environment_pole{}; double pitch=1; };
+struct AudioFormat {
+    std::uint16_t tag=1,channels=1,block_align=2,bits=16,samples_per_block=0;
+    std::uint32_t rate=48000;
+    bool operator==(const AudioFormat&) const = default;
+};
+struct MixBin {std::uint32_t bin;std::int32_t volume;};
+struct AmplitudeEnvelope {
+    std::uint32_t delay{}, attack{}, hold{}, decay{};
+    float sustain = 1;
+    std::uint32_t release{};
+};
+struct AudioPosition {std::uint32_t play,write;};
+struct AudioStats {std::uint64_t batches=0,mix_ns=0,overruns=0;};
+enum class AudioBus {none,submix};
+std::vector<float> decode_audio(AudioFormat,std::span<const std::byte>);
+class Audio {
+public:
+    explicit Audio(bool output=true,bool muted=false);
+    ~Audio();
+    Audio(const Audio&)=delete;
+    Audio& operator=(const Audio&)=delete;
+    std::uint32_t create(AudioFormat,AudioBus bus=AudioBus::none,std::uint32_t input_bin=UINT32_MAX);
+    void release(std::uint32_t);
+    void data(std::uint32_t,std::span<const std::byte>);
+    void bind(std::uint32_t,std::span<const std::byte>,std::uint32_t source_address=0); // Caller keeps storage alive until unbound.
+    void format(std::uint32_t,AudioFormat);
+    void play(std::uint32_t, bool loop, bool restart = false, bool synchronized = false);
+    void stop(std::uint32_t);
+    void release_envelope(std::uint32_t, bool release_waveform);
+    std::uint32_t status(std::uint32_t);
+    void queue_packet(std::uint32_t, std::span<const std::byte>);
+    std::uint64_t completed_packets(std::uint32_t);
+    std::uint64_t flush_packets(std::uint32_t);
+    std::uint32_t stream_status(std::uint32_t);
+    void end_segment(std::uint32_t);
+    void envelope(std::uint32_t, const AmplitudeEnvelope&);
+    void pause(std::uint32_t, unsigned mode);
+    std::uint32_t pause_buffer(std::uint32_t, unsigned mode);
+    void synchronize_playback();
+    AudioPosition positions(std::uint32_t);
+    std::uint32_t position(std::uint32_t);
+    void position(std::uint32_t,std::uint32_t bytes);
+    void region(std::uint32_t,bool loop,std::uint32_t start,std::uint32_t bytes);
+    void volume(std::uint32_t,std::int32_t hundredths_db);
+    // Native voices only: move a linear level to gain over output frames,
+    // optionally stopping the voice once the ramp reaches silence.
+    void ramp(std::uint32_t,float gain,std::uint32_t frames,bool stop=false);
+    void headroom(std::uint32_t,std::uint32_t hundredths_db);
+    void mixbin_headroom(std::uint32_t bin,std::uint32_t shift);
+    void mixbins(std::uint32_t,std::span<const MixBin>,bool volumes_only=false);
+    void frequency(std::uint32_t,std::uint32_t hz);
+    void route(std::uint32_t,std::uint32_t destination);
+    void spatial(std::uint32_t,const SpatialResult&);
+    void mix(std::span<float> stereo);
+    std::uint32_t sample_clock() const {return frames_processed_.load(std::memory_order_relaxed);}
+    float output_peak() const {return output_peak_.load(std::memory_order_relaxed);}
+    std::string failure();
+    bool output_ready() const {return stream_!=nullptr;}
+    void output_gain(float);
+    void recording(bool enabled) {recording_.store(enabled,std::memory_order_relaxed);}
+    AudioStats stats() const {return {batches_.load(),mix_ns_.load(),overruns_.load()};}
+private:
+    struct Voice {
+        struct Packet {
+            std::vector<std::byte> bytes;
+            bool ends_segment = false;
+        };
+        AudioFormat format;
+        std::vector<std::byte> encoded;
+        std::span<const std::byte> source;
+        std::unique_ptr<std::deque<Packet>> packets;
+        std::uint64_t completed_packets = 0;
+        unsigned pause_mode = 0;
+        AmplitudeEnvelope envelope;
+        std::uint32_t envelope_frame = 0;
+        std::uint32_t release_remaining = 0;
+        float release_gain = 0, release_step = 0;
+        std::array<float,128> block{};
+        std::uint32_t cached_block=UINT32_MAX,source_address=0;
+        double cursor=0,step=1;
+        float gain=1,headroom=1,spatial_gain=1,level=1,level_target=1,level_step=0;
+        std::uint32_t level_frames=0;
+        bool stop_after_ramp=false;
+        std::array<float,2> spatial_pan{1,1};
+        std::array<float,2> front_back{1,0},environment_gain{1,0},environment_pole{};
+        std::array<std::array<float,2>,2> environment_history{};
+        double spatial_pitch=1;
+        std::array<std::uint32_t,8> bins{0,1};
+        std::array<float,32> bin_gains{};
+        std::uint32_t bin_count=2,input_bin=UINT32_MAX;
+        std::uint32_t byte_count=0,play_start=0,play_frames=0,loop_start=0,loop_frames=0,route=0;
+        AudioBus bus=AudioBus::none;
+        bool used=false,playing=false,loop=false;
+    };
+    Voice& voice(std::uint32_t);
+    static std::uint32_t frames(AudioFormat,std::uint32_t bytes);
+    static void select_packet(Voice&);
+    static void advance_packets(Voice&);
+    static float envelope_gain(Voice&);
+    std::array<float,2> sample(Voice&,std::uint32_t frame);
+    void mix_unlocked(std::span<float>);
+    void mix_sources(std::span<float>);
+    void mix_bins(std::span<float>,unsigned frames);
+    void mix_voice(Voice&,std::span<const std::array<float,2>>,std::span<float>,unsigned frames);
+
+
+    SDL_AudioStream* stream_=nullptr;
+    std::array<Voice,256> voices_{};
+    std::array<std::uint32_t,32> bin_headroom_{};
+    std::atomic<std::uint32_t> frames_processed_{0};
+    std::atomic<float> output_peak_{};
+    std::atomic<bool> recording_{false};
+    std::atomic<std::uint64_t> batches_{0},mix_ns_{0},overruns_{0};
+    bool failed_=false;
+    std::array<char,256> failure_{};
+};
+
+}
+

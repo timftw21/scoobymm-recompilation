@@ -1,0 +1,140 @@
+Scooby-Doo! Mystery Mayhem recompilation design
+
+Build a small, native recompilation of the original Xbox release for Windows x64,
+Linux x86-64 and macOS on Intel and Apple Silicon. Prioritize performance while
+preserving gameplay, timing, sound and visual parity. Use the original executable
+and data from the player's disc image.
+
+1. Supported disc and executable
+
+Start with the supplied Scooby-Doo! Mystery Mayhem (USA, Europe) (En,Fr,De) XISO.
+The accompanying Verification.txt records the source Redump ISO and its checksums.
+Identify the supported executable by the SHA-256 of default.xbe in the XISO.
+The local image contains an XBE with title ID 0x5451000E, certificate version 2
+and size 1,486,848 bytes. Its SHA-256 is
+6B2451C01E2432BAB5E3AA0C9DFE2EB03F842C67F1417CBA158DD7A5C4AED75B.
+
+Record the verified identity, entry point, sections and imports in
+knowledge/supported_target.json during bring-up. Check the executable against
+that record before generation and report unsupported builds clearly. Keep game
+files local and read-only. Store generated files, settings and saves separately.
+Use knowledge/ for findings tied to XBE addresses, bytes or named disc resources.
+Start the resource inventory with the level, global, STREAM and MOVIES directories
+observed at the root of the image.
+
+2. Native code and Xbox services
+
+Use C++23, C where useful, HLSL and CMake. Build the recompiler, extraction and
+diagnostic tools with the native toolchain. Generation, building, gameplay and
+debugging must work without Python.
+
+Build instruction and function maps from bounded analysis of the supported XBE,
+then compile the game ahead of time. Preserve 32-bit Xbox addresses, memory
+layouts, calling conventions and CPU behavior. Use direct native calls and
+verified target tables for indirect calls. Report unresolved instructions or
+call targets with their addresses and bytes. Resolve their behavior before
+accepting an affected path.
+
+Bind Xbox services to native file, graphics, input and audio facilities.
+Implement the effects and error behavior the game relies on, including disc
+reads and save operations. Report these bindings separately from translated game
+code. Keep gameplay in one process. Share the core between two executables,
+the game with settings and a command-line tool for generation and diagnostics.
+
+3. Accuracy
+
+Match the Xbox game's camera, geometry, textures, lighting, draw order, effects,
+menus and HUD. Compare at matching aspect ratio and framing. Verify widescreen
+separately for camera coverage and HUD placement. Check movie playback and
+audio/video sync, dialogue, music and effects alongside rendering.
+
+Use captures of the original Xbox release as visual references [1]. Record the
+source, timestamp, scene and known display settings. Account for capture scaling,
+compression and color differences. Use executable and asset evidence for rules
+that video alone cannot establish. Offline validation works without booting the
+game or running an Xbox emulator.
+
+Cover character switching, puzzle and episode progression, Tome of Doom captures,
+minigames, cutscene transitions and save/reload. Verify the English, French and
+German modes indicated by the disc label. Play through the full game on each
+supported platform before release.
+
+4. Performance
+
+Target sustained 360 FPS or higher at 1x native render resolution in widescreen
+with VSync off, a budget of 2.778 ms per frame. Before acceptance, record the
+reference hardware, render dimensions and repeatable menu, exploration, ghost
+capture and minigame scenes. Count rendered frames and game updates separately.
+Record median and 99th-percentile frame times, CPU and GPU time, loading times
+and peak memory. Measure both the first run and repeated runs.
+
+Establish the Xbox game's timing from evidence and preserve it across display
+refresh rates and frame caps. Check movement, input windows, scripted events,
+camera and audio timing at the original cadence and with uncapped rendering.
+Reuse buffers, cache shaders and textures within measured limits, and upload
+changed data. Keep blocking I/O, shader compilation and detailed tracing out of
+the game loop. Add threads for measured bottlenecks.
+
+5. Offline diagnostics
+
+Use one command-line tool to inspect XBE addresses and disc assets, run isolated
+CPU and service cases, replay draws or frames offscreen, compare images, inspect
+audio and report performance. Reuse the same code paths as gameplay. Start with
+small cases derived from executable and asset evidence. Store the state, commands,
+resources and expected output needed for each replay. Add opt-in game captures
+once the runtime is available. Keep tracing disabled during normal play.
+
+Batch runs return clear exit codes and structured results. Tie failures to the
+relevant address, draw or asset. Use visual comparisons to pinpoint missing
+effects and record the tolerances needed for capture and rasterization differences.
+
+6. SDL3 and Direct3D 11
+
+Use SDL3 for windows, events, controllers and audio. Translate Xbox GPU behavior
+to a shared D3D11 renderer with HLSL shaders and use the platform's presentation
+path with the SDL3 window [2].
+
+Windows uses native D3D11 and DXGI. Linux uses DXVK Native over Vulkan with its
+SDL3 window integration [3]. Compile Linux HLSL ahead of time with vkd3d-shader
+[4]. Keep host file handling and CPU helpers behind the shared core interfaces.
+
+For macOS, validate a native DXMT/Metal path with an SDL3 Metal view on both Intel
+and Apple Silicon [5]. Prove offscreen rendering, window presentation and required
+shader behavior on each architecture before committing to that backend. Generate
+native ARM64 code through C++ and validate Xbox x86 floating-point behavior on
+Apple Silicon, including any x87 operations used by the game. Linux and macOS
+builds must run without Wine.
+
+7. Player settings
+
+Use Dear ImGui with the SDL3 and D3D11 backends [6, 7]. Provide disc-image
+selection and validation, display mode, resolution, aspect ratio, VSync, audio
+controls and controller remapping. Support keyboard and controller navigation,
+persistent settings, restore defaults and clear error messages. Put diagnostics
+in an advanced view.
+
+Implementation order
+
+1. Verify the XBE and map executable sections, imports and disc resources.
+2. Generate native code and prove isolated CPU and service behavior offline.
+3. Replay representative Xbox draws through D3D11 and compare Xbox captures.
+4. Integrate input, audio, movies, saves and settings. Boot and play on Windows.
+5. Validate the native Linux and macOS paths, then measure compatibility,
+   visual parity and performance against the same scenarios on each platform.
+
+References
+
+[1] Original Xbox capture candidate, John GodGames
+    https://www.youtube.com/watch?v=QHOSH9Wr1hU
+[2] SDL GPU API and supported backends
+    https://wiki.libsdl.org/SDL3/CategoryGPU
+[3] DXVK Native and its SDL3 window integration
+    https://github.com/doitsujin/dxvk#dxvk-native
+[4] WineHQ vkd3d-shader
+    https://gitlab.winehq.org/wine/vkd3d
+[5] DXMT project and platform requirements
+    https://github.com/3Shain/dxmt/wiki/Device-System-Runtime-Specifications
+[6] Dear ImGui SDL3 backend
+    https://github.com/ocornut/imgui/blob/master/backends/imgui_impl_sdl3.h
+[7] Dear ImGui D3D11 backend
+    https://github.com/ocornut/imgui/blob/master/backends/imgui_impl_dx11.h

@@ -1,0 +1,163 @@
+#include "analysis_map.h"
+#include "xbox/boot.h"
+#include "xbox/file.h"
+
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <chrono>
+#include <iostream>
+#include <stdexcept>
+#include <string_view>
+#include <Windows.h>
+
+namespace {
+constexpr std::array<std::wstring_view, 4> dpad_options{
+    L"--up-at-scanout", L"--down-at-scanout", L"--left-at-scanout", L"--right-at-scanout"
+};
+constexpr std::array<std::wstring_view, 3> face_options{
+    L"--confirm-at-scanout", L"--b-at-scanout", L"--x-at-scanout"
+};
+
+std::filesystem::path application_root() {
+    std::array<wchar_t, 32768> path;
+    const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (!length || length == path.size()) throw std::runtime_error("Cannot locate the game executable");
+    const auto directory = std::filesystem::path(std::wstring_view(path.data(), length)).parent_path();
+    for (auto candidate = directory;;) {
+        if (std::filesystem::is_regular_file(candidate / "knowledge/supported_target.json")) return candidate;
+        auto parent = candidate.parent_path();
+        if (parent.empty() || candidate == parent) return directory;
+        candidate = std::move(parent);
+    }
+}
+
+void usage() {
+    std::cout << "scoobymm [DEFAULT.xbe DISC.xiso] [--fullscreen] [--mute] [--no-vsync]\n"
+                 "  Omit both media paths to use this project's verified Xbox files.\n"
+                 "  --shader-cache DIR   Cached native shaders\n"
+                 "  --storage DIR        Playtest save directory (default data/user)\n"
+                 "  --report JSON        New session report\n"
+                 "  --frame PNG [--frame-index N]   Save a scanout\n"
+                 "  --capture-frame DIR [--capture-at N]   Request an F8 capture after scanout N\n"
+                 "  --performance DIR [--performance-at N] [--performance-frames N]\n"
+                 "                       Record F9 diagnostics after scanout N\n"
+                 "  --hidden --frames N   Bounded run with a hidden window\n"
+                 "  --start-at-scanout N, --confirm-at-scanout N, --b-at-scanout N, --x-at-scanout N   Script button input\n"
+                 "  --up-at-scanout N, --down-at-scanout N, --left-at-scanout N, --right-at-scanout N   Script D-pad input\n"
+                 "  --stick-at-scanout N FRAMES X Y   Hold the left stick at signed Xbox coordinates\n"
+                 "Keyboard: Enter to start, Space to confirm, Left Shift to go back,\n"
+                 "arrows for the D-pad, W/A/S/D for the left stick, Escape to quit.\n"
+                 "F8 captures a frame. F9 starts or stops performance recording (60 seconds maximum).\n";
+}
+}
+
+int wmain(int argc, wchar_t* argv[]) {
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--help") { usage(); return 0; }
+    try {
+        xbox_native::PlayOptions options;
+        std::filesystem::path root;
+        int next = 1;
+        if (argc > 1 && !std::wstring_view(argv[1]).starts_with(L"--")) {
+            if (argc < 3 || std::wstring_view(argv[2]).starts_with(L"--")) {
+                throw std::runtime_error("Provide both media paths or omit both");
+            }
+            options.xbe = argv[1];
+            options.disc = argv[2];
+            next = 3;
+        } else {
+            root = application_root();
+            options.xbe = root / "data/local/default.xbe";
+            options.disc = root / "Scooby-Doo! Mystery Mayhem/Scooby-Doo! Mystery Mayhem (USA, Europe) (En,Fr,De).xiso.iso";
+        }
+        options.shader_cache = root / "build/shader-cache";
+        options.storage = root / "data/user";
+        std::filesystem::path report_path;
+        bool explicit_frame_index = false, capture_at = false, performance_at = false;
+        for (int i=next;i<argc;++i) {
+            const std::wstring_view option = argv[i];
+            const auto argument = [&] {
+                if (++i == argc || std::wstring_view(argv[i]).starts_with(L"--")) {
+                    throw std::runtime_error("A play option is missing its value");
+                }
+                return std::filesystem::path(argv[i]);
+            };
+            const auto nonzero = [&] {
+                const auto value = analysis_map::number(argument().string());
+                if (!value) throw std::runtime_error("A scanout or frame count must be positive");
+                return value;
+            };
+            const auto pulse = [&](auto& list) {
+                if (list.size() == 32) throw std::runtime_error("Specify at most 32 pulses per button");
+                list.push_back(nonzero());
+            };
+            const auto axis = [&] {
+                const auto text = argument().string();
+                std::int16_t value{};
+                const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+                if (error != std::errc{} || end != text.data() + text.size())
+                    throw std::runtime_error("Stick coordinates must be signed 16-bit integers");
+                return value;
+            };
+            if (option == L"--fullscreen") options.fullscreen = true;
+            else if (option == L"--mute") options.audio = false;
+            else if (option == L"--no-vsync") options.vsync = false;
+            else if (option == L"--hidden") options.hidden = true;
+            else if (option == L"--frames") options.frames = nonzero();
+            else if (option == L"--shader-cache") options.shader_cache = argument();
+            else if (option == L"--storage") options.storage = argument();
+            else if (option == L"--report") report_path = argument();
+            else if (option == L"--frame") options.capture = argument();
+            else if (option == L"--frame-index") { options.capture_index = nonzero(); explicit_frame_index = true; }
+            else if (option == L"--capture-frame") options.diagnostics.frame = argument();
+            else if (option == L"--capture-at") { options.diagnostics.capture_at = nonzero(); capture_at = true; }
+            else if (option == L"--performance") options.diagnostics.performance = argument();
+            else if (option == L"--performance-at") { options.diagnostics.performance_at = nonzero(); performance_at = true; }
+            else if (option == L"--performance-frames") options.diagnostics.performance_frames = nonzero();
+            else if (option == L"--start-at-scanout") pulse(options.input.start);
+            else if (option == L"--stick-at-scanout") {
+                if (options.input.stick.size() == 32) throw std::runtime_error("Specify at most 32 stick inputs");
+                options.input.stick.push_back({nonzero(), nonzero(), axis(), axis()});
+            } else if (const auto button = std::ranges::find(face_options, option); button != face_options.end()) {
+                pulse(options.input.face[button - face_options.begin()]);
+            } else if (const auto direction = std::ranges::find(dpad_options, option); direction != dpad_options.end()) {
+                pulse(options.input.dpad[direction - dpad_options.begin()]);
+            } else throw std::runtime_error("Unknown play option: " + std::filesystem::path(option).string());
+        }
+        if (explicit_frame_index && options.capture.empty()) throw std::runtime_error("Frame index requires --frame");
+        if (capture_at && options.diagnostics.frame.empty()) throw std::runtime_error("--capture-at requires --capture-frame");
+        if ((performance_at || options.diagnostics.performance_frames) && options.diagnostics.performance.empty())
+            throw std::runtime_error("Performance timing options require --performance");
+        for (const auto& directory : {options.diagnostics.frame, options.diagnostics.performance}) {
+            if (!directory.empty() && std::filesystem::exists(directory))
+                throw std::runtime_error("Diagnostic output must be a new directory");
+        }
+        if (!options.capture.empty() && (options.capture.extension() != ".png" || std::filesystem::exists(options.capture))) {
+            throw std::runtime_error("Frame output must be a new PNG file");
+        }
+        if (report_path.empty()) {
+            const auto started = std::chrono::system_clock::now().time_since_epoch().count();
+            report_path = root / std::format("build/logs/playtest-{}.json", started);
+            std::filesystem::create_directories(report_path.parent_path());
+        }
+        std::ofstream report(report_path, std::ios::binary | std::ios::noreplace);
+        if (!report) throw std::runtime_error("Play session report must be a new file in an existing directory");
+        options.diagnostics.root = (root.empty() ? application_root() : root) / "build/captures";
+        options.diagnostics.session_report = std::filesystem::absolute(report_path);
+        std::cout << "Session report " << xbox_native::path_text(std::filesystem::absolute(report_path)) << '\n';
+        int code;
+        try {
+            code = xbox_native::play_game(options, report);
+        } catch (const std::exception& error) {
+            report << "{\"status\":\"startup_error\",\"reason\":" << xbox_native::json(error.what()) << "}\n";
+            throw;
+        }
+        report.flush();
+        if (!report) throw std::runtime_error("Cannot write the play session report");
+        if (code) std::cerr << "The game stopped. See the session report for the guest address and reason.\n";
+        return code;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}

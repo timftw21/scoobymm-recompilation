@@ -1,0 +1,17 @@
+#pragma once
+#include <cstdint>
+#include <string_view>
+
+namespace xbox_native {
+inline constexpr std::string_view verified_disc_sha256 = "@verified_disc_sha256@";
+struct BootModule {
+    std::string_view name, path;
+    std::uint32_t record_offset, record_size;
+    std::string_view record_hash;
+    std::uint32_t object_offset, object_size;
+    std::string_view object_hash;
+    std::uint32_t registration, registration_call;
+};
+inline constexpr BootModule boot_modules[] = {
+@module_entries@};
+}

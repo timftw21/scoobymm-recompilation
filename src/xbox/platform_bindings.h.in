@@ -1,0 +1,12 @@
+#pragma once
+#include <cstdint>
+#include <string_view>
+
+namespace xbox_native {
+enum class PlatformApi : std::uint32_t {
+@platform_enum@};
+
+struct PlatformBinding { PlatformApi api; std::string_view name, prefix; };
+inline constexpr PlatformBinding platform_bindings[] = {
+@platform_entries@};
+}

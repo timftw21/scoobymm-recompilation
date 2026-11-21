@@ -1,0 +1,130 @@
+#include "cpu.h"
+#include "unwind.h"
+#include <algorithm>
+#include <atomic>
+
+namespace xbox_native {
+void writeback_guest_cache(const Cpu& cpu) {
+    if (cpu.cs_selector & 3) throw GuestTrap(13, cpu.eip, cpu.eip);
+    // Guest RAM and its aliases share ordinary coherent host memory. Publish CPU writes before the next device access.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+bool invoke_platform(Cpu& cpu, Memory& memory, std::uint32_t address) {
+    if (!cpu.kernel || !cpu.kernel->platform) return false;
+    cpu.eip = address;
+    HostFloatingScope host(cpu.floating);
+    return cpu.kernel->platform(cpu.kernel->context, cpu, memory, address);
+}
+std::uint32_t read_port(Cpu& cpu,std::uint16_t port,unsigned width) {
+    if(!cpu.kernel || !cpu.kernel->read_port) throw NativeBoundary(cpu.eip,std::format("unbound {}-bit input port 0x{:04X}",width,port));
+    HostFloatingScope host(cpu.floating);
+    return cpu.kernel->read_port(cpu.kernel->context,port,width);
+}
+void write_port(Cpu& cpu,std::uint16_t port,unsigned width,std::uint32_t value) {
+    if(!cpu.kernel || !cpu.kernel->write_port) throw NativeBoundary(cpu.eip,std::format("unbound {}-bit output port 0x{:04X}",width,port));
+    HostFloatingScope host(cpu.floating);
+    cpu.kernel->write_port(cpu.kernel->context,port,width,value);
+}
+void invoke_native(Cpu& cpu, Memory& memory, std::uint32_t address) {
+    const auto caller = cpu.eip;
+    cpu.eip = address;
+    if(address>0xFFF00000U && address<0xFFF02000U && !(address&15U)) {
+        const auto ordinal=(address-0xFFF00000U)/16;
+        if(!cpu.kernel || !cpu.kernel->entries[ordinal]) throw NativeBoundary(address,"kernel function is unbound");
+        HostFloatingScope host(cpu.floating);
+        cpu.kernel->entries[ordinal](cpu.kernel->context,cpu,memory);
+        return;
+    }
+    const auto found = std::ranges::lower_bound(compiled_batch, address, {}, &CompiledFunction::address);
+    if (found != compiled_batch.end() && found->address == address) {
+        found->run(cpu, memory);
+        return;
+    }
+    if (cpu.kernel && cpu.kernel->resolve_module) {
+        if (const auto function = cpu.kernel->resolve_module(cpu.kernel->context, cpu, caller)) {
+            function(cpu, memory);
+            return;
+        }
+    }
+    throw NativeBoundary(address, std::format("call or jump from 0x{:08X} has no mapped entry", caller));
+}
+
+void unwind_guest(Cpu& cpu, Memory& memory, std::uint32_t target, std::uint32_t resume,
+                  std::uint32_t record, std::uint32_t value) {
+    using Word = std::uint32_t;
+    constexpr Word chain_end = UINT32_MAX;
+    constexpr Word handler_return = 0xFFFFFFD4;
+    const auto registers = cpu.registers;
+    const auto flags = cpu.flags, site = cpu.eip, stack = registers[esp], tib = cpu.fs_base;
+    if (!target || resume != memory.load<Word>(stack))
+        throw NativeBoundary(site, "RtlUnwind requires a target frame and the CRT return address");
+    const auto low = memory.load<Word>(tib + 8), high = memory.load<Word>(tib + 4);
+    if (high < 20 || stack < low || stack > high - 20)
+        throw NativeBoundary(site, "RtlUnwind entered with an invalid stack");
+    const auto next_frame = [&](Word frame) {
+        if (frame == chain_end || (frame & 3) || frame < stack || frame > high - 8)
+            throw NativeBoundary(site, "RtlUnwind encountered an invalid exception frame");
+        const auto next = memory.load<Word>(frame);
+        if (next <= frame || (target != chain_end && next > target))
+            throw NativeBoundary(site, "RtlUnwind target is outside the registered exception chain");
+        return next;
+    };
+    auto frame = memory.load<Word>(tib);
+    for (auto current = frame; current != target; current = next_frame(current)) {}
+    if (target != chain_end && ((target & 3) || target < stack || target > high - 8))
+        throw NativeBoundary(site, "RtlUnwind target is outside the guest stack");
+
+    constexpr Word unwinding = 2; // EXCEPTION_UNWINDING
+    if (record) memory.store(record + 4, memory.load<Word>(record + 4) | unwinding);
+    if (frame != target) {
+        struct Context32 {
+            Word flags;
+            std::array<Word, 34> debug_and_x87;
+            Word gs, fs, es, ds, edi, esi, ebx, edx, ecx, eax, ebp, eip, cs, eflags, esp, ss;
+            std::array<std::byte, 512> extended;
+        };
+        static_assert(sizeof(Context32) == 716 && offsetof(Context32, eip) == 184);
+        constexpr Word record_size = 80, context_size = sizeof(Context32), dispatch_size = 4, call_size = 20;
+        constexpr Word scratch_size = record_size + context_size + dispatch_size + call_size;
+        if (stack - low < scratch_size) throw NativeBoundary(site, "RtlUnwind ran out of guest stack");
+        const auto context = stack - record_size - context_size;
+        const auto dispatch = context - dispatch_size, call = dispatch - call_size;
+        if (!record) {
+            record = stack - record_size;
+            std::memset(memory.access(record, record_size), 0, record_size);
+            memory.store<Word>(record, 0xC0000027); // STATUS_UNWIND
+            memory.store(record + 4, unwinding);
+            memory.store(record + 12, resume);
+        }
+        const Context32 original{
+            0x00010007, {}, cpu.gs_selector, cpu.fs_selector, cpu.ds_selector, cpu.ds_selector,
+            registers[edi], registers[esi], registers[ebx], registers[edx], registers[ecx], value,
+            registers[ebp], resume, cpu.cs_selector, flags, stack + 20, cpu.ss_selector, {}
+        };
+        std::memcpy(memory.access(context, sizeof(original)), &original, sizeof(original));
+        while (frame != target) {
+            const auto next = next_frame(frame);
+            memory.store(dispatch, frame);
+            const Word arguments[]{handler_return, record, frame, context, dispatch};
+            std::memcpy(memory.access(call, sizeof(arguments)), arguments, sizeof(arguments));
+            cpu.registers = registers;
+            cpu.registers[esp] = call;
+            cpu.flags = flags;
+            cpu.eip = site;
+            invoke_native(cpu, memory, memory.load<Word>(frame + 4));
+            if (cpu.eip != handler_return || cpu.registers[esp] != call + 4 ||
+                cpu.registers[eax] != 1 || memory.load<Word>(tib) != frame) {
+                throw NativeBoundary(site, "Exception handler did not finish the requested unwind");
+            }
+            memory.store(tib, next);
+            frame = next;
+        }
+    }
+    cpu.registers = registers;
+    cpu.registers[esp] = stack + 20;
+    cpu.registers[eax] = value;
+    cpu.flags = flags;
+    cpu.eip = resume;
+}
+}

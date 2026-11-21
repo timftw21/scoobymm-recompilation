@@ -1,0 +1,507 @@
+{
+  "schema_version": 1,
+  "disc_sha256": "17B0A027507AB82828D1CB63D3C30058B52EE6A95F833D8FA3BCF280CA69BE97",
+  "executable_sha256": "6B2451C01E2432BAB5E3AA0C9DFE2EB03F842C67F1417CBA158DD7A5C4AED75B",
+  "modules": [
+    {
+      "name": "api_memcard",
+      "disc_path": "LEVEL/LOADER/GEN/LOADER.XBR",
+      "record_file_offset": 6712,
+      "record_size": 16337,
+      "record_sha256": "573147003CEC84315A1C67C0A6953B1324FE6B1E76985995D36F37DFC6E82FBC",
+      "object_format": "COFF-i386",
+      "object_record_offset": 24,
+      "object_size": 16313,
+      "object_sha256": "82C67DFCF81C6C940764E979033DE9560F520F249A55276986AA3EC6D4F7CECE",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 8992,
+        "relocation_object_offset": 9052,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 503
+      },
+      "function_symbols": 35,
+      "registration": {
+        "symbol": "_api_memcardRegister",
+        "section_offset": "0x2168",
+        "xbe_call_address": "0x0003A6B5",
+        "observed_section_base": "0x00178910",
+        "observed_entry": "0x0017AA78",
+        "entry_prefix": "5589E583EC14538B5D088B4378FFD0A3"
+      }
+    },
+    {
+      "name": "api_loadsave_debug",
+      "disc_path": "LEVEL/LOADER/GEN/LOADER.XBR",
+      "record_file_offset": 23049,
+      "record_size": 36303,
+      "record_sha256": "4CEC495DCA2379CF112647C9A77D01E5EAA227B649EBB29EFE64D4691040DC2D",
+      "object_format": "COFF-i386",
+      "object_record_offset": 31,
+      "object_size": 36272,
+      "object_sha256": "9110382D79A16EE8758FB8E833ED8521B282675F680DDF296375443DE98D76BB",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 32736,
+        "relocation_object_offset": 32796,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 143
+      },
+      "function_symbols": 40,
+      "registration": {
+        "symbol": "_api_loadsave_debugRegister",
+        "section_offset": "0x1120",
+        "xbe_call_address": "0x0003A6B5",
+        "entry_prefix": "5589E583EC088B45088B4078FFD0A3C8"
+      }
+    },
+    {
+      "name": "miscfunc",
+      "disc_path": "LEVEL/LOADER/GEN/LOADER.XBR",
+      "record_file_offset": 59352,
+      "record_size": 9864,
+      "record_sha256": "8AF6B8C2D0C2AE625113228157656F234D9EDBF25C9A9520B1D6428431DAD0CE",
+      "object_format": "COFF-i386",
+      "object_record_offset": 21,
+      "object_size": 9843,
+      "object_sha256": "E93BDFDE6B1D1AC70FB38C6BDFB178A8BFE7D76EE7B8F18644A33A8DC30EEBBD",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 7532,
+        "relocation_object_offset": 7592,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 86
+      },
+      "function_symbols": 19,
+      "registration": {
+        "symbol": "_miscfuncRegister",
+        "section_offset": "0x1580",
+        "xbe_call_address": "0x0003A6B5",
+        "entry_prefix": "5589E583EC14538B5D088B4328FFD0A3"
+      }
+    },
+    {
+      "name": "loader",
+      "disc_path": "LEVEL/LOADER/GEN/LOADER.XBR",
+      "record_file_offset": 69216,
+      "record_size": 158462,
+      "record_sha256": "7649969B9C6BDE8E6A93398E4FEA8254996763E680828E41229F690D42EFCCB2",
+      "object_format": "COFF-i386",
+      "object_record_offset": 19,
+      "object_size": 158443,
+      "object_sha256": "3332F92F0129DAB279D090D766C6B586AAFD758CBE254A7468D36E95B8F383C0",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 153920,
+        "relocation_object_offset": 153980,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 338
+      },
+      "function_symbols": 11,
+      "registration": {
+        "symbol": "_loaderConstructor",
+        "section_offset": "0x1DAC",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC14538B5D08837D0C010F85",
+        "observed_section_base": "0x00185800",
+        "observed_entry": "0x001875AC"
+      }
+    },
+    {
+      "name": "memorymanager",
+      "disc_path": "LEVEL/LOADER/GEN/LOADER.XBR",
+      "record_file_offset": 227678,
+      "record_size": 8149,
+      "record_sha256": "F70A68E8F5401E74247FF490122D90A28112145C988514097E3B4BB442DEA19A",
+      "object_format": "COFF-i386",
+      "object_record_offset": 26,
+      "object_size": 8123,
+      "object_sha256": "F0551797E6DB1ECA43AE53084891B3D2E8BD6331F1D8ABFFC60F012C0CCB793B",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 5624,
+        "relocation_object_offset": 5684,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 115
+      },
+      "function_symbols": 21,
+      "registration": {
+        "symbol": "_memorymanagerConstructor",
+        "section_offset": "0x149C",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC5056538B7508837D0C0175"
+      }
+    },
+    {
+      "name": "savepanel",
+      "disc_path": "LEVEL/LOADER/GEN/LOADER.XBR",
+      "record_file_offset": 235827,
+      "record_size": 65815,
+      "record_sha256": "33CA43EB9645A844A0436583F107143AF64FBAEB3A15E02D9EF36FD253929131",
+      "object_format": "COFF-i386",
+      "object_record_offset": 22,
+      "object_size": 65793,
+      "object_sha256": "2394D90A5B8E147D3D1820F3FBC4CA21F2C787E127262127B94D7AF1E435FA75",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 42152,
+        "relocation_object_offset": 42212,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 1943
+      },
+      "function_symbols": 70,
+      "registration": {
+        "symbol": "_savepanelConstructor",
+        "section_offset": "0x8BE4",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC14538B5D08837D0C010F85"
+      }
+    },
+    {
+      "name": "loader_camera",
+      "disc_path": "LEVEL/LOADER/GEN/LOADER.XBR",
+      "record_file_offset": 301642,
+      "record_size": 4272,
+      "record_sha256": "EC525962ECB99F0681ED69C431E014EB8F2E8EBA2A3104CEE00F904D3B093B73",
+      "object_format": "COFF-i386",
+      "object_record_offset": 26,
+      "object_size": 4246,
+      "object_sha256": "ACDDFC7CD83B8A4558559EEB810FD44CC374C317803615360E8F14F28E3CB751",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 3504,
+        "relocation_object_offset": 3564,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 11
+      },
+      "function_symbols": 4,
+      "registration": {
+        "symbol": "_loader_cameraConstructor",
+        "section_offset": "0x0CC4",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC1056538B750883C4F88B5D"
+      }
+    },
+    {
+      "name": "mischud",
+      "disc_path": "LEVEL/INTRO/GEN/INTRO.XBR",
+      "record_file_offset": 86992,
+      "record_size": 6507,
+      "record_sha256": "154413A85C37C2E691B6EAC522373C41A4F451A56A020B97DFBCB09DC0C492B4",
+      "object_format": "COFF-i386",
+      "object_record_offset": 20,
+      "object_size": 6487,
+      "object_sha256": "54106AFE2A30EE7BC76C4312DF2E6D42416F0E18B58E0FEFB32F2D46A9C5C653",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 5016,
+        "relocation_object_offset": 5076,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 47
+      },
+      "function_symbols": 12,
+      "registration": {
+        "symbol": "_mischudRegister",
+        "section_offset": "0x1290",
+        "xbe_call_address": "0x0003A6B5",
+        "entry_prefix": "5589E583EC14538B5D088B4378FFD0A3",
+        "observed_entry": "0x0018CE50",
+        "observed_section_base": "0x0018BBC0"
+      }
+    },
+    {
+      "name": "title_camera",
+      "disc_path": "LEVEL/INTRO/GEN/INTRO.XBR",
+      "record_file_offset": 93499,
+      "record_size": 56472,
+      "record_sha256": "319D474D3139977C91BF0F49319C6CE24425D291665781061C88E588585F7BDF",
+      "object_format": "COFF-i386",
+      "object_record_offset": 25,
+      "object_size": 56447,
+      "object_sha256": "716706C7C3CB093B48A974506711413B195D1854F5A94ACEBB747BAE40220296",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 37024,
+        "relocation_object_offset": 37084,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 1310
+      },
+      "function_symbols": 82,
+      "registration": {
+        "symbol": "_title_cameraConstructor",
+        "section_offset": "0x8AE0",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC1056538B750883C4F88B5D"
+      }
+    },
+    {
+      "name": "inv",
+      "disc_path": "LEVEL/INTRO/GEN/INTRO.XBR",
+      "record_file_offset": 149971,
+      "record_size": 4016,
+      "record_sha256": "FE2CB86F26F10186827CA82594DCD055317FB86E0D50455CDB67B44AFF111D93",
+      "object_format": "COFF-i386",
+      "object_record_offset": 16,
+      "object_size": 4000,
+      "object_sha256": "3834383E563AE41EDD490E8B90182928487775E8C9CB76C5BF2CBAC836C1688B",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 3444,
+        "relocation_object_offset": 3504,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 6
+      },
+      "function_symbols": 3,
+      "registration": {
+        "symbol": "_invConstructor",
+        "section_offset": "0x0CD8",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC14538B5D08837D0C01752D"
+      }
+    },
+    {
+      "name": "scooby",
+      "disc_path": "LEVEL/INTRO/GEN/INTRO.XBR",
+      "record_file_offset": 153987,
+      "record_size": 4740,
+      "record_sha256": "460B5B435B478C1F3A5C0ED937B6285B6EF9D4E3B89FDB21AF33DD28ACB4114A",
+      "object_format": "COFF-i386",
+      "object_record_offset": 19,
+      "object_size": 4721,
+      "object_sha256": "E5D7E88D0962C09C718E5093049285DB6C452C0892A318516295A0D68A81B84D",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 3764,
+        "relocation_object_offset": 3824,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 22
+      },
+      "function_symbols": 4,
+      "registration": {
+        "symbol": "_scoobyConstructor",
+        "section_offset": "0x0D34",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC4056538B7508837D0C0175"
+      }
+    },
+    {
+      "name": "shaggy",
+      "disc_path": "LEVEL/INTRO/GEN/INTRO.XBR",
+      "record_file_offset": 158727,
+      "record_size": 4740,
+      "record_sha256": "E809992DFD49BBA5EF66595C0DDA28264FD6C9C34EF5155DB70EF22B21AFFCAE",
+      "object_format": "COFF-i386",
+      "object_record_offset": 19,
+      "object_size": 4721,
+      "object_sha256": "B79B822A80AB13E11B4CB380D925A8202CACBDC5CE532A5E6C6FBC572239C2B4",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 3764,
+        "relocation_object_offset": 3824,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 22
+      },
+      "function_symbols": 4,
+      "registration": {
+        "symbol": "_shaggyConstructor",
+        "section_offset": "0x0D34",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC4056538B7508837D0C0175"
+      }
+    },
+    {
+      "name": "savepanel",
+      "disc_path": "LEVEL/INTRO/GEN/INTRO.XBR",
+      "record_file_offset": 327072,
+      "record_size": 65721,
+      "record_sha256": "67A5E1B786C9F3394C6C640E2DD5E24C62DF88E9899D9AB85F4E5504E3781EFD",
+      "object_format": "COFF-i386",
+      "object_record_offset": 22,
+      "object_size": 65699,
+      "object_sha256": "9C7310D84860BC4964FC9664D04FDE53D8BA68325DBD5D0F5C6445D3519ABC47",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 42088,
+        "relocation_object_offset": 42148,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 1940
+      },
+      "function_symbols": 70,
+      "registration": {
+        "symbol": "_savepanelConstructor",
+        "section_offset": "0x8B9C",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC14538B5D08837D0C010F85"
+      }
+    },
+    {
+      "name": "bigghost",
+      "disc_path": "LEVEL/INTRO/GEN/INTRO.XBR",
+      "record_file_offset": 392793,
+      "record_size": 15484,
+      "record_sha256": "E093864A3CFC2A0D29B4F8577E0C9E485C4814CB2A9DF23C2491D44547D31DEB",
+      "object_format": "COFF-i386",
+      "object_record_offset": 21,
+      "object_size": 15463,
+      "object_sha256": "4E8D62C9E80B8A679914F7B1D1B981E5E564F8081C84CEB50E7A9FEFA84CD23A",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 11320,
+        "relocation_object_offset": 11380,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 309
+      },
+      "function_symbols": 12,
+      "registration": {
+        "symbol": "_bigghostConstructor",
+        "section_offset": "0x29D4",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC44538B5D08837D0C010F85"
+      }
+    },
+    {
+      "name": "mummy",
+      "disc_path": "LEVEL/INTRO/GEN/INTRO.XBR",
+      "record_file_offset": 408277,
+      "record_size": 14088,
+      "record_sha256": "1F98E853AED5436569EF6B2EAF8702E0AF96010FF1EA9184FEC66F31E12F40A3",
+      "object_format": "COFF-i386",
+      "object_record_offset": 18,
+      "object_size": 14070,
+      "object_sha256": "0A9E910359102E1A93E8A6A53CA08616F4210F6293EB701EB8268C566C1531EC",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 11028,
+        "relocation_object_offset": 11088,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 185
+      },
+      "function_symbols": 17,
+      "registration": {
+        "symbol": "_mummyConstructor",
+        "section_offset": "0x298C",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC4056538B7508837D0C0175"
+      }
+    },
+    {
+      "name": "medghost",
+      "disc_path": "LEVEL/INTRO/GEN/INTRO.XBR",
+      "record_file_offset": 422365,
+      "record_size": 13376,
+      "record_sha256": "81E2DE6318CC916094DD7B5A70E7AC0BD84AD5408C85D1D1149646638316AA99",
+      "object_format": "COFF-i386",
+      "object_record_offset": 21,
+      "object_size": 13355,
+      "object_sha256": "13FC8D5BCED0AD7D7680F9752C2CA9B336A95DB41E090FC6398F076EAC02F4FE",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 9880,
+        "relocation_object_offset": 9940,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 246
+      },
+      "function_symbols": 11,
+      "registration": {
+        "symbol": "_medghostConstructor",
+        "section_offset": "0x2440",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC44538B5D08837D0C010F85"
+      }
+    },
+    {
+      "name": "smallghost",
+      "disc_path": "LEVEL/INTRO/GEN/INTRO.XBR",
+      "record_file_offset": 435741,
+      "record_size": 11084,
+      "record_sha256": "B2510EDC34CB1467561D651E55522F472F79C163B29407CCB500FA587D97802C",
+      "object_format": "COFF-i386",
+      "object_record_offset": 23,
+      "object_size": 11061,
+      "object_sha256": "B7AA6FE7883DB28A9DD6CB6596E2B1C8A24309B3D5ACE97FDBE5E6A8C0433307",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 8376,
+        "relocation_object_offset": 8436,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 166
+      },
+      "function_symbols": 11,
+      "registration": {
+        "symbol": "_smallghostConstructor",
+        "section_offset": "0x1F34",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC44538B5D08837D0C010F85"
+      }
+    },
+    {
+      "name": "door",
+      "disc_path": "LEVEL/INTRO/GEN/INTRO.XBR",
+      "record_file_offset": 446825,
+      "record_size": 4602,
+      "record_sha256": "E621A08343AF09CD89C68041CF9B8CF087026CD0A433AF2C3E416FC90DF86ED1",
+      "object_format": "COFF-i386",
+      "object_record_offset": 17,
+      "object_size": 4585,
+      "object_sha256": "FB2F9C804B13B47582AC81DDB9C1F217D8821A74F5073E36DE4D53D9DC6C9E7C",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 3668,
+        "relocation_object_offset": 3728,
+        "relocation_type": "IMAGE_REL_I386_DIR32",
+        "relocation_count": 19
+      },
+      "function_symbols": 4,
+      "registration": {
+        "symbol": "_doorConstructor",
+        "section_offset": "0x0CF8",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC14538B5D08837D0C01757E"
+      }
+    },
+    {
+      "name": "panel",
+      "disc_path": "LEVEL/INTRO/GEN/INTRO.XBR",
+      "record_file_offset": 163467,
+      "record_size": 155456,
+      "record_sha256": "9344422598EB8D8DCF4006102B09BBC1CD4AD5E092671355CB0689F49262D354",
+      "object_format": "COFF-i386",
+      "object_record_offset": 18,
+      "object_size": 155438,
+      "object_sha256": "C6267BC9ACAC17AB6960E6A5EBBF92B338F34A97C669C94B0BAD4BD372E08734",
+      "section": {
+        "name": ".text",
+        "object_offset": 60,
+        "size": 131552,
+        "relocation_object_offset": 131612,
+        "relocation_type": "IMAGE_REL_I386_DIR32, IMAGE_REL_I386_REL32",
+        "relocation_count": 1996
+      },
+      "function_symbols": 63,
+      "registration": {
+        "symbol": "_panelConstructor",
+        "section_offset": "0xBD3C",
+        "xbe_call_address": "0x0003D42F",
+        "entry_prefix": "5589E583EC14538B5D08837D0C010F85"
+      }
+    }
+  ]
+}

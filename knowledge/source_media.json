@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "image": "Scooby-Doo! Mystery Mayhem (USA, Europe) (En,Fr,De).xiso.iso",
+  "bytes": 3573284864,
+  "sha256": "17B0A027507AB82828D1CB63D3C30058B52EE6A95F833D8FA3BCF280CA69BE97",
+  "provenance": {
+    "source": "Accompanying Verification.txt (reported source Redump ISO checksums)",
+    "conversion_tool": "extract-xiso build-202609111233",
+    "conversion_date": "2026-11-03 11:16:30",
+    "reported_redump_name": "Scooby-Doo! Mystery Mayhem (USA, Europe) (En,Fr,De).iso",
+    "reported_redump_crc32": "eb32d3b5",
+    "reported_redump_md5": "acda56252c00a0e6be207d67ae2bf713",
+    "reported_redump_sha1": "35ff93bde9965cda7aa8c49732c0195176b7bbcc"
+  }
+}

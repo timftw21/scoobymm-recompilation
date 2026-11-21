@@ -1,0 +1,8 @@
+#pragma once
+#include <cstdint>
+
+namespace xbox_native {
+struct BootRecovery { std::uint32_t source, start, end, consumer; };
+inline constexpr BootRecovery boot_recovery[] = {
+@recovery_entries@};
+}

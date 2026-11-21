@@ -1,0 +1,34 @@
+Third-party source notices
+
+Burnout 2 recompilation: Xbox CPU and C++ lowering code from
+2c90673a82da212fd4b933519723515bd28d501c.
+Source: https://github.com/timftw21/burnout2-recompilation
+
+Super Monkey Ball Deluxe recompilation: XBE reader, streaming hash, MMX lowering,
+offline boot, kernel service patterns, Xbox SHA1 and SDL audio mixer from
+983c6cf6c51404bab0867de3d635b434f6aaef51.
+Source: https://github.com/timftw21/smbd-recompilation
+Native NV2A packet bridge and D3D11 renderer from
+b9b49bf15d78b80b88e72fe779cb3f2a586a2a30.
+
+Burnout 2 MIT License
+
+Copyright (c) 2026 b2_recomp contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
