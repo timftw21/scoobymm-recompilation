@@ -76,7 +76,7 @@ bool GuestAudio::set_data(Buffer& buffer, Word address, Word size) {
     if (owned) address = owned;
     try {
         const auto bytes = size ? std::span(static_cast<const std::byte*>(memory_.access(address, size)), size) : Bytes{};
-        audio_->data(buffer.voice, bytes);
+        audio_->data(buffer.voice, bytes, address);
     } catch (...) {
         release(owned);
         throw;
@@ -422,7 +422,7 @@ bool GuestAudio::invoke(PlatformApi api, Cpu& cpu, std::uint64_t checkpoints) {
         const auto bytes = std::span(static_cast<const std::byte*>(memory_.access(data, packet.size)), packet.size);
         stream.pending.push_back(packet);
         try {
-            audio_->queue_packet(stream.voice, bytes);
+            audio_->queue_packet(stream.voice, bytes, data);
         } catch (...) {
             stream.pending.pop_back();
             throw;

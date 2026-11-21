@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -26,6 +27,11 @@ struct AmplitudeEnvelope {
 };
 struct AudioPosition {std::uint32_t play,write;};
 struct AudioStats {std::uint64_t batches=0,mix_ns=0,overruns=0;};
+struct AdpcmBlockError {
+    std::uint32_t voice, source_address, offset;
+    std::uint16_t channels;
+    std::array<std::byte,8> header{};
+};
 enum class AudioBus {none,submix};
 std::vector<float> decode_audio(AudioFormat,std::span<const std::byte>);
 class Audio {
@@ -36,14 +42,14 @@ public:
     Audio& operator=(const Audio&)=delete;
     std::uint32_t create(AudioFormat,AudioBus bus=AudioBus::none,std::uint32_t input_bin=UINT32_MAX);
     void release(std::uint32_t);
-    void data(std::uint32_t,std::span<const std::byte>);
+    void data(std::uint32_t,std::span<const std::byte>,std::uint32_t source_address=0);
     void bind(std::uint32_t,std::span<const std::byte>,std::uint32_t source_address=0); // Caller keeps storage alive until unbound.
     void format(std::uint32_t,AudioFormat);
     void play(std::uint32_t, bool loop, bool restart = false, bool synchronized = false);
     void stop(std::uint32_t);
     void release_envelope(std::uint32_t, bool release_waveform);
     std::uint32_t status(std::uint32_t);
-    void queue_packet(std::uint32_t, std::span<const std::byte>);
+    void queue_packet(std::uint32_t, std::span<const std::byte>,std::uint32_t source_address=0);
     std::uint64_t completed_packets(std::uint32_t);
     std::uint64_t flush_packets(std::uint32_t);
     std::uint32_t stream_status(std::uint32_t);
@@ -70,6 +76,7 @@ public:
     std::uint32_t sample_clock() const {return frames_processed_.load(std::memory_order_relaxed);}
     float output_peak() const {return output_peak_.load(std::memory_order_relaxed);}
     std::string failure();
+    std::optional<AdpcmBlockError> first_invalid_adpcm_block();
     bool output_ready() const {return stream_!=nullptr;}
     void output_gain(float);
     void recording(bool enabled) {recording_.store(enabled,std::memory_order_relaxed);}
@@ -78,6 +85,7 @@ private:
     struct Voice {
         struct Packet {
             std::vector<std::byte> bytes;
+            std::uint32_t source_address = 0;
             bool ends_segment = false;
         };
         AudioFormat format;
@@ -128,6 +136,7 @@ private:
     std::atomic<std::uint64_t> batches_{0},mix_ns_{0},overruns_{0};
     bool failed_=false;
     std::array<char,256> failure_{};
+    std::optional<AdpcmBlockError> first_invalid_adpcm_block_;
 };
 
 }

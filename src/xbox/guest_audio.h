@@ -26,6 +26,9 @@ public:
     float peak() const { return peak_; }
     float output_peak() const { return audio_ ? audio_->output_peak() : 0; }
     float peak_since_effect_load() const { return peak_since_effect_load_; }
+    std::optional<AdpcmBlockError> first_invalid_adpcm_block() const {
+        return audio_ ? audio_->first_invalid_adpcm_block() : std::nullopt;
+    }
     std::optional<float> peak_since_capture() const {
         if (!capture_sample_ || mixed_until_ <= *capture_sample_) return {};
         return peak_since_capture_;

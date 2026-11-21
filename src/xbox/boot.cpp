@@ -1857,6 +1857,11 @@ void OfflineBoot::report(std::ostream& output, std::string_view status, std::str
         << ",\"offline_peak\":" << audio_.peak()
         << ",\"offline_peak_since_effect_load\":" << audio_.peak_since_effect_load();
     if (const auto peak = audio_.peak_since_capture()) out << ",\"offline_peak_since_capture\":" << *peak;
+    if (const auto block = audio_.first_invalid_adpcm_block()) {
+        out << ",\"first_invalid_adpcm_block\":{\"voice\":" << block->voice
+            << ",\"source_address\":" << json(hex32(block->source_address)) << ",\"offset\":" << block->offset
+            << ",\"header\":" << json(hex_bytes(std::span(block->header).first(block->channels * 4))) << '}';
+    }
     out << "},\"graphics\":{\"initialized\":" << (graphics_.ready() ? "true" : "false")
         << ",\"submissions\":" << graphics.submissions << ",\"draws\":" << graphics.draws
         << ",\"flips\":" << graphics.flips << ",\"clears\":" << graphics.clears

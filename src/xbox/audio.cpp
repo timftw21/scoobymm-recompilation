@@ -1,5 +1,4 @@
 #include "audio.h"
-#include "file.h"
 #include <chrono>
 
 
@@ -47,11 +46,11 @@ void validate(AudioFormat format,bool bus=false) {
                 format.channels, format.rate, format.bits, format.block_align, format.samples_per_block));
     } else throw std::runtime_error("Unsupported audio codec");
 }
-void decode_adpcm(AudioFormat format,const std::byte* source,std::span<float> result) {
+bool decode_adpcm(AudioFormat format,const std::byte* source,std::span<float> result) {
     for(unsigned channel=0;channel<format.channels;++channel) {
         std::int16_t initial;std::memcpy(&initial,source+channel*4,2);
         int predictor=initial,index=std::to_integer<unsigned>(source[channel*4+2]);
-        if(index>88) throw std::runtime_error("Invalid Xbox ADPCM step index");
+        if(index>88) return false;
         result[channel]=predictor/32768.0f;
         for(unsigned sample=1;sample<64;++sample) {
             const auto nibble_index=sample-1,byte_index=nibble_index/2;
@@ -65,6 +64,7 @@ void decode_adpcm(AudioFormat format,const std::byte* source,std::span<float> re
             result[sample*format.channels+channel]=predictor/32768.0f;
         }
     }
+    return true;
 }
 }
 std::vector<float> decode_audio(AudioFormat format,std::span<const std::byte> data) {
@@ -80,8 +80,10 @@ std::vector<float> decode_audio(AudioFormat format,std::span<const std::byte> da
     }
     const auto blocks=data.size()/format.block_align;
     std::vector<float> result(blocks*64*format.channels);
-    for(std::size_t block=0;block<blocks;++block)
-        decode_adpcm(format,data.data()+block*format.block_align,std::span(result).subspan(block*64*format.channels,64*format.channels));
+    for(std::size_t block=0;block<blocks;++block) {
+        if(!decode_adpcm(format,data.data()+block*format.block_align,std::span(result).subspan(block*64*format.channels,64*format.channels)))
+            throw std::runtime_error("Invalid Xbox ADPCM step index");
+    }
     return result;
 }
 Audio::Audio(bool output,bool muted) {
@@ -156,6 +158,7 @@ std::uint32_t Audio::frames(AudioFormat format,std::uint32_t bytes) {
 void Audio::select_packet(Voice& value) {
     value.playing = !value.packets->empty();
     value.source = value.playing ? std::span<const std::byte>(value.packets->front().bytes) : std::span<const std::byte>{};
+    value.source_address = value.playing ? value.packets->front().source_address : 0;
     value.byte_count = static_cast<std::uint32_t>(value.source.size());
     value.play_frames = frames(value.format, value.byte_count);
     value.cached_block = UINT32_MAX;
@@ -169,8 +172,8 @@ void Audio::advance_packets(Voice& value) {
         select_packet(value);
     }
 }
-void Audio::queue_packet(std::uint32_t id, std::span<const std::byte> bytes) {
-    Voice::Packet packet{std::vector(bytes.begin(), bytes.end())};
+void Audio::queue_packet(std::uint32_t id, std::span<const std::byte> bytes,std::uint32_t source_address) {
+    Voice::Packet packet{std::vector(bytes.begin(), bytes.end()),source_address};
     StreamLock lock(stream_);
     auto& value = voice(id);
     if (!frames(value.format, static_cast<std::uint32_t>(bytes.size()))) throw std::runtime_error("Empty audio stream packet");
@@ -243,13 +246,13 @@ void Audio::synchronize_playback() {
         if (value.used && value.pause_mode == 2) value.pause_mode = 0;
     }
 }
-void Audio::data(std::uint32_t id,std::span<const std::byte> bytes) {
+void Audio::data(std::uint32_t id,std::span<const std::byte> bytes,std::uint32_t source_address) {
     AudioFormat format;{StreamLock lock(stream_);const auto& value=voice(id);format=value.format;
         if(value.bus!=AudioBus::none && !bytes.empty()) throw std::runtime_error("Mix buses cannot carry encoded sample data");}
     frames(format,static_cast<std::uint32_t>(bytes.size()));
     std::vector<std::byte> encoded(bytes.begin(),bytes.end());
     StreamLock lock(stream_);auto& value=voice(id);
-    value.encoded.swap(encoded);value.source=value.encoded;value.cached_block=UINT32_MAX;value.source_address=0;
+    value.encoded.swap(encoded);value.source=value.encoded;value.cached_block=UINT32_MAX;value.source_address=source_address;
     value.byte_count=static_cast<std::uint32_t>(bytes.size());
     value.cursor=0;value.play_start=0;value.play_frames=frames(value.format,value.byte_count);
     value.environment_history={};
@@ -290,13 +293,15 @@ std::array<float,2> Audio::sample(Voice& value,std::uint32_t frame) {
         if(value.cached_block!=block) {
             const auto offset=std::size_t(block)*format.block_align;
             if(offset+format.block_align>value.source.size()) throw std::runtime_error("Xbox ADPCM block exceeds the bound buffer");
-            try {decode_adpcm(format,value.source.data()+offset,value.block);}
-            catch(const std::exception& error) {
-                throw std::runtime_error(std::format("{}: voice {}, block {}, channels {}, address {}, header {}, source {} size {}, play {}+{}, loop {}+{}, cursor {}",
-                    error.what(),&value-voices_.data()+1,block,format.channels,
-                    hex32(value.source_address+static_cast<std::uint32_t>(offset)),hex_bytes(value.source.subspan(offset,format.channels*4)),
-                    hex32(value.source_address),value.byte_count,value.play_start,value.play_frames,value.loop_start,value.loop_frames,
-                    static_cast<std::uint32_t>(value.cursor)));
+            if(!decode_adpcm(format,value.source.data()+offset,value.block)) {
+                // Each block has its own predictor. Keep its duration and resume at the next header.
+                value.block.fill(0);
+                if(!first_invalid_adpcm_block_) {
+                    AdpcmBlockError error{static_cast<std::uint32_t>(&value-voices_.data()+1),value.source_address,
+                        static_cast<std::uint32_t>(offset),format.channels};
+                    std::ranges::copy(value.source.subspan(offset,format.channels*4),error.header.begin());
+                    first_invalid_adpcm_block_=error;
+                }
             }
             value.cached_block=block;
         }
@@ -526,6 +531,10 @@ void Audio::mix_sources(std::span<float> output) {
     }
 }
 std::string Audio::failure(){StreamLock lock(stream_);return failed_?failure_.data():std::string{};}
+std::optional<AdpcmBlockError> Audio::first_invalid_adpcm_block() {
+    StreamLock lock(stream_);
+    return first_invalid_adpcm_block_;
+}
 void Audio::mix_unlocked(std::span<float> output) {
     if (std::ranges::any_of(voices_, [](const Voice& value) {
         return value.used && value.playing && !value.pause_mode;
