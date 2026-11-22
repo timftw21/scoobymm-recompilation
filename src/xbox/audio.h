@@ -36,7 +36,7 @@ enum class AudioBus {none,submix};
 std::vector<float> decode_audio(AudioFormat,std::span<const std::byte>);
 class Audio {
 public:
-    explicit Audio(bool output=true,bool muted=false);
+    explicit Audio(bool output=true,float gain=1.f);
     ~Audio();
     Audio(const Audio&)=delete;
     Audio& operator=(const Audio&)=delete;

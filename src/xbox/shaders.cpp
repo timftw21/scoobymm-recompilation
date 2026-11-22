@@ -147,7 +147,7 @@ float4 main(P p):SV_Target {
 ID3DBlob* shader_blob(ShaderKind kind) {return new ShaderBlob(shader_binary(kind).bytes);}
 const char* shader_profile(ShaderKind kind) {
     if(kind==ShaderKind::launch) return "cs_5_0";
-    if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::gui_pixel ||
+    if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::video_overlay || kind==ShaderKind::gui_pixel ||
        (kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8) ||
        (kind>=ShaderKind::color && kind<=ShaderKind::modulate3d)) return "ps_5_0";
     return "vs_5_0";
@@ -180,6 +180,25 @@ float4 main(uint id:SV_VertexID):SV_Position {float2 p=float2((id<<1)&2,id&2);re
     case ShaderKind::display_vertex:return R"(
 struct P {float4 p:SV_Position;float2 uv:TEXCOORD0;};
 P main(uint id:SV_VertexID) {P o;o.uv=float2((id<<1)&2,id&2);o.p=float4(o.uv*float2(2,-2)+float2(-1,1),0,1);return o;})";
+    case ShaderKind::video_overlay:return R"(
+Texture2D base:register(t0);
+Texture2D<uint4> pairs:register(t1);
+cbuffer Overlay:register(b0) {uint4 source;uint4 destination;uint2 stepXY;uint colorKey;uint keyed;};
+float4 main(float4 position:SV_Position):SV_Target {
+    uint2 pixel=uint2(position.xy);
+    float4 original=base.Load(int3(pixel,0));
+    if(any(pixel<destination.xy) || any(pixel-destination.xy>=destination.zw)) return original;
+    uint3 rgb=uint3(round(saturate(original.rgb)*255));
+    if(keyed && ((rgb.r<<16)|(rgb.g<<8)|rgb.b)!=colorKey) return original;
+    // Each destination extent is 12 bits. Split 12.20 sampling steps so both products fit uint.
+    uint2 delta=pixel-destination.xy;
+    uint2 offset=delta*(stepXY>>20)+((delta*(stepXY&0xfffff))>>20);
+    uint2 texel=min(source.xy-1,source.zw+offset);
+    int4 pair=int4(pairs.Load(int3(texel.x>>1,texel.y,0)));
+    int y=298*((texel.x&1 ? pair.z : pair.x)-16), cb=pair.y-128, cr=pair.w-128;
+    int3 color=(int3(y+409*cr,y-100*cb-208*cr,y+516*cb)+128)>>8;
+    return float4(clamp(color,0,255)/255.0,1);
+})";
     case ShaderKind::display_pixel:return R"(
 Texture2D image:register(t0);Texture1D gammaRamp:register(t1);SamplerState filter:register(s0);
 float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {

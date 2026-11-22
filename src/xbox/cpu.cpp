@@ -4,6 +4,50 @@
 #include <atomic>
 
 namespace xbox_native {
+std::uint64_t Memory::load_mapped(std::uint32_t address,unsigned width) const {
+    if (const auto* io = address >= io_floor_ ? find_io(address, width) : nullptr) {
+        const auto offset = address - io->base;
+        const auto low = io->read(io->context, offset, std::min(width, 4U));
+        if (width <= 4) return low;
+        return low | (std::uint64_t(io->read(io->context, offset + 4, 4)) << 32);
+    }
+    std::uint64_t value{};
+    std::memcpy(&value,mapped_pointer(address,width),width);
+    if constexpr (std::endian::native==std::endian::big) value=std::byteswap(value);
+    return value;
+}
+void Memory::store_mapped(std::uint32_t address,unsigned width,std::uint64_t value) {
+    if (const auto* io = address >= io_floor_ ? find_io(address, width) : nullptr) {
+        const auto offset = address - io->base;
+        io->write(io->context, offset, std::min(width, 4U), static_cast<std::uint32_t>(value));
+        if (width == 8) io->write(io->context, offset + 4, 4, static_cast<std::uint32_t>(value >> 32));
+        return;
+    }
+    if constexpr (std::endian::native==std::endian::big) value=std::byteswap(value);
+    std::memcpy(mapped_pointer(address,width),&value,width);
+}
+std::byte* Memory::mapped_pointer(std::uint32_t address, std::size_t size) const {
+    const auto primary = [&](std::uint32_t offset) {
+        if (!blocked_pages_.empty() && size) {
+            const auto first = offset >> 12, last = static_cast<std::uint32_t>((offset + size - 1) >> 12);
+            if (std::ranges::any_of(blocked_pages_.subspan(first, last - first + 1), [](auto blocked) { return blocked != 0; }))
+                throw std::runtime_error(std::format("Guest memory access at 0x{:08X} crosses an uncommitted page", address));
+        }
+        return bytes_.data() + offset;
+    };
+    if(address>=base_ && address-base_<=bytes_.size() && size<=bytes_.size()-(address-base_))
+        return primary(address - base_);
+    for(unsigned i=0;i<region_count_;++i) {
+        const auto& region=regions_[i];
+        if(address>=region.base && address-region.base<=region.bytes.size() && size<=region.bytes.size()-(address-region.base)) {
+            if (region.primary_offset != UINT32_MAX)
+                return primary(region.primary_offset + address - region.base);
+            return region.bytes.data()+(address-region.base);
+        }
+    }
+    throw std::runtime_error(std::format("Guest memory access at 0x{:08X}, {} bytes, outside the mapped regions", address, size));
+}
+
 void writeback_guest_cache(const Cpu& cpu) {
     if (cpu.cs_selector & 3) throw GuestTrap(13, cpu.eip, cpu.eip);
     // Guest RAM and its aliases share ordinary coherent host memory. Publish CPU writes before the next device access.
@@ -36,8 +80,17 @@ void invoke_native(Cpu& cpu, Memory& memory, std::uint32_t address) {
         cpu.kernel->entries[ordinal](cpu.kernel->context,cpu,memory);
         return;
     }
+    // Only the verified executable's table is immutable. A disc module can unload
+    // and another module can later use the same address.
+    static thread_local std::array<const CompiledFunction*,256> recent{};
+    auto& cached = recent[((address >> 4) ^ (address >> 12)) & (recent.size() - 1)];
+    if (cached && cached->address == address) {
+        cached->run(cpu, memory);
+        return;
+    }
     const auto found = std::ranges::lower_bound(compiled_batch, address, {}, &CompiledFunction::address);
     if (found != compiled_batch.end() && found->address == address) {
+        cached = &*found;
         found->run(cpu, memory);
         return;
     }

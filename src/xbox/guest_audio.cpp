@@ -242,7 +242,7 @@ bool GuestAudio::invoke(PlatformApi api, Cpu& cpu, std::uint64_t checkpoints) {
         const auto output = arg(0);
         if (!output) return done(1, invalid_argument);
         if (!audio_) {
-            audio_ = std::make_unique<Audio>(output_);
+            audio_ = std::make_unique<Audio>(output_, output_gain_);
             mixed_until_ = checkpoints * 48 / 100;
         }
         if (!device_) {

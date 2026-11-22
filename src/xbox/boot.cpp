@@ -131,12 +131,12 @@ class OfflineBoot {
 public:
     OfflineBoot(Xbe& image, Disc* disc, std::uint64_t budget, Word breakpoint, bool audio_output,
                 std::filesystem::path capture, Word capture_index, InputScript input,
-                PlayWindow* window = nullptr, bool vsync = true, Word frames = 0, std::filesystem::path storage = {},
+                PlayWindow* window = nullptr, Word frames = 0, std::filesystem::path storage = {},
                 const DiagnosticOptions* diagnostics = nullptr, Word language = 1)
         : image_(image), disc_(disc), ram_(ram_end - guest_base), kernel_(0x10000), memory_(guest_base, ram_),
           arena_start_(align_up(image.image_end, 0x10000)), stack_bottom_(ram_end),
           audio_(memory_, platform_allocator(), audio_output),
-          graphics_(memory_, platform_allocator(), std::move(capture), capture_index, window ? window->native_handle() : nullptr, vsync),
+          graphics_(memory_, platform_allocator(), std::move(capture), capture_index, window),
           window_(window), frame_limit_(frames), input_(std::move(input)), storage_(std::move(storage)), language_(language) {
         if (compiled_batch.empty() || !std::ranges::all_of(compiled_batch, [&](const auto& function) {
                 return function.source_sha256 == image.sha256;
@@ -144,6 +144,36 @@ public:
             throw std::runtime_error("Compiled functions do not match the verified XBE");
         }
         image.load_preloaded(guest_base, ram_);
+        if (window) {
+            // 0x18EC2 enters the CPU spin only for frame intervals below this threshold.
+            // 0x1880B also uses it to initialize the disabled limiter before reading the disc settings.
+            // The elapsed-time calculation at 0x183C0 uses an independent hardware timer.
+            memory_.store<Word>(0x0015E6FC, 0);
+            services_.camera_extent = [](void* context, Word camera, unsigned field, Word value) {
+                const auto& boot = *static_cast<OfflineBoot*>(context);
+                if (field != 0x68 || !boot.window_->settings().widescreen) return value;
+                const auto scene = boot.memory_.load<Word>(0x01EED360);
+                if (!scene || boot.memory_.load<Word>(camera + 0x14) != 1) return value;
+                // Widen the two scene cameras' CPU visibility bounds. Vertex
+                // output gets the matching horizontal scale at the backbuffer.
+                for (const auto slot : {4U, 8U}) {
+                    const auto object = boot.memory_.load<Word>(scene + slot);
+                    if (object && boot.memory_.load<Word>(object + 0x30) == camera)
+                        return std::bit_cast<Word>(std::bit_cast<float>(value) * (4.f / 3.f));
+                }
+                return value;
+            };
+            clock_.frame_step = [](void* context, Word authored) {
+                const auto& boot = *static_cast<OfflineBoot*>(context);
+                const auto engine = boot.memory_.load<Word>(0x01EED350);
+                if (!engine || boot.window_->settings().refresh_rate == 30) return authored;
+                // 0x1855F stores the smoothed seconds elapsed this update. Preserve
+                // the authored 0.033 seconds per 30 Hz frame, including its rounding.
+                const auto dt = std::bit_cast<float>(boot.memory_.load<Word>(engine + 0x290));
+                return std::bit_cast<Word>(std::bit_cast<float>(authored) * (30.f * dt));
+            };
+            audio_.output_gain(window->gain());
+        }
         memory_.map(kernel_base, kernel_);
         memory_.guard_primary_pages(blocked_pages_);
         memory_.map(0x80020000, std::span(ram_).subspan(0x10000), 0x10000);
@@ -177,16 +207,18 @@ public:
         if (!storage_.empty()) open_storage();
         initialize_exports();
         if (window && diagnostics) {
-            diagnostics_ = std::make_unique<PlayDiagnostics>(*diagnostics, *window, vsync,
+            diagnostics_ = std::make_unique<PlayDiagnostics>(*diagnostics, *window,
                 [this](const std::filesystem::path& dir) { capture_state(dir); },
                 [this](FrameCounters& counters) {
                     counters.checkpoints = checkpoints();
+                    counters.scheduler_idle_ticks = scheduler_idle_ticks_;
                     counters.audio_frames = audio_.frames();
                     // The loop at 0x00018D25 increments this counter at 0x00018EC9.
                     constexpr Word engine_slot = 0x01EED350, updates_offset = 0x298;
                     const auto engine = memory_.load<Word>(engine_slot);
                     if (engine >= guest_base && engine <= ram_end - updates_offset - sizeof(Word)) {
                         counters.engine = engine;
+                        counters.engine_seconds = std::bit_cast<float>(memory_.load<Word>(engine + 0x27C));
                         std::memcpy(&counters.engine_updates, ram_.data() + engine - guest_base + updates_offset,
                                     sizeof(counters.engine_updates));
                     }
@@ -290,8 +322,8 @@ private:
     KernelServices services_;
     GuestClock clock_{this, [](void* context) {
         auto& boot = *static_cast<OfflineBoot*>(context);
-        return boot.interrupt_time() / 10000000 * 733333333ULL +
-               boot.interrupt_time() % 10000000 * 733333333ULL / 10000000;
+        const auto now = boot.interrupt_time();
+        return now / 10000000 * 733333333ULL + now % 10000000 * 733333333ULL / 10000000;
     }};
     ExecutionDiagnostic diagnostic_;
     Thread* current_ = nullptr;
@@ -321,6 +353,7 @@ private:
     Word flicker_filter_{};
     bool luma_filter_{};
     std::uint64_t idle_time_{};
+    std::uint64_t scheduler_idle_ticks_{};
     std::uint64_t epoch_ = 133801632000000000ULL;
     std::filesystem::path storage_;
     Word language_;
@@ -783,7 +816,10 @@ void OfflineBoot::flush_storage() {
 
 void OfflineBoot::schedule() {
     for (;;) {
-        if (window_ && !window_->poll()) {quit_ = true; return;}
+        if (window_) {
+            if (!window_->poll()) {quit_ = true; return;}
+            audio_.output_gain(window_->gain());
+        }
         if (diagnostics_) diagnostics_->poll();
         if (frame_limit_ && graphics_.scanouts() >= frame_limit_) return;
         update_clock();
@@ -823,7 +859,11 @@ void OfflineBoot::schedule() {
         for (const auto& [address, timer] : timers_) next_due = std::min(next_due, timer.due);
         if (next_due == UINT64_MAX)
             throw NativeBoundary(last_cpu_->eip, "All guest threads are waiting without a signal source");
-        if (window_) Sleep(1);
+        if (window_) {
+            const auto start = window_->time();
+            Sleep(1);
+            scheduler_idle_ticks_ += window_->time() - start;
+        }
         else idle_time_ += next_due - now;
     }
 }
@@ -1143,7 +1183,7 @@ void OfflineBoot::service(unsigned ordinal, Cpu& cpu) {
     switch (ordinal) {
     case 2: {
         const auto option = arg(1), parameter = arg(2);
-        if (option == 6) memory_.store<Word>(arg(3), 0x00400101); // Standard NTSC-M at 60 Hz.
+        if (option == 6) memory_.store<Word>(arg(3), 0x00400101 | (window_ && window_->settings().widescreen ? 0x10000 : 0)); // NTSC-M at 60 Hz.
         else if (option == 11 && parameter <= 5) flicker_filter_ = parameter;
         else if (option == 14) luma_filter_ = parameter != 0;
         else break;
@@ -1302,7 +1342,8 @@ void OfflineBoot::service(unsigned ordinal, Cpu& cpu) {
         switch (arg(0)) {
         case 7: value = language_; break;
         case 0x104: value = 1; break;
-        case 8: case 9: case 10: case 17: value = 0; break;
+        case 8: value = window_ && window_->settings().widescreen ? 0x10000 : 0; break;
+        case 9: case 10: case 17: value = 0; break;
         case 0x103: value = 0x00400100; break;
         }
         if (!value) return finish(cpu, 5, name_missing);
@@ -1989,7 +2030,8 @@ void OfflineBoot::report(std::ostream& output, std::string_view status, std::str
     bool first_module = true;
     for (const auto& [module, base, owner] : modules_) {
         if (!std::exchange(first_module, false)) out << ',';
-        out << "{\"name\":" << json(module->name) << ",\"base\":" << json(hex32(base)) << '}';
+        out << "{\"name\":" << json(module->name) << ",\"base\":" << json(hex32(base))
+            << ",\"compiled_index\":" << (module - compiled_modules.data()) << '}';
     }
     out << "],\"last_io_path\":" << json(last_io_path_) << ",\"threads\":[";
     for (const auto& thread : threads_) {
@@ -2033,14 +2075,18 @@ std::uint32_t xbox_language(std::string_view code) {
     if (code == "fr") return 4;
     throw std::invalid_argument("Supported languages are en, fr and de");
 }
-int play_game(const PlayOptions& options, std::ostream& report) {
+int play_game(PlayOptions& options, std::ostream& report) {
+    use_shader_cache(options.shader_cache);
+    PlayWindow window(options);
+    if (options.launcher && !window.launcher()) {
+        report << "{\"status\":\"closed\"}\n";
+        return 0;
+    }
     Xbe image(options.xbe);
     Disc disc(options.disc);
     if (disc.executable_sha256() != image.sha256) throw std::runtime_error("XISO executable differs from the verified XBE");
-    use_shader_cache(options.shader_cache);
-    PlayWindow window(options.hidden, options.fullscreen);
-    return OfflineBoot(image, &disc, UINT64_MAX, 0, options.audio, options.capture, options.capture_index,
-                       options.input, &window, options.vsync, options.frames, options.storage, &options.diagnostics, options.language).run(report);
+    return OfflineBoot(image, &disc, UINT64_MAX, 0, true, options.capture, options.capture_index,
+                       options.input, &window, options.frames, options.storage, &options.diagnostics, options.language).run(report);
 }
 
 int boot_command(int argc, char* argv[]) {
@@ -2090,7 +2136,7 @@ int boot_command(int argc, char* argv[]) {
         if (capture_index && capture.empty()) throw std::runtime_error("Frame index requires --frame");
         use_shader_cache(std::move(shader_cache));
         return OfflineBoot(image, disc ? &*disc : nullptr, budget, breakpoint, audio_output,
-                           std::move(capture), capture_index ? capture_index : 1, std::move(input), nullptr,true,0,{},nullptr,language).run();
+                           std::move(capture), capture_index ? capture_index : 1, std::move(input), nullptr,0,{},nullptr,language).run();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

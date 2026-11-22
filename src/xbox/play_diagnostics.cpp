@@ -33,6 +33,12 @@ std::optional<std::uint64_t> thread_ticks() {
     return ticks(kernel) + ticks(user);
 }
 
+std::optional<std::uint64_t> thread_cycles() {
+    ULONG64 cycles;
+    if (!QueryThreadCycleTime(GetCurrentThread(), &cycles)) return {};
+    return cycles;
+}
+
 void write_file(const std::filesystem::path& path, const auto& write) {
     std::ofstream file(path, std::ios::binary | std::ios::noreplace);
     file.exceptions(std::ios::badbit | std::ios::failbit);
@@ -82,8 +88,6 @@ public:
     }
 
     ~GpuIntervals() { end(); }
-
-    bool active() const { return active_ != nullptr; }
 
     bool start(std::size_t sample) {
         if (!available_) return false;
@@ -154,10 +158,12 @@ struct PlayDiagnostics::Recording {
         std::array<std::uint32_t, 2> window;
         double elapsed_ms, present_ms;
         std::optional<double> cpu_ms;
+        std::optional<std::uint64_t> cpu_cycles;
         GpuWork gpu_work;
         FrameCounters delta;
         std::optional<std::uint32_t> engine_updates;
         bool skipped;
+        double simulation_ms, submission_ms, scheduler_idle_ms, gpu_wait_ms;
     };
 
     Recording(Renderer& renderer, const FrameCounters& counters)
@@ -169,21 +175,34 @@ struct PlayDiagnostics::Recording {
     void restart(const FrameCounters& counters) {
         last = counters;
         previous_ticks = thread_ticks();
+        previous_cycles = thread_cycles();
         boundary = Clock::now();
     }
 
     void begin_gpu_work() {
-        if (gpu.active()) return;
+        if (submission_started) return;
+        submission_started = Clock::now();
         collect();
         if (gpu.start(samples.size())) ++gpu_work.issued;
         else gpu_work.incomplete = true;
     }
 
+    void end_gpu_work() {
+        gpu.end();
+        if (submission_started) {
+            submission_ms += milliseconds(Clock::now() - *submission_started);
+            submission_started.reset();
+        }
+    }
+
     void sample(const FrameCounters& counters, std::array<std::uint32_t, 2> window, double present_ms, bool skipped) {
         const auto now = Clock::now();
         const auto ticks = thread_ticks();
+        const auto cycles = thread_cycles();
         std::optional<double> cpu;
+        std::optional<std::uint64_t> cycle_delta;
         if (!skipped && ticks && previous_ticks) cpu = double(*ticks - *previous_ticks) / 10'000;
+        if (!skipped && cycles && previous_cycles) cycle_delta = *cycles - *previous_cycles;
         const auto& a = counters.gpu;
         const auto& b = last.gpu;
         const GpuStats gpu_delta{a.submissions - b.submissions, a.packets - b.packets, a.methods - b.methods,
@@ -193,9 +212,15 @@ struct PlayDiagnostics::Recording {
         if (last.engine && last.engine == counters.engine && counters.engine_updates >= last.engine_updates)
             engine_updates = counters.engine_updates - last.engine_updates;
         samples.push_back({counters.scanout, window, skipped ? 0 : milliseconds(now - boundary), skipped ? 0 : present_ms,
-            cpu, std::exchange(gpu_work, {}), {counters.scanout - last.scanout, counters.presentations - last.presentations,
+            cpu, cycle_delta, std::exchange(gpu_work, {}), {counters.scanout - last.scanout, counters.presentations - last.presentations,
                 counters.overlays - last.overlays, counters.vblanks - last.vblanks, counters.checkpoints - last.checkpoints,
-                counters.audio_frames - last.audio_frames, gpu_delta}, engine_updates, skipped});
+                counters.audio_frames - last.audio_frames, gpu_delta}, engine_updates, skipped,
+            engine_updates ? 1000.0 * (counters.engine_seconds - last.engine_seconds) : 0.0, std::exchange(submission_ms, 0.0),
+            double(counters.scheduler_idle_ticks-last.scheduler_idle_ticks)/10'000, double(counters.gpu_wait_ns-last.gpu_wait_ns)/1'000'000});
+        last = counters;
+        previous_ticks = ticks;
+        previous_cycles = cycles;
+        boundary = now;
         collect();
         if (now >= next_memory_sample) sample_memory(now);
     }
@@ -218,17 +243,25 @@ struct PlayDiagnostics::Recording {
         next_memory_sample = now + std::chrono::milliseconds(500);
     }
 
-    void write(const Path& directory, const DiagnosticOptions& options, std::string_view reason, bool vsync) const {
-        std::vector<double> elapsed, cpu, gpu_times, present;
+    void write(const Path& directory, const DiagnosticOptions& options, std::string_view reason, const PlayerSettings& settings) const {
+        std::vector<double> elapsed, cpu, cycles, gpu_times, present, submission, idle, waits;
         std::uint64_t flips = 0, presentations = 0, overlays = 0, vblanks = 0, checkpoints = 0, audio_frames = 0;
         std::uint64_t updates = 0, update_samples = 0;
-        double measured_ms = 0;
+        std::uint64_t measured_presentations = 0, measured_flips = 0;
+        double measured_ms = 0, simulation_ms = 0;
         for (const auto& sample : samples) {
             if (!sample.skipped) {
                 elapsed.push_back(sample.elapsed_ms);
                 measured_ms += sample.elapsed_ms;
+                measured_presentations += sample.delta.presentations;
+                measured_flips += sample.delta.gpu.flips;
+                simulation_ms += sample.simulation_ms;
                 present.push_back(sample.present_ms);
+                submission.push_back(sample.submission_ms);
+                idle.push_back(sample.scheduler_idle_ms);
+                waits.push_back(sample.gpu_wait_ms);
                 if (sample.cpu_ms) cpu.push_back(*sample.cpu_ms);
+                if (sample.cpu_cycles) cycles.push_back(static_cast<double>(*sample.cpu_cycles));
                 if (sample.gpu_work.complete()) gpu_times.push_back(sample.gpu_work.ms);
             }
             flips += sample.delta.gpu.flips;
@@ -242,15 +275,15 @@ struct PlayDiagnostics::Recording {
                 ++update_samples;
             }
         }
-        const auto timing = [](const std::vector<double>& values) {
+        const auto timing = [](const std::vector<double>& values, std::string_view unit = "ms") {
             if (values.empty()) return std::string("{\"samples\":0}");
             const auto stats = summarize(values);
-            return std::format("{{\"samples\":{},\"median_ms\":{:.4f},\"p99_ms\":{:.4f},\"average_ms\":{:.4f}}}",
-                               values.size(), stats.median, stats.p99, stats.average);
+            return std::format("{{\"samples\":{},\"median_{}\":{:.4f},\"p99_{}\":{:.4f},\"average_{}\":{:.4f}}}",
+                               values.size(), unit, stats.median, unit, stats.p99, unit, stats.average);
         };
         write_file(directory / "performance.csv", [&](std::ostream& out) {
             out << "scanout,window_width,window_height,excluded,frame_ms,game_thread_cpu_ms,gpu_command_span_ms,present_ms,"
-                   "guest_flips,presentations,overlay_scanouts,guest_vblanks,guest_checkpoints,audio_frames,draws,vertices,gpu_submissions,engine_updates\n";
+                   "guest_flips,presentations,overlay_scanouts,guest_vblanks,guest_checkpoints,audio_frames,draws,vertices,gpu_submissions,engine_updates,simulation_ms,submission_ms,guest_fences,game_thread_cycles,scheduler_idle_ms,gpu_wait_ms\n";
             for (const auto& sample : samples) {
                 const auto& d = sample.delta;
                 out << sample.scanout << ',' << sample.window[0] << ',' << sample.window[1] << ',' << sample.skipped << ',';
@@ -266,6 +299,11 @@ struct PlayDiagnostics::Recording {
                     << ',' << d.checkpoints << ',' << d.audio_frames << ',' << d.gpu.draws << ',' << d.gpu.vertices
                     << ',' << d.gpu.submissions << ',';
                 if (sample.engine_updates) out << *sample.engine_updates;
+                out << ',';
+                if (sample.engine_updates) out << sample.simulation_ms;
+                out << ',' << sample.submission_ms << ',' << d.gpu.fences << ',';
+                if (sample.cpu_cycles) out << *sample.cpu_cycles;
+                out << ',' << sample.scheduler_idle_ms << ',' << sample.gpu_wait_ms;
                 out << '\n';
             }
         });
@@ -284,18 +322,25 @@ struct PlayDiagnostics::Recording {
                 << ",\"session_report\":" << json(path_text(options.session_report)) << ",\"processor\":" << json(processor)
                 << ",\"graphics_adapter\":" << json(adapter) << ",\"native_size\":" << dimensions(native)
                 << ",\"window_size\":" << dimensions(samples.empty() ? std::array<std::uint32_t, 2>{} : samples.back().window)
-                << ",\"vsync\":" << (vsync ? "true" : "false")
+                << ",\"vsync\":" << (settings.vsync ? "true" : "false")
+                << ",\"refresh_rate\":" << settings.refresh_rate << ",\"widescreen\":" << (settings.widescreen ? "true" : "false")
                 << ",\"start_scanout\":" << first.scanout << ",\"scanouts\":" << samples.size()
                 << ",\"excluded_capture_scanouts\":" << samples.size() - elapsed.size()
                 << ",\"measured_scanouts_per_second\":" << (measured_ms ? 1000 * elapsed.size() / measured_ms : 0)
+                << ",\"presentations_per_second\":" << (measured_ms ? 1000.0 * measured_presentations / measured_ms : 0)
+                << ",\"guest_flips_per_second\":" << (measured_ms ? 1000.0 * measured_flips / measured_ms : 0)
                 << ",\"measured_ms\":" << measured_ms << ",\"guest_flips\":" << flips << ",\"presentations\":" << presentations
                 << ",\"engine_updates\":" << (update_samples ? std::to_string(updates) : "null")
                 << ",\"engine_update_samples\":" << update_samples
+                << ",\"simulation_ms\":" << (update_samples ? std::to_string(simulation_ms) : "null")
                 << ",\"overlay_scanouts\":" << overlays << ",\"guest_vblanks\":" << vblanks
                 << ",\"guest_checkpoints\":" << checkpoints << ",\"audio_frames\":" << audio_frames
                 << ",\"process_lifetime_peak_working_set_bytes\":" << peak_working
                 << ",\"recording_sampled_peak_private_bytes\":" << peak_private
                 << ",\"frame\":" << timing(elapsed) << ",\"game_thread_cpu\":" << timing(cpu)
+                << ",\"game_thread_cycles\":" << timing(cycles,"cycles")
+                << ",\"scheduler_idle\":" << timing(idle) << ",\"gpu_wait\":" << timing(waits)
+                << ",\"submission\":" << timing(submission)
                 << ",\"gpu_command_span\":" << timing(gpu_times) << ",\"present\":" << timing(present) << "}\n";
         });
     }
@@ -305,15 +350,17 @@ struct PlayDiagnostics::Recording {
     std::string adapter, processor;
     FrameCounters first, last;
     Clock::time_point started, boundary, next_memory_sample{};
-    std::optional<std::uint64_t> previous_ticks;
+    std::optional<std::uint64_t> previous_ticks, previous_cycles;
     std::vector<Sample> samples;
     GpuWork gpu_work;
+    std::optional<Clock::time_point> submission_started;
+    double submission_ms{};
     std::size_t peak_working{}, peak_private{};
 };
 
-PlayDiagnostics::PlayDiagnostics(const DiagnosticOptions& options, PlayWindow& window, bool vsync,
+PlayDiagnostics::PlayDiagnostics(const DiagnosticOptions& options, PlayWindow& window,
                                  WriteState write_state, ReadCounters read_counters)
-    : options_(options), window_(window), vsync_(vsync), write_state_(std::move(write_state)),
+    : options_(options), window_(window), write_state_(std::move(write_state)),
       read_counters_(std::move(read_counters)) {}
 
 PlayDiagnostics::~PlayDiagnostics() = default;
@@ -342,6 +389,11 @@ void PlayDiagnostics::title(std::string_view status) {
     window_.diagnostic_title(text);
 }
 
+bool PlayDiagnostics::recording_expired() const {
+    return performance_ && !(performance_scripted_ && options_.performance_frames) &&
+           Clock::now() - performance_->started >= recording_limit;
+}
+
 void PlayDiagnostics::poll() {
     const auto keys = window_.take_diagnostic_keys();
     if (keys.capture && !frame_requested_ && !capturing()) {
@@ -352,8 +404,7 @@ void PlayDiagnostics::poll() {
         if (performance_) stop_performance("hotkey");
         else toggle_requested_ = !toggle_requested_;
     }
-    if (performance_ && Clock::now() - performance_->started >= recording_limit)
-        stop_performance("time_limit");
+    if (recording_expired()) stop_performance("time_limit");
 }
 
 void PlayDiagnostics::begin_gpu_work() {
@@ -361,7 +412,7 @@ void PlayDiagnostics::begin_gpu_work() {
 }
 
 void PlayDiagnostics::end_gpu_work() {
-    if (performance_) performance_->gpu.end();
+    if (performance_) performance_->end_gpu_work();
 }
 
 void PlayDiagnostics::capture_frame(Renderer& renderer, Gpu& gpu, const FrameCounters& counters, const Image* video,
@@ -385,7 +436,7 @@ void PlayDiagnostics::capture_frame(Renderer& renderer, Gpu& gpu, const FrameCou
         write_state_(dir);
         if (performance_) {
             performance_->collect();
-            performance_->write(dir, options_, "frame_snapshot", vsync_);
+            performance_->write(dir, options_, "frame_snapshot", window_.settings());
         }
         const auto draws = gpu.stats().draws - initial_draws_;
         write_file(dir / "capture.json", [&](std::ostream& out) {
@@ -393,7 +444,9 @@ void PlayDiagnostics::capture_frame(Renderer& renderer, Gpu& gpu, const FrameCou
                 << ",\"session_report\":" << json(path_text(options_.session_report))
                 << ",\"graphics_adapter\":" << json(renderer.adapter()) << ",\"native_size\":" << dimensions(renderer.scanout_size())
                 << ",\"window_size\":" << dimensions(displayed ? renderer.display_size() : std::array<std::uint32_t, 2>{})
-                << ",\"vsync\":" << (vsync_ ? "true" : "false") << ",\"movie_overlay\":" << (video ? "true" : "false")
+                << ",\"vsync\":" << (window_.settings().vsync ? "true" : "false")
+                << ",\"widescreen\":" << (window_.settings().widescreen ? "true" : "false")
+                << ",\"refresh_rate\":" << window_.settings().refresh_rate << ",\"movie_overlay\":" << (video ? "true" : "false")
                 << ",\"draws\":" << draws << ",\"draw_trace_limit\":" << Gpu::draw_trace_limit
                 << ",\"draw_trace_truncated\":" << (draws > Gpu::draw_trace_limit ? "true" : "false")
                 << ",\"window_png\":" << (displayed ? "true" : "false") << "}\n";
@@ -411,16 +464,17 @@ void PlayDiagnostics::capture_frame(Renderer& renderer, Gpu& gpu, const FrameCou
 
 void PlayDiagnostics::scanout(Renderer& renderer, Gpu& gpu, FrameCounters counters, double present_ms, bool captured) {
     const bool scripted_performance = !options_.performance.empty() && counters.scanout == options_.performance_at;
-    if (performance_ || toggle_requested_ || scripted_performance)
+    if (performance_ || toggle_requested_ || scripted_performance) {
         read_counters_(counters);
+        counters.gpu_wait_ns = gpu.wait_ns();
+    }
     if (performance_) {
         performance_->sample(counters, renderer.display_size(), present_ms, captured);
         if (performance_scripted_ && options_.performance_frames &&
             performance_->samples.size() >= options_.performance_frames)
             stop_performance("frame_limit");
         else if (performance_->samples.size() >= frame_limit) stop_performance("sample_limit");
-        else if (Clock::now() - performance_->started >= recording_limit) stop_performance("time_limit");
-        else performance_->restart(counters);
+        else if (recording_expired()) stop_performance("time_limit");
     }
     if (scripted_performance) {
         if (performance_) stop_performance("scripted_recording");
@@ -458,11 +512,11 @@ void PlayDiagnostics::scanout(Renderer& renderer, Gpu& gpu, FrameCounters counte
 
 void PlayDiagnostics::stop_performance(std::string_view reason) {
     auto recording = std::move(performance_);
-    recording->gpu.end();
+    recording->end_gpu_work();
     recording->collect();
     try {
         performance_result_.directory = directory("performance", performance_scripted_ ? options_.performance : Path{});
-        recording->write(performance_result_.directory, options_, reason, vsync_);
+        recording->write(performance_result_.directory, options_, reason, window_.settings());
         if (performance_scripted_) {
             performance_completed_ = !options_.performance_frames || recording->samples.size() >= options_.performance_frames;
             if (!performance_completed_) performance_result_.error = "Recording stopped before the requested scanout count";

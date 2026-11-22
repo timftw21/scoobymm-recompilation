@@ -14,6 +14,8 @@ struct FrameCounters {
     std::uint64_t vblanks{}, checkpoints{}, audio_frames{};
     GpuStats gpu;
     std::uint32_t engine{}, engine_updates{};
+    float engine_seconds{};
+    std::uint64_t scheduler_idle_ticks{}, gpu_wait_ns{};
 };
 
 class PlayDiagnostics {
@@ -21,7 +23,7 @@ public:
     using WriteState = std::function<void(const std::filesystem::path&)>;
     using ReadCounters = std::function<void(FrameCounters&)>;
 
-    PlayDiagnostics(const DiagnosticOptions&, PlayWindow&, bool vsync, WriteState, ReadCounters);
+    PlayDiagnostics(const DiagnosticOptions&, PlayWindow&, WriteState, ReadCounters);
     ~PlayDiagnostics();
     void poll();
     bool capturing() const { return trace_ != nullptr; }
@@ -35,13 +37,13 @@ public:
     void report(std::ostream&) const;
 
 private:
+    bool recording_expired() const;
     using Path = std::filesystem::path;
     struct Recording;
     struct Result { Path directory; std::string error; };
 
     DiagnosticOptions options_;
     PlayWindow& window_;
-    bool vsync_;
     WriteState write_state_;
     ReadCounters read_counters_;
     std::unique_ptr<Recording> performance_;

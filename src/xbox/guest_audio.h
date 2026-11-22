@@ -16,6 +16,11 @@ public:
     GuestAudio(Memory& memory, GuestAllocator allocator, bool output)
         : memory_(memory), allocator_(allocator), output_(output) {}
     bool invoke(PlatformApi api, Cpu& cpu, std::uint64_t checkpoints);
+    void output_gain(float gain) {
+        if (output_gain_ == gain) return;
+        output_gain_ = gain;
+        if (audio_) audio_->output_gain(gain);
+    }
     bool ready() const { return audio_ != nullptr; }
     bool output_ready() const { return audio_ && audio_->output_ready(); }
     std::uint64_t frames() const { return audio_ ? audio_->sample_clock() : 0; }
@@ -52,6 +57,7 @@ private:
     Memory& memory_;
     GuestAllocator allocator_;
     bool output_;
+    float output_gain_ = 1;
     std::unique_ptr<Audio> audio_;
     std::map<std::uint32_t, Buffer> buffers_;
     std::map<std::uint32_t, Stream> streams_;

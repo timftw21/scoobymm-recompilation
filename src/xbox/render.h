@@ -8,6 +8,16 @@ struct ID3D11Device;
 struct ID3D11DeviceContext;
 
 namespace xbox_native {
+struct VideoOverlay {
+    // Three uint4 constant-buffer registers shared with the video pixel shader.
+    struct Geometry {
+        std::uint32_t width, height, start_x, start_y;
+        std::uint32_t left, top, dest_width, dest_height;
+        std::uint32_t step_x, step_y, color_key, keyed;
+    } geometry;
+    std::uint32_t pitch;
+    Bytes pairs;
+};
 struct Image {
     std::uint32_t width, height;
     std::vector<std::byte> rgba;
@@ -69,6 +79,7 @@ struct RenderState {
 struct ProgramView {
     float depth_scale = 1, subpixel_bias = 0.03125f;
     std::array<Float4,4> texture_scales{{{1,1,1,1},{1,1,1,1},{1,1,1,1},{1,1,1,1}}};
+    float horizontal_scale = 1;
 };
 
 struct VertexAttribute {
@@ -115,7 +126,7 @@ public:
     void resize(std::uint32_t width, std::uint32_t height);
     void attach_window(void* native_window);
     void display_gamma(std::span<const std::array<std::byte, 3>, 256> gamma);
-    bool display(const Image* video = nullptr); // Scale the completed scanout to the window.
+    bool display(const VideoOverlay* video = nullptr, bool widescreen = false); // Scale the completed scanout to the window.
     void present(bool vsync);
     ID3D11Device* native_device() const;
     ID3D11DeviceContext* native_context() const;

@@ -3,6 +3,7 @@
 #include <bcrypt.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+#include <cstring>
 #include <format>
 #include <map>
 
@@ -10,6 +11,16 @@ namespace xbox_native {
 namespace {
 std::filesystem::path cache_directory;
 constexpr auto max_blob = 2 * 1024 * 1024;
+using ShaderOffsets = std::array<std::uint32_t, static_cast<unsigned>(ShaderKind::count) + 1>;
+
+Bytes builtin_bank() {
+    const auto resource = FindResourceW(nullptr,L"SCOOBYMM_SHADERS",MAKEINTRESOURCEW(10));
+    if (!resource) return {};
+    const auto size = SizeofResource(nullptr,resource);
+    const auto* data = static_cast<const std::byte*>(LockResource(LoadResource(nullptr,resource)));
+    if (!data || size < sizeof(ShaderOffsets)) throw std::runtime_error("Invalid built-in shader resource");
+    return {data,size};
+}
 
 std::filesystem::path cache_file(std::string_view source, const char* profile) {
     if (cache_directory.empty()) return {};
@@ -35,6 +46,15 @@ ShaderBinary shader_binary(ShaderKind kind, const VertexProgram* program) {
     using Microsoft::WRL::ComPtr;
     const bool translated = kind == ShaderKind::vertex || kind == ShaderKind::launch;
     if (translated != (program != nullptr)) throw std::runtime_error("Invalid shader program");
+    static const auto bank = builtin_bank();
+    if (!translated && !bank.empty()) {
+        const auto index = static_cast<unsigned>(kind);
+        if (index >= static_cast<unsigned>(ShaderKind::count)) throw std::runtime_error("Invalid built-in shader kind");
+        const auto first = u32(bank,index * 4), last = u32(bank,(index + 1) * 4);
+        if (first < sizeof(ShaderOffsets) || last <= first || last > bank.size())
+            throw std::runtime_error("Invalid built-in shader range");
+        return {bank.subspan(first,last-first),false};
+    }
     const auto normalized = program ? normalize_vertex_program(*program) : VertexProgram{};
     const auto key = std::pair{kind, normalized};
     // One thread owns rendering. Keep bytecode backing stable for ID3DBlob views.
@@ -73,6 +93,30 @@ ShaderBinary shader_binary(ShaderKind kind, const VertexProgram* program) {
     }
     auto [stored, inserted] = cache.emplace(key, std::vector(begin, begin + size));
     return {stored->second, inserted};
+}
+void bake_builtin_shaders(const std::filesystem::path& output) {
+    ShaderOffsets offsets{};
+    std::vector<std::byte> bank(sizeof(offsets));
+    for (unsigned i = 0; i < static_cast<unsigned>(ShaderKind::count); ++i) {
+        offsets[i] = static_cast<std::uint32_t>(bank.size());
+        const auto kind = static_cast<ShaderKind>(i);
+        if (kind == ShaderKind::vertex || kind == ShaderKind::launch ||
+            kind == ShaderKind::gui_vertex || kind == ShaderKind::gui_pixel) continue;
+        const auto blob = shader_binary(kind).bytes;
+        bank.insert(bank.end(),blob.begin(),blob.end());
+    }
+    offsets.back() = static_cast<std::uint32_t>(bank.size());
+    std::memcpy(bank.data(),offsets.data(),sizeof(offsets));
+    auto temporary = output;
+    temporary += std::format(".{}.tmp",GetCurrentProcessId());
+    try {
+        write_text(temporary,{reinterpret_cast<const char*>(bank.data()),bank.size()});
+        std::filesystem::rename(temporary,output);
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary,ignored);
+        throw;
+    }
 }
 std::span<const StaticVertex> static_vertex_shaders() { return {}; }
 }

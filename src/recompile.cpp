@@ -2,6 +2,7 @@
 #include "xbox/batch.h"
 #ifdef XBOX_OFFLINE_BOOT
 #include "xbox/boot.h"
+#include "xbox/shaders.h"
 #endif
 #include <Zydis/Zydis.h>
 
@@ -388,6 +389,16 @@ int recompile(Image& image, const Path& directory, const Path& output) {
 
 int main(int argc, char* argv[]) {
 #ifdef XBOX_OFFLINE_BOOT
+    if (argc == 4 && std::string_view(argv[1]) == "bake-shaders") {
+        try {
+            xbox_native::use_shader_cache(argv[3]);
+            xbox_native::bake_builtin_shaders(argv[2]);
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << error.what() << '\n';
+            return 1;
+        }
+    }
     if (argc > 1 && std::string_view(argv[1]) == "boot") {
         return xbox_native::boot_command(argc, argv);
     }
@@ -414,6 +425,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Usage: native-recompiler IMAGE.bin BASE_ADDRESS MAP_DIRECTORY NEW_OUTPUT.cpp\n"
                      "       native-recompiler xbe DEFAULT.xbe MAP_DIRECTORY NEW_OUTPUT_DIRECTORY [--allow-partial] [--disc XISO]\n"
 #ifdef XBOX_OFFLINE_BOOT
+                     "       native-recompiler bake-shaders OUTPUT.bin CACHE_DIRECTORY\n"
                      "       native-recompiler check-dialogue DEFAULT.xbe DISC.xiso\n"
                      "       native-recompiler boot DEFAULT.xbe CHECKPOINT_BUDGET [STOP_ADDRESS] [--disc XISO] [--language en|fr|de] [--audio] [--frame PNG] [--frame-index N] [--start-at-scanout N] [--shader-cache DIR]\n"
 #endif

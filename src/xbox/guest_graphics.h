@@ -6,13 +6,14 @@
 namespace xbox_native {
 enum class PlatformApi : std::uint32_t;
 class PlayDiagnostics;
+class PlayWindow;
 
 class GuestGraphics {
 public:
     GuestGraphics(Memory& memory, GuestAllocator allocator, std::filesystem::path capture, std::uint32_t capture_index,
-                  void* window = nullptr, bool vsync = true)
+                  PlayWindow* window = nullptr)
         : memory_(memory), allocator_(allocator), capture_(std::move(capture)), capture_index_(capture_index),
-          window_(window), vsync_(vsync) {}
+          window_(window) {}
     bool invoke(PlatformApi api, Cpu& cpu);
     bool ready() const { return renderer_ != nullptr; }
     bool captured() const { return captured_; }
@@ -30,10 +31,10 @@ private:
     GuestAllocator allocator_;
     std::filesystem::path capture_;
     std::uint32_t capture_index_;
-    void* window_;
-    bool vsync_;
+    PlayWindow* window_;
     PlayDiagnostics* diagnostics_{};
-    std::unique_ptr<Renderer> renderer_;
+    std::unique_ptr<Renderer> offscreen_;
+    Renderer* renderer_{};
     std::unique_ptr<Gpu> gpu_;
     std::uint32_t cursor_{};
     std::array<std::array<std::byte, 3>, 256> gamma_{};
@@ -51,7 +52,8 @@ private:
     std::uint32_t read_register(std::uint32_t offset, unsigned width) const;
     void write_register(std::uint32_t offset, unsigned width, std::uint32_t value);
     void scanout();
-    void composite_video(Image& image) const;
+    VideoOverlay video_overlay() const;
+    static void composite_video(Image&, const VideoOverlay&);
     void finish(Cpu& cpu, unsigned arguments);
 };
 }

@@ -48,5 +48,6 @@ struct LoweredFunction {
 };
 
 LoweredFunction lower(const Function& function);
+std::string lower_vertex_loop(const Function&, std::uint32_t header);
 
 } // namespace xbox_native

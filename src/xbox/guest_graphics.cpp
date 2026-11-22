@@ -1,6 +1,7 @@
 #include "guest_graphics.h"
 #include "platform_bindings.h"
 #include "play_diagnostics.h"
+#include "play_window.h"
 
 #include <algorithm>
 #include <chrono>
@@ -76,15 +77,20 @@ Word GuestGraphics::initialize(Cpu& cpu, Word parameters) {
         return status;
     }
 
-    renderer_ = std::make_unique<Renderer>(width, height);
-    if (window_) renderer_->attach_window(window_);
+    if (window_) {
+        renderer_ = &window_->renderer();
+        renderer_->resize(width,height);
+    } else {
+        offscreen_ = std::make_unique<Renderer>(width,height);
+        renderer_ = offscreen_.get();
+    }
     cursor_ = memory_.load<Word>(push_start);
     // Object IDs and classes from the initializer at 0x0011A530–0x0011A5F1.
     constexpr std::array<GraphicsObject, 11> objects{{
         {0xD, 0x97}, {0xE, 0x39}, {0x10, 0x9F}, {0x11, 0x62}, {0x12, 0x44},
         {0x13, 0x57}, {0x14, 0x43}, {0x15, 0x12}, {0x16, 0x72}, {0x18, 0x19}, {0x19, 0x30}
     }};
-    gpu_ = std::make_unique<Gpu>(*renderer_, memory_, notification, objects);
+    gpu_ = std::make_unique<Gpu>(*renderer_, memory_, notification, objects, Gpu::NotificationDelivery::polled);
     gpu_->flip = [this] { scanout(); };
     for (unsigned i = 0; i < gamma_.size(); ++i) gamma_[i].fill(static_cast<std::byte>(i));
     memory_.map_io(gpu_base, gpu_size, this,
@@ -157,6 +163,7 @@ std::uint64_t GuestGraphics::next_vblank() const {
 
 void GuestGraphics::advance_display(std::uint64_t now) {
     if (!gpu_) return;
+    if (!submitting_) gpu_->poll_notifications();
     const auto elapsed = now * display_hz / ticks_per_second;
     if (elapsed <= vblanks_) return;
     vblanks_ = elapsed;
@@ -169,9 +176,8 @@ void GuestGraphics::advance_display(std::uint64_t now) {
     }
 }
 
-void GuestGraphics::composite_video(Image& image) const {
+VideoOverlay GuestGraphics::video_overlay() const {
     const auto reg = [this](Word offset) { return video_registers_[(offset - video_first) / 4]; };
-    if (!(reg(video_buffer) & 1)) return;
     const auto packed = reg(video_format), pitch = packed & 0x1FFF;
     const auto width = reg(video_source_size) & 0x7FF, height = reg(video_source_size) >> 16 & 0x7FF;
     const auto start_x = (reg(video_source_point) & 0x7FFF) >> 4;
@@ -180,19 +186,26 @@ void GuestGraphics::composite_video(Image& image) const {
         start_x >= width || start_y >= height || (packed & 0x30000) != 0x10000)
         throw std::runtime_error("Unsupported NV2A video overlay format");
     const auto address = reg(video_address);
-    const auto* source = static_cast<const std::uint8_t*>(memory_.access(address, std::size_t(pitch) * (height - 1) + ((width + 1) & ~1U) * 2));
-    const auto left = reg(video_dest_point) & 0xFFF, top = reg(video_dest_point) >> 16 & 0xFFF;
-    const auto right = std::min(image.width, left + (reg(video_dest_size) & 0xFFF));
-    const auto bottom = std::min(image.height, top + (reg(video_dest_size) >> 16 & 0xFFF));
+    const auto bytes = std::size_t(pitch) * (height - 1) + ((width + 1) & ~1U) * 2;
+    return {{width, height, start_x, start_y, reg(video_dest_point) & 0xFFF, reg(video_dest_point) >> 16 & 0xFFF,
+             reg(video_dest_size) & 0xFFF, reg(video_dest_size) >> 16 & 0xFFF, reg(video_step_x), reg(video_step_y),
+             reg(video_color_key) & 0xFFFFFF, (packed >> 20) & 1}, pitch,
+            {static_cast<const std::byte*>(memory_.access(address,bytes)),bytes}};
+}
+
+void GuestGraphics::composite_video(Image& image, const VideoOverlay& overlay) {
+    const auto& [width,height,start_x,start_y,left,top,dest_width,dest_height,step_x,step_y,key,keyed] = overlay.geometry;
+    const auto* source = reinterpret_cast<const std::uint8_t*>(overlay.pairs.data());
+    const auto right = std::min(image.width, left + dest_width), bottom = std::min(image.height, top + dest_height);
     const auto to_byte = [](int value) { return static_cast<std::byte>(std::clamp((value + 128) >> 8, 0, 255)); };
     for (auto y = top; y < bottom; ++y) {
-        const auto row = std::min<std::uint64_t>(height - 1, start_y + ((std::uint64_t{y - top} * reg(video_step_y)) >> 20));
+        const auto row = std::min<std::uint64_t>(height - 1, start_y + ((std::uint64_t{y - top} * step_y) >> 20));
         for (auto x = left; x < right; ++x) {
             auto* pixel = image.rgba.data() + (std::size_t(y) * image.width + x) * 4;
             const auto rgb = std::to_integer<Word>(pixel[0]) << 16 | std::to_integer<Word>(pixel[1]) << 8 | std::to_integer<Word>(pixel[2]);
-            if ((packed & 0x100000) && rgb != (reg(video_color_key) & 0xFFFFFF)) continue;
-            const auto col = std::min<std::uint64_t>(width - 1, start_x + ((std::uint64_t{x - left} * reg(video_step_x)) >> 20));
-            const auto* pair = source + row * pitch + (col & ~1ULL) * 2;
+            if (keyed && rgb != key) continue;
+            const auto col = std::min<std::uint64_t>(width - 1, start_x + ((std::uint64_t{x - left} * step_x) >> 20));
+            const auto* pair = source + row * overlay.pitch + (col & ~1ULL) * 2;
             const auto luma = 298 * (pair[(col & 1) * 2] - 16);
             const auto cb = pair[1] - 128, cr = pair[3] - 128;
             pixel[0] = to_byte(luma + 409 * cr);
@@ -210,16 +223,23 @@ void GuestGraphics::scanout() {
     const bool measuring = diagnostics_ && diagnostics_->measuring();
     if (measuring) diagnostics_->begin_gpu_work();
     const bool video = (video_registers_[(video_buffer - video_first) / 4] & 1) != 0;
+    // Overlays and diagnostic memory captures also read guest RAM on the CPU.
+    if (video || diagnostic_capture) gpu_->poll_notifications(true);
     std::optional<Image> image;
+    std::optional<VideoOverlay> overlay;
     if (video && (window_ || capture || diagnostic_capture)) {
-        image = renderer_->readback(true);
-        composite_video(*image);
+        overlay = video_overlay();
+        if (capture || diagnostic_capture) {
+            image = renderer_->readback(true);
+            composite_video(*image, *overlay);
+        }
     }
     bool captured_display = false;
     bool displayed = false;
-    if (window_) {
+    if (window_ && window_->frame_due(video,scanouts_,vblanks_)) {
         if (std::exchange(gamma_dirty_, false)) renderer_->display_gamma(gamma_);
-        displayed = renderer_->display(video ? &*image : nullptr);
+        // The movie is already composed for the authored 4:3 scanout.
+        displayed = renderer_->display(overlay ? &*overlay : nullptr, !video && window_->settings().widescreen);
     }
     if (measuring) diagnostics_->end_gpu_work();
     if (diagnostic_capture) {
@@ -233,11 +253,13 @@ void GuestGraphics::scanout() {
             image = renderer_->read_display();
             captured_display = true;
         }
+        window_->overlay(measuring);
+        window_->pace_game(video);
         const auto start = measuring ? Clock::now() : Clock::time_point{};
-        renderer_->present(vsync_);
+        renderer_->present(window_->settings().vsync);
         if (measuring) present_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
         ++presentations_;
-    }
+    } else if (window_) window_->pace_game(video);
     if (capture) {
         if (!image) image = renderer_->readback(true);
         if (gamma_written_ && !captured_display) {
@@ -265,6 +287,16 @@ void GuestGraphics::submit() {
     const auto start = memory_.load<Word>(push_start), limit = memory_.load<Word>(push_end);
     if (cursor_ < start || end < cursor_ || end > limit) throw std::runtime_error("D3D submission leaves the push buffer");
     if (cursor_ != end) {
+        // The SDK builds its color surface table at device+0x15F4 and
+        // initializes the backbuffers at 0x119830 via 0x11A0B2.
+        std::array<Word,3> colors{};
+        if (window_ && window_->settings().widescreen) {
+            for (unsigned i=0; i<colors.size(); ++i) {
+                const auto surface = memory_.load<Word>(device + 0x15F4 + 4*i);
+                if (surface) colors[i] = memory_.load<Word>(surface + 4) & 0x0FFFFFFF;
+            }
+        }
+        gpu_->widescreen_buffers(colors);
         submitting_ = true;
         if (diagnostics_) diagnostics_->begin_gpu_work();
         gpu_->submit(cursor_, end);
@@ -295,10 +327,16 @@ bool GuestGraphics::invoke(PlatformApi api, Cpu& cpu) {
     case PlatformApi::GraphicsBusy:
         cpu.registers[eax] = gpu_->busy();
         return done(0);
-    case PlatformApi::GraphicsWait:
+    case PlatformApi::GraphicsWait: {
+        const auto issued = memory_.load<Word>(device + 0x2C);
+        const auto completed = memory_.load<Word>(memory_.load<Word>(device + 0x30));
+        // 0x1191CC compares unsigned distances so fence numbers can wrap.
+        // The translated short return sets the original registers and flags.
+        if (issued - arg(0) >= issued - completed) return false;
         submit();
         gpu_->wait();
         return done(2);
+    }
     case PlatformApi::GraphicsReserve: {
         const auto flags = memory_.load<Word>(device + 8), cursor = memory_.load<Word>(device);
         if (flags & 4) {
@@ -314,8 +352,9 @@ bool GuestGraphics::invoke(PlatformApi api, Cpu& cpu) {
             }
             auto next = cursor;
             if (maximum + 0x204 > end - cursor) {
+                // 0x1193B9 checks whether the FIFO reader still overlaps the
+                // reservation. submit() consumes the commands and advances GET.
                 submit();
-                gpu_->wait();
                 next = cursor_ = begin;
                 memory_.store(device, next);
                 memory_.store<Word>(device + 0x40, cursor - begin);

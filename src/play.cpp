@@ -7,6 +7,7 @@
 #include <charconv>
 #include <chrono>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <Windows.h>
@@ -35,6 +36,10 @@ std::filesystem::path application_root() {
 void usage() {
     std::cout << "scoobymm [DEFAULT.xbe DISC.xiso] [--fullscreen] [--mute] [--no-vsync]\n"
                  "  Omit both media paths to use this project's verified Xbox files.\n"
+                 "  --settings           Open settings before play (default with no arguments)\n"
+                 "  --refresh-rate HZ    Rendering cap, or 0 for unlimited\n"
+                 "  --refresh-at-scanout N HZ   Change the cap at a repeatable benchmark boundary\n"
+                 "  --widescreen         Use the Xbox widescreen display setting\n"
                  "  --shader-cache DIR   Cached native shaders\n"
                  "  --storage DIR        Playtest save directory (default data/user)\n"
                  "  --language en|fr|de   Xbox game language\n"
@@ -49,7 +54,7 @@ void usage() {
                  "  --stick-at-scanout N FRAMES X Y   Hold the left stick at signed Xbox coordinates\n"
                  "Keyboard: Enter to start, Space to confirm, Left Shift to go back,\n"
                  "arrows for the D-pad, W/A/S/D for the left stick, Escape to quit.\n"
-                 "F8 captures a frame. F9 starts or stops performance recording (60 seconds maximum).\n";
+                 "F1 or the controller Guide button opens settings. F8 captures a frame. F9 starts or stops performance recording (60 seconds maximum).\n";
 }
 }
 
@@ -58,6 +63,7 @@ int wmain(int argc, wchar_t* argv[]) {
     try {
         xbox_native::PlayOptions options;
         const auto root = application_root();
+        options.launcher = argc == 1;
         int next = 1;
         if (argc > 1 && !std::wstring_view(argv[1]).starts_with(L"--")) {
             if (argc < 3 || std::wstring_view(argv[2]).starts_with(L"--")) {
@@ -72,6 +78,8 @@ int wmain(int argc, wchar_t* argv[]) {
         }
         options.shader_cache = root / "build/shader-cache";
         options.storage = root / "data/user";
+        bool set_fullscreen = false, set_mute = false, set_no_vsync = false, set_wide = false;
+        std::optional<int> refresh;
         std::filesystem::path report_path;
         bool explicit_frame_index = false, capture_at = false, performance_at = false;
         for (int i=next;i<argc;++i) {
@@ -99,9 +107,21 @@ int wmain(int argc, wchar_t* argv[]) {
                     throw std::runtime_error("Stick coordinates must be signed 16-bit integers");
                 return value;
             };
-            if (option == L"--fullscreen") options.fullscreen = true;
-            else if (option == L"--mute") options.audio = false;
-            else if (option == L"--no-vsync") options.vsync = false;
+            const auto rate = [&] {
+                const auto n = analysis_map::number(argument().string());
+                if (n > 1000) throw std::runtime_error("Choose a refresh rate between 0 and 1000 Hz");
+                return static_cast<int>(n);
+            };
+            if (option == L"--fullscreen") set_fullscreen = true;
+            else if (option == L"--mute") set_mute = true;
+            else if (option == L"--no-vsync") set_no_vsync = true;
+            else if (option == L"--widescreen") set_wide = true;
+            else if (option == L"--settings") options.launcher = true;
+            else if (option == L"--refresh-rate") refresh = rate();
+            else if (option == L"--refresh-at-scanout") {
+                options.refresh_at = nonzero();
+                options.scripted_rate = rate();
+            }
             else if (option == L"--hidden") options.hidden = true;
             else if (option == L"--frames") options.frames = nonzero();
             else if (option == L"--shader-cache") options.shader_cache = argument();
@@ -125,6 +145,20 @@ int wmain(int argc, wchar_t* argv[]) {
                 pulse(options.input.dpad[direction - dpad_options.begin()]);
             } else throw std::runtime_error("Unknown play option: " + std::filesystem::path(option).string());
         }
+        const auto explicit_xbe = options.xbe, explicit_disc = options.disc;
+        try { options.load(options.storage / "settings.cfg"); }
+        catch (const std::exception& error) {
+            if (options.hidden) throw;
+            options.settings_error = error.what();
+            options.launcher = true;
+        }
+        if (next > 1) { options.xbe = explicit_xbe; options.disc = explicit_disc; }
+        if (set_fullscreen) options.fullscreen = true;
+        if (set_mute) options.muted = true;
+        if (set_no_vsync) options.vsync = false;
+        if (set_wide) options.widescreen = true;
+        if (refresh) options.refresh_rate = *refresh;
+        if (options.hidden && options.launcher) throw std::runtime_error("The interactive launcher requires a visible window");
         if (explicit_frame_index && options.capture.empty()) throw std::runtime_error("Frame index requires --frame");
         if (capture_at && options.diagnostics.frame.empty()) throw std::runtime_error("--capture-at requires --capture-frame");
         if ((performance_at || options.diagnostics.performance_frames) && options.diagnostics.performance.empty())

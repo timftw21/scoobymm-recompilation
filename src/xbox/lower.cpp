@@ -48,6 +48,7 @@ public:
     bool floating = false;
     bool divide_faults = false;
     std::set<std::uint32_t> loop_headers;
+    const Function* function = nullptr;
     std::set<std::uint32_t> jump_continuations;
     std::map<std::string,std::string> native_helpers;
     std::map<std::string,std::string> native_declarations;
@@ -264,8 +265,14 @@ public:
             mnemonic=="fnclex" || mnemonic=="fninit" || mnemonic=="fnop";
         if (memory) {
             if (!memory->size || memory->size%8) throw std::runtime_error("Unsupported x87 memory width");
-            body << "    const auto fp_address=" << address(*memory) << ";\n"
-                 << "    auto* fp_memory=memory.access(fp_address," << memory->size/8 << ");\n";
+            body << "    const auto fp_address=" << address(*memory) << ";\n";
+            // The RenderWare perspective frustum builder uses these three
+            // horizontal extents when deciding which objects enter the view.
+            if (!relocatable && (instruction.address == 0xA29F4 || instruction.address == 0xA29FA ||
+                    instruction.address == 0xA29FD) && memory->size == 32 && memory->mem.base == ZYDIS_REGISTER_ESI &&
+                    memory->mem.index == ZYDIS_REGISTER_NONE && memory->mem.disp.value == 0x68)
+                body << "    auto fp_extent=xbox_native::camera_extent(cpu,memory,esi,0x68U); auto* fp_memory=&fp_extent;\n";
+            else body << "    auto* fp_memory=memory.access(fp_address," << memory->size/8 << ");\n";
         }
         if (!control) {
             body << "    cpu.floating.instruction=" << pc(instruction.address) << ";\n"
@@ -364,8 +371,10 @@ public:
             calls = true;
             body << "    if (cpu.diagnostic) { commit(); cpu.eip = " << pc(instruction.address) << "; }\n";
         }
-        if(loop_headers.contains(instruction.address))
+        if(loop_headers.contains(instruction.address)) {
             body << "    if(xbox_native::checkpoint_due(cpu)) { commit(); xbox_native::checkpoint(cpu," << pc(instruction.address) << "); }\n";
+            body << lower_vertex_loop(*function,instruction.address);
+        }
         bool terminator = false;
         const bool packed = std::ranges::any_of(visible, [](const auto& operand) {
             return operand.type == ZYDIS_OPERAND_TYPE_REGISTER && operand.reg.value >= ZYDIS_REGISTER_MM0 &&
@@ -642,7 +651,15 @@ public:
             const auto width = ins.operand_width;
             if (width != 16 && width != 32) throw std::runtime_error("Unsupported push width");
             used.insert(4); dirty.insert(4);
-            body << "    const auto value = " << read(operands[0]) << ";\n    esp -= " << width / 8
+            auto value = read(operands[0]);
+            // The verified title passes 0.033 seconds per rendered frame to its
+            // scene effects and interface timers. Offline execution keeps the literal.
+            if (!relocatable && (instruction.address == 0x23CC7 || instruction.address == 0x23D8A ||
+                    instruction.address == 0x24098) && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                    operands[0].imm.value.u == 0x3D072B02 && width == 32) {
+                value = "(cpu.clock && cpu.clock->frame_step ? cpu.clock->frame_step(cpu.clock->context, " + value + ") : " + value + ")";
+            }
+            body << "    const auto value = " << value << ";\n    esp -= " << width / 8
                  << "U;\n    memory.store<" << type(width) << ">(esp, static_cast<" << type(width) << ">(value));\n";
             break;
         }
@@ -920,6 +937,7 @@ public:
 LoweredFunction lower(const Function& function) {
     LoweredFunction result;
     Emitter emitter;
+    emitter.function = &function;
     emitter.relocatable = function.relocatable;
     emitter.loop_headers.insert(function.loop_headers.begin(), function.loop_headers.end());
     emitter.calls=!emitter.loop_headers.empty();

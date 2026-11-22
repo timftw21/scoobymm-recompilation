@@ -33,10 +33,12 @@ struct KernelServices {
     void (*write_port)(void*,std::uint16_t,unsigned,std::uint32_t) = nullptr;
     bool (*platform)(void*, Cpu&, Memory&, std::uint32_t) = nullptr;
     NativeFunction (*resolve_module)(void*, Cpu&, std::uint32_t) = nullptr;
+    std::uint32_t (*camera_extent)(void*, std::uint32_t camera, unsigned field, std::uint32_t value) = nullptr;
 };
 struct GuestClock {
     void* context = nullptr;
     std::uint64_t (*read_cycles)(void*) = nullptr;
+    std::uint32_t (*frame_step)(void*, std::uint32_t authored) = nullptr;
 };
 struct ExecutionDiagnostic {
     std::uint64_t remaining = 1000000, visits = 0;
@@ -130,9 +132,15 @@ public:
         if(overlaps(base_,bytes_.size())) throw std::runtime_error("Guest mappings overlap");
         for(unsigned i=0;i<region_count_;++i) if(overlaps(regions_[i].base,regions_[i].bytes.size()))
             throw std::runtime_error("Guest mappings overlap");
+        if (primary_offset != UINT32_MAX && (primary_offset > bytes_.size() || bytes.size() > bytes_.size() - primary_offset))
+            throw std::runtime_error("Guest alias exceeds primary RAM");
         regions_[region_count_++]={base,bytes,primary_offset};
     }
-    void guard_primary_pages(std::span<const std::uint8_t> blocked) { blocked_pages_ = blocked; }
+    void guard_primary_pages(std::span<const std::uint8_t> blocked) {
+        if (!blocked.empty() && blocked.size() < (bytes_.size() + 4095U) / 4096U)
+            throw std::runtime_error("Guest page map is too small");
+        blocked_pages_ = blocked;
+    }
     void* access(std::uint32_t address, std::size_t size) const { return pointer(address,size); }
     void prefetch(std::uint32_t address) const {
         if(address>=base_ && static_cast<std::uint64_t>(address)-base_<bytes_.size())
@@ -158,26 +166,21 @@ public:
     }
     template<class T> T load(std::uint32_t address) const {
         static_assert(std::is_unsigned_v<T>);
-        if(address>=io_floor_) if(const auto* io=find_io(address,sizeof(T))) {
-            if constexpr(sizeof(T)<=4) return static_cast<T>(io->read(io->context,address-io->base,sizeof(T)));
-            else {static_assert(sizeof(T)==8);return static_cast<T>(io->read(io->context,address-io->base,4))|
-                (static_cast<T>(io->read(io->context,address-io->base+4,4))<<32);}
-        }
+        static_assert(sizeof(T)<=8);
+        const auto* source = primary_pointer(address,sizeof(T));
+        if (!source) [[unlikely]] return static_cast<T>(load_mapped(address,sizeof(T)));
         T value;
-        std::memcpy(&value, pointer(address, sizeof(T)), sizeof(T));
+        std::memcpy(&value,source,sizeof(T));
         if constexpr (std::endian::native == std::endian::big) value = std::byteswap(value);
         return value;
     }
     template<class T> void store(std::uint32_t address, T value) {
         static_assert(std::is_unsigned_v<T>);
-        if(address>=io_floor_) if(const auto* io=find_io(address,sizeof(T))) {
-            if constexpr(sizeof(T)<=4) io->write(io->context,address-io->base,sizeof(T),static_cast<std::uint32_t>(value));
-            else {static_assert(sizeof(T)==8);io->write(io->context,address-io->base,4,static_cast<std::uint32_t>(value));
-                io->write(io->context,address-io->base+4,4,static_cast<std::uint32_t>(value>>32));}
-            return;
-        }
+        static_assert(sizeof(T)<=8);
+        auto* target = primary_pointer(address,sizeof(T));
+        if (!target) [[unlikely]] return store_mapped(address,sizeof(T),value);
         if constexpr (std::endian::native == std::endian::big) value = std::byteswap(value);
-        std::memcpy(pointer(address, sizeof(T)), &value, sizeof(T));
+        std::memcpy(target,&value,sizeof(T));
     }
     template<class T> void move_elements(std::uint32_t destination, std::uint32_t source,
                                          std::uint32_t count, bool descending) {
@@ -245,29 +248,23 @@ private:
         }
         return nullptr;
     }
+    std::byte* primary_pointer(std::uint32_t address, std::size_t size) const {
+        const auto offset = address - base_;
+        // Most guest accesses fit on one committed RAM page. Even when the
+        // subtraction wraps, a nonempty range below base cannot fit in RAM.
+        if (size && size <= 4096U - (offset & 4095U) &&
+            static_cast<std::uint64_t>(offset) + size <= bytes_.size() &&
+            (blocked_pages_.empty() || !blocked_pages_[offset >> 12])) [[likely]]
+            return bytes_.data() + offset;
+        return nullptr;
+    }
     std::byte* pointer(std::uint32_t address, std::size_t size) const {
-        if(address>=base_ && address-base_<=bytes_.size() && size<=bytes_.size()-(address-base_))
-            return primary_pointer(address, address - base_, size);
-        for(unsigned i=0;i<region_count_;++i) {
-            const auto& region=regions_[i];
-            if(address>=region.base && address-region.base<=region.bytes.size() && size<=region.bytes.size()-(address-region.base)) {
-                if (region.primary_offset != UINT32_MAX)
-                    return primary_pointer(address, region.primary_offset + address - region.base, size);
-                return region.bytes.data()+(address-region.base);
-            }
-        }
-        throw std::runtime_error(std::format("Guest memory access at 0x{:08X}, {} bytes, outside the mapped regions", address, size));
+        if (auto* data = primary_pointer(address,size)) return data;
+        return mapped_pointer(address, size);
     }
-    std::byte* primary_pointer(std::uint32_t address, std::uint32_t offset, std::size_t size) const {
-        if (!blocked_pages_.empty() && size) {
-            const auto last = (offset + size - 1) >> 12;
-            for (auto page = offset >> 12; page <= last; ++page) {
-                if (blocked_pages_[page])
-                    throw std::runtime_error(std::format("Guest memory access at 0x{:08X} crosses an uncommitted page", address));
-            }
-        }
-        return bytes_.data() + offset;
-    }
+    std::uint64_t load_mapped(std::uint32_t address,unsigned width) const;
+    void store_mapped(std::uint32_t address,unsigned width,std::uint64_t value);
+    std::byte* mapped_pointer(std::uint32_t address, std::size_t size) const;
     std::uint32_t base_;
     std::span<std::byte> bytes_;
     std::span<const std::uint8_t> blocked_pages_;
@@ -278,6 +275,13 @@ private:
     unsigned io_count_=0;
     std::uint32_t io_floor_=UINT32_MAX;
 };
+
+inline std::uint32_t camera_extent(const Cpu& cpu, const Memory& memory, std::uint32_t camera, unsigned field) {
+    const auto value = memory.load<std::uint32_t>(camera + field);
+    if (cpu.kernel && cpu.kernel->camera_extent)
+        return cpu.kernel->camera_extent(cpu.kernel->context, camera, field, value);
+    return value;
+}
 
 inline void load_code_selector(Cpu& cpu,const Memory& memory,std::uint16_t selector,std::uint32_t offset) {
     const auto index=selector&~7U;

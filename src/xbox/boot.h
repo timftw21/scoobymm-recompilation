@@ -1,4 +1,5 @@
 #pragma once
+#include "settings.h"
 
 #include <array>
 #include <cstdint>
@@ -25,11 +26,14 @@ struct DiagnosticOptions {
     std::uint32_t capture_at = 1, performance_at = 1, performance_frames = 0;
 };
 
-struct PlayOptions {
-    std::filesystem::path xbe, disc, shader_cache, capture, storage;
+struct PlayOptions : PlayerSettings {
+    std::filesystem::path shader_cache, capture, storage;
+    std::string settings_error;
     std::uint32_t capture_index = 1, frames = 0;
     std::uint32_t language = 1;
-    bool hidden = false, fullscreen = false, audio = true, vsync = true;
+    std::uint32_t refresh_at = 0;
+    int scripted_rate = 0;
+    bool hidden = false, launcher = false;
     InputScript input;
     DiagnosticOptions diagnostics;
 };
@@ -37,5 +41,5 @@ struct PlayOptions {
 int boot_command(int argc, char* argv[]);
 int check_dialogue_stream(const std::filesystem::path& xbe, const std::filesystem::path& disc);
 std::uint32_t xbox_language(std::string_view code);
-int play_game(const PlayOptions&, std::ostream& report);
+int play_game(PlayOptions&, std::ostream& report);
 }

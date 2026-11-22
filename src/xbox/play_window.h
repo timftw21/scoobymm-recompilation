@@ -1,6 +1,8 @@
 #pragma once
 
+#include "boot.h"
 #include <array>
+#include <memory>
 #include <cstdint>
 #include <string_view>
 
@@ -8,6 +10,8 @@ struct SDL_Window;
 struct SDL_Gamepad;
 
 namespace xbox_native {
+class Renderer;
+class SettingsMenu;
 struct DiagnosticKeys {
     bool capture{}, toggle_performance{};
 };
@@ -21,7 +25,14 @@ struct GamepadState {
 
 class PlayWindow {
 public:
-    PlayWindow(bool hidden, bool fullscreen);
+    explicit PlayWindow(PlayOptions& options);
+    bool launcher();
+    void overlay(bool measuring);
+    bool frame_due(bool movie, std::uint32_t scanout, std::uint64_t vblank);
+    void pace_game(bool movie);
+    float gain() const;
+    Renderer& renderer() const { return *renderer_; }
+    const PlayerSettings& settings() const { return options_; }
     ~PlayWindow();
     PlayWindow(const PlayWindow&) = delete;
     PlayWindow& operator=(const PlayWindow&) = delete;
@@ -36,8 +47,17 @@ public:
 private:
     SDL_Window* window_{};
     SDL_Gamepad* gamepad_{};
-    bool hidden_;
-    GamepadState state_;
+    PlayOptions& options_;
+    bool hidden_, playing_{}, focused_{};
+    int pacing_rate_ = -1;
+    std::uint64_t deadline_{}, movie_bucket_{};
+    int movie_rate_ = -1;
+    unsigned skip_{};
+    void pace(int hz);
+    std::unique_ptr<Renderer> renderer_;
+    std::unique_ptr<SettingsMenu> menu_;
+    GamepadState state_, menu_input_;
+    bool menu_was_open_{};
     DiagnosticKeys diagnostic_keys_;
     std::uint64_t origin_{}, updated_{}, next_rumble_{};
     std::uint16_t low_{}, high_{};

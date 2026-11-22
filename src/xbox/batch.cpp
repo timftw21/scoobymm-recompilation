@@ -1164,7 +1164,11 @@ int recompile_xbe(const Path& input, const Path& maps, const Path& output, bool 
     header << banner(image) << "#pragma once\n#include \"xbox/cpu.h\"\nnamespace xbox_native {\n";
     index << "namespace {\n"
           << "const std::array<CompiledFunction," << program.units.size() + program.alternate_owners.size() << "> functions{{\n";
-    std::size_t total_source{}, function_index{}, lowered_count{};
+    std::size_t total_source{}, assigned_rows{}, lowered_count{};
+    std::size_t total_rows = 0;
+    for (const auto& [entry, unit] : program.units)
+        if (!unit.recovered) total_rows += unit.rows.size();
+    const auto rows_per_shard = std::max<std::size_t>(1,(total_rows+shard_count-1)/shard_count);
     for (auto& [entry, unit] : program.units) {
         const auto name = symbol(entry);
         auto& declarations = unit.recovered ? index_declarations : header;
@@ -1195,7 +1199,9 @@ int recompile_xbe(const Path& input, const Path& maps, const Path& output, bool 
         }
         total_source += lowered.source.size();
         if (total_source > max_source_bytes) throw std::runtime_error("Generated source exceeds 256 MiB");
-        const auto shard = unit.recovered ? shard_count : function_index++ % shard_count;
+        // Keep neighboring functions together so the host compiler can inline their direct calls.
+        const auto shard = unit.recovered ? shard_count : std::min<std::size_t>(shard_count-1,assigned_rows/rows_per_shard);
+        if (!unit.recovered) assigned_rows += unit.rows.size();
         uses_unwind[shard] |= std::ranges::any_of(function.instructions, [](const auto& pair) {
             return pair.second.saves_jump || pair.second.resumes_jump;
         });
