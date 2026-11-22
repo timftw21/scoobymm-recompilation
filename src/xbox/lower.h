@@ -14,6 +14,8 @@ struct Instruction {
     std::array<std::byte, ZYDIS_MAX_INSTRUCTION_LENGTH> bytes{};
     std::string text;
     std::optional<std::uint32_t> kernel_ordinal;
+    std::optional<std::uint32_t> checked_target;
+    std::vector<std::pair<std::uint32_t,std::uint32_t>> caller_targets;
     std::vector<std::uint32_t> jump_targets;
     std::vector<std::uint32_t> external_jump_targets;
     bool cross_function_branch{};

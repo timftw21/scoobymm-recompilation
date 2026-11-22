@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include "logic_exports.h"
 #include "unwind.h"
 #include <algorithm>
 #include <atomic>
@@ -73,6 +74,16 @@ void write_port(Cpu& cpu,std::uint16_t port,unsigned width,std::uint32_t value) 
 void invoke_native(Cpu& cpu, Memory& memory, std::uint32_t address) {
     const auto caller = cpu.eip;
     cpu.eip = address;
+    // Loaded logic objects own per-call ABI bindings. Check the caller before
+    // selecting any guest, cached XBE, or kernel destination.
+    if (cpu.kernel && cpu.kernel->resolve_module) {
+        if (const auto fn = cpu.kernel->resolve_module(cpu.kernel->context,cpu,caller)) {
+            fn(cpu,memory);
+            return;
+        }
+    }
+    if (logic_export_field(caller))
+        throw NativeBoundary(address,std::format("No matching disc module export for call at 0x{:08X}",caller));
     if(address>0xFFF00000U && address<0xFFF02000U && !(address&15U)) {
         const auto ordinal=(address-0xFFF00000U)/16;
         if(!cpu.kernel || !cpu.kernel->entries[ordinal]) throw NativeBoundary(address,"kernel function is unbound");
@@ -93,12 +104,6 @@ void invoke_native(Cpu& cpu, Memory& memory, std::uint32_t address) {
         cached = &*found;
         found->run(cpu, memory);
         return;
-    }
-    if (cpu.kernel && cpu.kernel->resolve_module) {
-        if (const auto function = cpu.kernel->resolve_module(cpu.kernel->context, cpu, caller)) {
-            function(cpu, memory);
-            return;
-        }
     }
     throw NativeBoundary(address, std::format("call or jump from 0x{:08X} has no mapped entry", caller));
 }

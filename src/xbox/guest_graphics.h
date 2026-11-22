@@ -21,6 +21,8 @@ public:
     void diagnostics(PlayDiagnostics* value) { diagnostics_ = value; }
     GpuStats stats() const { return gpu_ ? gpu_->stats() : GpuStats{}; }
     void advance_display(std::uint64_t now);
+    void name_widget(std::uint32_t handle,std::uint32_t name);
+    void draw_widget(std::uint32_t widget);
     std::uint64_t next_vblank() const;
     std::uint32_t overlay_frames() const { return overlay_frames_; }
     std::uint32_t scanouts() const { return scanouts_; }
@@ -37,17 +39,29 @@ private:
     Renderer* renderer_{};
     std::unique_ptr<Gpu> gpu_;
     std::uint32_t cursor_{};
+    // The HUD registry at 0x49DF0 has 512 slots and generation-tagged handles.
+    struct WidgetAnchor { std::uint32_t handle = UINT32_MAX; int side{}; bool gameplay_root{}; };
+    std::array<WidgetAnchor,512> widget_anchors_{};
+    std::uint32_t pause_menu_handle_ = UINT32_MAX;
+    std::vector<Gpu::HudAnchor> hud_markers_;
+    int hud_side_{};
+    bool presentation_wide_{}, last_widescreen_{};
+    std::uint32_t widget_from_handle(std::uint32_t hud, std::uint32_t handle) const;
+    bool pause_menu_visible() const;
     std::array<std::array<std::byte, 3>, 256> gamma_{};
     unsigned gamma_index_{}, gamma_channel_{};
     bool gamma_written_{}, gamma_dirty_{};
     bool captured_{};
     std::array<std::uint32_t, (0x8B00 - 0x8100) / 4 + 1> video_registers_{};
+    static constexpr std::uint64_t ntsc_field_ns = 16'683'350; // SDK constant at 0x11EC16.
+    std::uint64_t field_period_ns_ = ntsc_field_ns;
     std::uint64_t vblanks_{};
     std::uint32_t scanouts_{}, overlay_frames_{}, presentations_{};
     bool overlay_pending_{}, submitting_{};
 
     std::uint32_t initialize(Cpu& cpu, std::uint32_t parameters);
-    std::uint32_t sdk_call(Cpu& cpu, std::uint32_t address, std::span<const std::uint32_t> args = {});
+    std::uint32_t sdk_call(Cpu& cpu, std::uint32_t address, std::span<const std::uint32_t> args = {},
+                           std::uint32_t device_offset = 0);
     void submit();
     std::uint32_t read_register(std::uint32_t offset, unsigned width) const;
     void write_register(std::uint32_t offset, unsigned width, std::uint32_t value);

@@ -85,7 +85,7 @@ add_library(xbox-media STATIC src/xbox/disc.cpp src/xbox/file.cpp src/xbox/xbe.c
 target_compile_features(xbox-media PUBLIC cxx_std_23)
 target_include_directories(xbox-media PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set_target_properties(xbox-media PROPERTIES CXX_EXTENSIONS OFF)
-add_executable(native-recompiler src/recompile.cpp src/xbox/batch.cpp src/xbox/lower.cpp src/xbox/vertex_loop.cpp)
+add_executable(native-recompiler src/recompile.cpp src/xbox/batch.cpp src/xbox/call_sources.cpp src/xbox/call_evidence.cpp src/xbox/lower.cpp src/xbox/vertex_loop.cpp)
 target_compile_features(native-recompiler PRIVATE cxx_std_23)
 set_target_properties(native-recompiler PROPERTIES CXX_EXTENSIONS OFF)
 target_include_directories(native-recompiler PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -141,12 +141,31 @@ if(XBOX_GENERATED_SOURCE)
         "${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp" "${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp")
     target_include_directories(scoobymm-imgui PUBLIC "${imgui_SOURCE_DIR}" "${imgui_SOURCE_DIR}/backends")
     target_link_libraries(scoobymm-imgui PRIVATE SDL3::SDL3 d3dcompiler)
+    find_package(Git REQUIRED)
+    find_program(CARGO_EXECUTABLE cargo REQUIRED)
+    FetchContent_Declare(dsp56300
+        GIT_REPOSITORY https://github.com/xemu-project/dsp56300.git
+        GIT_TAG aab3649fc452daf03da8b5e36fdc0c308d874101
+        GIT_SUBMODULES ""
+        UPDATE_DISCONNECTED TRUE
+        PATCH_COMMAND "${GIT_EXECUTABLE}" apply "${CMAKE_CURRENT_SOURCE_DIR}/cmake/dsp56300-return.patch")
+    FetchContent_MakeAvailable(dsp56300)
+    set(dsp_library "${dsp56300_BINARY_DIR}/release/dsp56300_emu_ffi.lib")
+    add_custom_command(OUTPUT "${dsp_library}"
+        COMMAND "${CARGO_EXECUTABLE}" build --locked --release --jobs 2 -p dsp56300-emu-ffi
+                --manifest-path "${dsp56300_SOURCE_DIR}/Cargo.toml" --target-dir "${dsp56300_BINARY_DIR}"
+        DEPENDS "${dsp56300_SOURCE_DIR}/Cargo.lock" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/dsp56300-return.patch"
+        COMMENT "Building DSP56300 audio processor" VERBATIM)
+    add_custom_target(scoobymm-dsp DEPENDS "${dsp_library}")
     add_library(xbox-runtime STATIC
         src/xbox/settings.cpp src/xbox/settings_menu.cpp
-        src/xbox/boot.cpp src/xbox/audio.cpp src/xbox/guest_audio.cpp
+        src/xbox/boot.cpp src/xbox/audio.cpp src/xbox/audio_effects.cpp src/xbox/guest_audio.cpp
         src/xbox/guest_graphics.cpp src/xbox/gpu.cpp src/xbox/render.cpp src/xbox/shaders.cpp
         src/xbox/shader_compiler.cpp src/xbox/vertex_program.cpp src/xbox/play_window.cpp src/xbox/play_diagnostics.cpp)
     target_compile_features(xbox-runtime PUBLIC cxx_std_23)
+    add_dependencies(xbox-runtime scoobymm-dsp)
+    target_include_directories(xbox-runtime PRIVATE "${dsp56300_SOURCE_DIR}/crates/emu-ffi/include")
+    target_link_libraries(xbox-runtime PRIVATE "${dsp_library}" ws2_32 userenv bcrypt ntdll)
     target_include_directories(xbox-runtime PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_compile_options(xbox-runtime PRIVATE /W4)
     set_target_properties(xbox-runtime PROPERTIES CXX_EXTENSIONS OFF)

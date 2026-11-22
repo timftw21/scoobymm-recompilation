@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "audio_effects.h"
 #include <chrono>
 
 
@@ -454,10 +455,7 @@ void Audio::mix_voice(Voice& value,std::span<const std::array<float,2>> samples,
         gains[i]=gain*sink->bin_gains[bin]*((bin==0 || bin==4 || bin==6 || bin==8)?pan[0]:(bin==1 || bin==5 || bin==7 || bin==9)?pan[1]:1);
         if(bin>=6 && bin<=9) gains[i]*=value.front_back[bin>=8]*value.environment_gain[0];
         else if(bin==2) gains[i]*=value.environment_gain[0];
-        else if(bin==10) {
-            gains[i]*=value.environment_gain[1];
-            if(gains[i]) throw std::runtime_error("Environmental audio requires an assigned reverb effect");
-        }
+        else if(bin==10) gains[i]*=value.environment_gain[1];
     }
     for(unsigned frame=0;frame<samples.size();++frame) {
         std::array<std::array<float,2>,2> filtered{};
@@ -533,18 +531,45 @@ void Audio::mix_bins(std::span<float> output,unsigned frame_count) {
         for(auto& sample:output.subspan(bin*frame_count,frame_count)) sample=std::clamp(sample*gain,-1.0f,1.0f);
     }
 }
+void Audio::install_effects(std::unique_ptr<AudioEffects> image) {
+    StreamLock lock(stream_);
+    effects_.swap(image);
+    effect_offset_ = 0;
+    effect_output_.fill(0);
+}
+
 void Audio::mix_sources(std::span<float> output) {
     std::array<float,32*32> bins{};
-    for(std::size_t start=0;start<output.size()/2;start+=32) {
-        const auto count=static_cast<unsigned>(std::min<std::size_t>(32,output.size()/2-start));
+    for(std::size_t start=0;start<output.size()/2;) {
+        const auto count=static_cast<unsigned>(std::min<std::size_t>(32-effect_offset_,output.size()/2-start));
         mix_bins(std::span(bins).first(count*32),count);
-        for(unsigned i=0;i<count;++i) {
-            const auto center=bins[2*count+i]*0.70710678f+bins[3*count+i]*0.5f;
-            output[(start+i)*2]=std::clamp(bins[i]+center+bins[4*count+i]*0.70710678f,-1.0f,1.0f);
-            output[(start+i)*2+1]=std::clamp(bins[count+i]+center+bins[5*count+i]*0.70710678f,-1.0f,1.0f);
+        auto stereo = output.subspan(start*2,count*2);
+        start += count;
+        if (effects_) {
+            // The device consumes a full block. Keep its output queued while collecting the
+            // next block so short SDL requests do not advance voices or finish packets early.
+            auto mix = effects_->mix_bins();
+            for (unsigned bin=0; bin<32; ++bin) for (unsigned i=0; i<count; ++i) {
+                const auto sample = std::min(bins[bin*count+i]*8388608.f,8388607.f);
+                mix[bin*32+effect_offset_+i] = static_cast<std::int32_t>(sample) & 0xffffff;
+            }
+            std::copy_n(effect_output_.data()+2*effect_offset_,2*count,stereo.begin());
+            effect_offset_ += count;
+            if (effect_offset_ != 32) continue;
+            effect_offset_ = 0;
+            effects_->process();
+            for (unsigned i=0; i<6*32; ++i)
+                bins[i] = (static_cast<std::int32_t>(mix[i] ^ 0x800000)-0x800000) / 8388608.f;
+            stereo = effect_output_;
+        } else if(std::ranges::any_of(std::span(bins).subspan(count*6,count*26),[](float value){return value!=0;})) {
+            throw std::runtime_error("Effect send requires a loaded audio image");
         }
-        if(std::ranges::any_of(std::span(bins).subspan(count*6,count*26),[](float value){return value!=0;}))
-            throw std::runtime_error("Effect send requires a compiled audio image");
+        const auto frames = stereo.size()/2;
+        for(std::size_t i=0;i<frames;++i) {
+            const auto center=bins[2*frames+i]*0.70710678f+bins[3*frames+i]*0.5f;
+            stereo[i*2]=std::clamp(bins[i]+center+bins[4*frames+i]*0.70710678f,-1.0f,1.0f);
+            stereo[i*2+1]=std::clamp(bins[frames+i]+center+bins[5*frames+i]*0.70710678f,-1.0f,1.0f);
+        }
     }
 }
 std::string Audio::failure(){StreamLock lock(stream_);return failed_?failure_.data():std::string{};}
@@ -553,7 +578,7 @@ std::optional<AdpcmBlockError> Audio::first_invalid_adpcm_block() {
     return first_invalid_adpcm_block_;
 }
 void Audio::mix_unlocked(std::span<float> output) {
-    if (std::ranges::any_of(voices_, [](const Voice& value) {
+    if (effects_ || std::ranges::any_of(voices_, [](const Voice& value) {
         return value.used && value.playing && !value.pause_mode;
     })) mix_sources(output);
     else std::ranges::fill(output, 0.0f);

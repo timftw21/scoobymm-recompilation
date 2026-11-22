@@ -79,7 +79,7 @@ struct RenderState {
 struct ProgramView {
     float depth_scale = 1, subpixel_bias = 0.03125f;
     std::array<Float4,4> texture_scales{{{1,1,1,1},{1,1,1,1},{1,1,1,1},{1,1,1,1}}};
-    float horizontal_scale = 1;
+    float horizontal_scale = 1, horizontal_offset = 0;
 };
 
 struct VertexAttribute {

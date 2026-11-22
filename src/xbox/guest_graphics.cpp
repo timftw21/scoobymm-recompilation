@@ -22,7 +22,7 @@ constexpr Word video_interrupt = 0x8100, video_buffer = 0x8700, video_stop = 0x8
 constexpr Word video_address = 0x8920, video_source_size = 0x8928, video_source_point = 0x8930;
 constexpr Word video_step_x = 0x8938, video_step_y = 0x8940, video_dest_point = 0x8948, video_dest_size = 0x8950;
 constexpr Word video_format = 0x8958, video_color_key = 0x8B00;
-constexpr std::uint64_t display_hz = 60, ticks_per_second = 10000000;
+constexpr std::uint64_t ns_per_tick = 100; // Xbox interrupt clock.
 }
 
 void GuestGraphics::finish(Cpu& cpu, unsigned arguments) {
@@ -31,14 +31,14 @@ void GuestGraphics::finish(Cpu& cpu, unsigned arguments) {
     sp += 4 * (1 + arguments);
 }
 
-Word GuestGraphics::sdk_call(Cpu& cpu, Word address, std::span<const Word> args) {
+Word GuestGraphics::sdk_call(Cpu& cpu, Word address, std::span<const Word> args, Word device_offset) {
     const auto registers = cpu.registers;
     const auto flags = cpu.flags, pc = cpu.eip;
     const auto stack = registers[esp] - static_cast<Word>(0x100 + 4 * args.size());
     memory_.store(stack, sdk_return);
     for (std::size_t i = 0; i < args.size(); ++i) memory_.store(stack + 4 + static_cast<Word>(4 * i), args[i]);
     cpu.registers[esp] = stack;
-    cpu.registers[ecx] = device;
+    cpu.registers[ecx] = device + device_offset;
     invoke_native(cpu, memory_, address);
     if (cpu.eip != sdk_return || cpu.registers[esp] != stack + 4 * (args.size() + 1)) {
         throw NativeBoundary(address, "Original graphics helper returned with an unexpected stack");
@@ -109,6 +109,24 @@ Word GuestGraphics::initialize(Cpu& cpu, Word parameters) {
     const std::array presentation{parameters};
     if (const auto status = sdk_call(cpu, 0x00119D10, presentation); std::bit_cast<std::int32_t>(status) < 0)
         return status;
+    // The SDK selects the scanout mode after creating the backbuffer (0x11A69A).
+    // XMV reads this mode through GetDisplayMode to schedule its frame timestamps.
+    const std::array backbuffer{memory_.load<Word>(device + 0x15F8)};
+    const auto pitch = sdk_call(cpu, 0x00113D80, backbuffer);
+    const std::array mode{width, height, memory_.load<Word>(parameters + 0x2C),
+                          memory_.load<Word>(parameters + 0x28), format,
+                          memory_.load<Word>(parameters + 0x30), pitch};
+    if (const auto status = sdk_call(cpu, 0x0011EB78, mode, 0x17F8); std::bit_cast<std::int32_t>(status) < 0)
+        return status;
+    // GetDisplayMode (0x113EBC) uses an explicit field period when programmed,
+    // otherwise it takes the refresh rate from the selected encoder mode.
+    const auto override_ns = memory_.load<std::uint64_t>(device + 0x2018);
+    const auto mode_flags = memory_.load<Word>(device + 0x19AC);
+    const auto encoder_period_ns = (mode_flags & 0x400000) ? ntsc_field_ns : 20'000'000;
+    field_period_ns_ = override_ns ? override_ns : encoder_period_ns;
+    // The native renderer has already applied this mode. A console clears the
+    // pending encoder change at 0x11307A after programming its video hardware.
+    memory_.store<Word>(device + 0x19B0, 0);
     // Preserve the original setup of surfaces, shader selections and render state.
     memory_.store<Word>(device + 0x37C, 0x00125C98);
     const std::array shader{2U};
@@ -158,13 +176,13 @@ void GuestGraphics::write_register(Word offset, unsigned width, Word value) {
 }
 
 std::uint64_t GuestGraphics::next_vblank() const {
-    return ((vblanks_ + 1) * ticks_per_second + display_hz - 1) / display_hz;
+    return ((vblanks_ + 1) * field_period_ns_ + ns_per_tick - 1) / ns_per_tick;
 }
 
 void GuestGraphics::advance_display(std::uint64_t now) {
     if (!gpu_) return;
     if (!submitting_) gpu_->poll_notifications();
-    const auto elapsed = now * display_hz / ticks_per_second;
+    const auto elapsed = now * ns_per_tick / field_period_ns_;
     if (elapsed <= vblanks_) return;
     vblanks_ = elapsed;
     memory_.store(vblank_count, static_cast<Word>(vblanks_));
@@ -236,10 +254,10 @@ void GuestGraphics::scanout() {
     }
     bool captured_display = false;
     bool displayed = false;
-    if (window_ && window_->frame_due(video,scanouts_,vblanks_)) {
+    if (window_ && window_->frame_due(video,scanouts_)) {
         if (std::exchange(gamma_dirty_, false)) renderer_->display_gamma(gamma_);
         // The movie is already composed for the authored 4:3 scanout.
-        displayed = renderer_->display(overlay ? &*overlay : nullptr, !video && window_->settings().widescreen);
+        displayed = renderer_->display(overlay ? &*overlay : nullptr, !video && presentation_wide_);
     }
     if (measuring) diagnostics_->end_gpu_work();
     if (diagnostic_capture) {
@@ -260,6 +278,14 @@ void GuestGraphics::scanout() {
         if (measuring) present_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
         ++presentations_;
     } else if (window_) window_->pace_game(video);
+    if (window_ && last_widescreen_ != window_->settings().widescreen) {
+        last_widescreen_ = window_->settings().widescreen;
+        const auto scene = memory_.load<Word>(0x01EED360);
+        if (scene) for (const auto slot : {4U,8U}) {
+            const auto camera = memory_.load<Word>(scene+slot);
+            if (camera) memory_.store<Word>(camera+0xC8,1); // Rebuild the engine's cached visibility planes.
+        }
+    }
     if (capture) {
         if (!image) image = renderer_->readback(true);
         if (gamma_written_ && !captured_display) {
@@ -281,16 +307,90 @@ void GuestGraphics::scanout() {
     }
 }
 
+Word GuestGraphics::widget_from_handle(Word hud, Word handle) const {
+    const auto slot = handle >> 16;
+    if (!hud || slot >= widget_anchors_.size()) return 0;
+    const auto entry = hud + 0xB4 + slot*8;
+    return memory_.load<Word>(entry) == (handle & 0xFFFF) ? memory_.load<Word>(entry+4) : 0;
+}
+
+void GuestGraphics::name_widget(Word handle, Word address) {
+    const auto hud = memory_.load<Word>(0x01EF58C4);
+    const auto widget = widget_from_handle(hud,handle);
+    if (!widget || !address) return;
+    // The disc panel passes widget names separately from localized text.
+    std::array<char,32> label{};
+    for (unsigned i = 0; i+1 < label.size(); ++i) {
+        label[i] = static_cast<char>(memory_.load<std::uint8_t>(address+i));
+        if (!label[i]) break;
+    }
+    const std::string_view name(label.data());
+    int side = 0;
+    if (const auto parent = memory_.load<Word>(widget+0x58)) {
+        const auto parent_handle = memory_.load<Word>(parent+0x88);
+        const auto parent_slot = parent_handle >> 16;
+        if (parent_slot < widget_anchors_.size() && widget_anchors_[parent_slot].handle == parent_handle) {
+            const auto& anchor = widget_anchors_[parent_slot];
+            side = anchor.side;
+            if (anchor.gameplay_root) {
+                // CreateHudWins assigns the authored rectangle before naming the
+                // widget. Preserve that anchor while it slides in or out.
+                const auto width = std::bit_cast<float>(memory_.load<Word>(widget+0xC));
+                auto left = std::bit_cast<float>(memory_.load<Word>(widget+4));
+                const auto flags = memory_.load<Word>(widget+0x44);
+                if (flags & 4) left += (1.f-width)*.5f;
+                if (flags & 0x10) left += 1.f-width;
+                if (left+width <= .5f) side = -1;
+                else if (left >= .5f) side = 1;
+            }
+        }
+        // The sandwich stack is a separate top-level group. It uses the
+        // layout engine's explicit right-edge flag at 0x76D25.
+        if (parent == memory_.load<Word>(hud+4) && (memory_.load<Word>(widget+0x44) & 0x10))
+            side = 1;
+    }
+    const auto slot = handle >> 16;
+    widget_anchors_[slot] = {handle,side,name == "INGAME_MAIN_WIN"};
+    if (name == "PAUSE_MAIN_WIN") pause_menu_handle_ = handle;
+    else if ((pause_menu_handle_ >> 16) == slot) pause_menu_handle_ = UINT32_MAX;
+}
+
+bool GuestGraphics::pause_menu_visible() const {
+    const auto widget = widget_from_handle(memory_.load<Word>(0x01EF58C4),pause_menu_handle_);
+    return widget && !(memory_.load<Word>(widget+0x44) & 0x100);
+}
+
+void GuestGraphics::draw_widget(Word widget) {
+    int side = 0;
+    if (widget && window_->settings().widescreen) {
+        const auto handle = memory_.load<Word>(widget+0x88);
+        const auto slot = handle >> 16;
+        if (slot < widget_anchors_.size() && widget_anchors_[slot].handle == handle)
+            side = widget_anchors_[slot].side;
+    }
+    if (side == hud_side_) return;
+    hud_side_ = side;
+    // The SDK queues draw packets. Record their FIFO position so that a kickoff
+    // midway through a widget or a ring wrap preserves the anchor.
+    const auto flags = memory_.load<Word>(device+8);
+    const auto address = memory_.load<Word>(device + ((flags & 4) ? 0x358 : 0));
+    if (!hud_markers_.empty() && hud_markers_.back().address == address)
+        hud_markers_.back().side = side;
+    else hud_markers_.push_back({address,side});
+}
+
 void GuestGraphics::submit() {
     const auto flags = memory_.load<Word>(device + 8);
     const auto end = memory_.load<Word>(device + ((flags & 4) ? 0x358 : 0));
     const auto start = memory_.load<Word>(push_start), limit = memory_.load<Word>(push_end);
     if (cursor_ < start || end < cursor_ || end > limit) throw std::runtime_error("D3D submission leaves the push buffer");
-    if (cursor_ != end) {
+    if (cursor_ != end || !hud_markers_.empty()) {
         // The SDK builds its color surface table at device+0x15F4 and
         // initializes the backbuffers at 0x119830 via 0x11A0B2.
         std::array<Word,3> colors{};
-        if (window_ && window_->settings().widescreen) {
+        // The title menu overlays a 3D room. Only the pause panel needs a 4:3 canvas.
+        presentation_wide_ = window_ && window_->settings().widescreen && !pause_menu_visible();
+        if (presentation_wide_) {
             for (unsigned i=0; i<colors.size(); ++i) {
                 const auto surface = memory_.load<Word>(device + 0x15F4 + 4*i);
                 if (surface) colors[i] = memory_.load<Word>(surface + 4) & 0x0FFFFFFF;
@@ -299,7 +399,8 @@ void GuestGraphics::submit() {
         gpu_->widescreen_buffers(colors);
         submitting_ = true;
         if (diagnostics_) diagnostics_->begin_gpu_work();
-        gpu_->submit(cursor_, end);
+        gpu_->submit(cursor_, end,hud_markers_);
+        hud_markers_.clear();
         if (diagnostics_) diagnostics_->end_gpu_work();
         submitting_ = false;
         cursor_ = end;

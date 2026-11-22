@@ -70,7 +70,7 @@ std::string draw_source(const std::string& body) {
     std::string source(helpers);
     source+=R"(
 cbuffer Program:register(b1) { float4 k[192]; float4 viewport; float4 fog_params; float4 uv_scales[4]; uint4 input_formats[4];
- uint4 fixed_flags;uint4 fixed_texgen[4];uint4 fixed_matrices; float horizontal_scale; };
+ uint4 fixed_flags;uint4 fixed_texgen[4];uint4 fixed_matrices; float horizontal_scale, horizontal_offset; };
 float4 vertex_input(float4 v,uint format) {
  if(format==0) return v;
  if(format==0x40) return v.bgra;
@@ -96,7 +96,7 @@ struct I {
 P p; float w=o[0].w;
 w=(asuint(w)&0x80000000) ? clamp(w,-asfloat(0x5F800000),-asfloat(0x1F800000)) : clamp(w,asfloat(0x1F800000),asfloat(0x5F800000));
 float2 screen=trunc(o[0].xy*16)/16-viewport.w;
-p.p=float4((screen.x*viewport.x-1)*horizontal_scale*w,(1-screen.y*viewport.y)*w,o[0].z*viewport.z*w,w);
+p.p=float4(((screen.x*viewport.x-1)*horizontal_scale+horizontal_offset)*w,(1-screen.y*viewport.y)*w,o[0].z*viewport.z*w,w);
 p.c=saturate(o[3]); p.s=saturate(o[4]);
 p.t0=o[9]*uv_scales[0]; p.t1=o[10]*uv_scales[1]; p.t2=o[11]*uv_scales[2]; p.t3=o[12]*uv_scales[3];
 float d=o[5].x,mode=fog_params.z;

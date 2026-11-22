@@ -337,6 +337,18 @@ public:
              (ins.attributes & (ZYDIS_ATTRIB_HAS_SEGMENT_FS | ZYDIS_ATTRIB_HAS_SEGMENT_GS))))
             throw std::runtime_error("Instruction prefixes need an implementation");
         body << label(instruction.address) << ": { // " << instruction.text << '\n';
+        // The panel modules call the retail HUD naming stub through HUD API slot 0x28.
+        // The exception cleanup thunk at 0xCC203 also jumps here without HUD arguments.
+        if (!relocatable && instruction.address == 0x48300)
+            body << "    if (cpu.kernel && cpu.kernel->name_widget) {\n"
+                 << "        const auto sp = cpu.registers[xbox_native::esp], ret = memory.load<std::uint32_t>(sp);\n"
+                 << "        if (ret >= 0x10005U && ret < 0x04000000U && memory.load<std::uint16_t>(ret-2) == 0xD0FF && memory.load<std::uint8_t>(ret-3) == 0x28)\n"
+                 << "            cpu.kernel->name_widget(cpu.kernel->context,memory.load<std::uint32_t>(sp+4),memory.load<std::uint32_t>(sp+8));\n    }\n";
+        // 0x770CA is past visibility and rectangle clipping, before this widget's draws.
+        if (!relocatable && (instruction.address == 0x770CA || instruction.address == 0x4A733))
+            body << "    if (cpu.kernel && cpu.kernel->draw_widget) cpu.kernel->draw_widget(cpu.kernel->context,"
+                 << (instruction.address == 0x770CA ? "edi" : "0") << ");\n";
+
         // The supported title drains two read buffers through three DirectSound slots.
         // Its EOF path can see an idle voice while a completed read still awaits submission.
         if (!relocatable && instruction.address == 0x29445)
@@ -557,7 +569,13 @@ public:
             vector_write(operands[0],value); break;
         }
         case ZYDIS_MNEMONIC_MOV: case ZYDIS_MNEMONIC_MOVZX:
-            body << "    const auto value = " << read(operands[1]) << ";\n";
+            // The object visibility and proxy frusta use the camera's view-window
+            // getter. Other callers use the original width for layout and projection.
+            if (!relocatable && instruction.address == 0x464D3)
+                body << "    const auto caller = memory.load<std::uint32_t>(esp);\n"
+                     << "    const auto value = caller == 0x30807U || caller == 0x4EDE8U ? "
+                     << "xbox_native::camera_extent(cpu,memory,eax,0x68U) : " << read(operands[1]) << ";\n";
+            else body << "    const auto value = " << read(operands[1]) << ";\n";
             write(operands[0], "value"); break;
         case ZYDIS_MNEMONIC_MOVSX:
             body << "    const auto value = xbox_native::sign_extend<" << operands[1].size << ">(" << read(operands[1]) << ");\n";
@@ -697,6 +715,16 @@ public:
             calls = restores = true;
             const bool indirect=!instruction.target() && !instruction.kernel_ordinal;
             if(indirect) body << "    const auto target=" << read(operands[0]) << ";\n";
+            if (!instruction.caller_targets.empty()) {
+                body<<"    std::uint32_t callback = 0;\n    switch (guest_caller) {\n";
+                for (const auto [caller,destination]:instruction.caller_targets)
+                    body<<"    case "<<constant(caller)<<": callback = "<<constant(destination)<<"; break;\n";
+                body<<"    }\n    if (!callback || target != callback) throw xbox_native::NativeBoundary("<<pc(instruction.address)
+                    <<", \"callback differs from the original caller's argument\");\n";
+            }
+            if (instruction.checked_target)
+                body << "    if (target != " << pc(*instruction.checked_target) << ") throw xbox_native::NativeBoundary("
+                     << pc(instruction.address) << ", \"indirect call differs from its verified target\");\n";
             used.insert(4); dirty.insert(4);
             body << "    esp -= 4U;\n    memory.store<std::uint32_t>(esp, " << pc(next)
                  << ");\n    commit();\n    cpu.eip = " << pc(instruction.target().value_or(instruction.address)) << ";\n    ";
@@ -961,6 +989,8 @@ LoweredFunction lower(const Function& function) {
     if (function.relocatable) {
         out << "    const auto code_base = cpu.eip - " << (multiple_entries ? "entry" : constant(function.entry)) << ";\n";
     }
+    if (std::ranges::any_of(function.instructions,[](const auto& pair){return !pair.second.caller_targets.empty();}))
+        out<<"    const auto guest_caller=memory.load<std::uint32_t>(cpu.registers[esp]);\n";
     if (emitter.floating) out << "    FloatingScope floating_scope(cpu.floating);\n";
     out << "    if(xbox_native::checkpoint_due(cpu)) xbox_native::checkpoint(cpu,"
         << (multiple_entries ? (function.relocatable ? "code_base + entry" : "entry") : emitter.pc(function.entry)) << ");\n";

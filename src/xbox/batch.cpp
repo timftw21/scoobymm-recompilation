@@ -1,5 +1,8 @@
 #include "batch.h"
 #include "lower.h"
+#include "logic_exports.h"
+#include "kernel_imports.h"
+#include "call_evidence.h"
 #include "boot_modules.h"
 #include "boot_recovery.h"
 #include "disc.h"
@@ -143,9 +146,13 @@ private:
 struct ModuleObject {
     std::vector<std::byte> text;
     std::map<Word, Word> relocations;
+    std::set<Word> data_references;
+    std::set<Word> private_words;
+    std::set<Word> zero_words;
     std::set<Word> unlinked_calls;
     std::set<Word> functions;
     std::vector<std::pair<Word, Word>> exports;
+    std::optional<Word> destructor;
 };
 
 Bytes slice(Bytes bytes, std::size_t offset, std::size_t size) {
@@ -163,17 +170,29 @@ ModuleObject read_module(Bytes object, std::string_view name) {
     const auto strings = slice(object, u32(object, 8) + symbols.size(), object.size() - u32(object, 8) - symbols.size());
     const auto relocs = slice(object, u32(object, 44), std::size_t{10} * u16(object, 52));
     ModuleObject module;
+    std::map<Word,bool> data_symbols;
     for (std::size_t offset = 0; offset < symbols.size();) {
         const auto symbol = slice(symbols, offset, 18);
         const auto value = u32(symbol, 8);
         const auto aux = std::to_integer<unsigned>(symbol[17]);
+        if (u16(symbol,12)==1 && u16(symbol,14)==0) {
+            const auto field=u32(symbol,0)==0 ? slice(strings,u32(symbol,4),strings.size()-u32(symbol,4)) : symbol.first(8);
+            const char first=static_cast<char>(field.front());
+            // At 0x3A410–0x3A52F the Xbox loader publishes only the three named
+            // functions. Defined class-2 data has the same object-local relocation
+            // base as class-3 data. Taking its address still disqualifies the cell.
+            const auto storage=std::to_integer<unsigned>(symbol[16]);
+            if (first=='_' || first=='.') data_symbols[value] |= first=='_' && (storage==2 || storage==3);
+            if (first=='.' && aux) data_symbols.try_emplace(value+u32(symbols,offset+18),false);
+        }
         if (u16(symbol, 12) == 1 && u16(symbol, 14) == 0x20) {
             module.functions.insert(value);
             const auto field = u32(symbol, 0) == 0 ? slice(strings, u32(symbol, 4), strings.size() - u32(symbol, 4)) : symbol.first(8);
             const std::string_view label(reinterpret_cast<const char*>(field.data()), field.size());
             const auto spelling = label.substr(0, label.find('\0'));
-            if (spelling == "_" + std::string(name) + "Register") module.exports.emplace_back(value, 0x0003A6B5);
-            if (spelling == "_" + std::string(name) + "Constructor") module.exports.emplace_back(value, 0x0003D42F);
+            if (spelling == "_" + std::string(name) + "Register") module.exports.emplace_back(value, logic_register_call);
+            if (spelling == "_" + std::string(name) + "Constructor") module.exports.emplace_back(value, logic_constructor_call);
+            if (spelling == "_" + std::string(name) + "Destructor") module.destructor = value;
         }
         if (aux && u16(symbol, 12) == 1 && hex_bytes(symbol.first(8)) == "2E74657874000000") {
             const auto text = slice(section, 0, u32(symbols, offset + 18));
@@ -184,9 +203,20 @@ ModuleObject read_module(Bytes object, std::string_view name) {
     }
     if (module.text.empty() || module.functions.empty() || *module.functions.rbegin() >= module.text.size())
         throw std::runtime_error("Logic module has no executable symbol index");
+    data_symbols.try_emplace(static_cast<Word>(section.size()),false);
+    for (auto it=data_symbols.lower_bound(static_cast<Word>(module.text.size()));it!=data_symbols.end();++it) {
+        const auto next=std::next(it);
+        // BSS symbols may have alignment padding after the accessed word.
+        if (it->second && next!=data_symbols.end() && next->first-it->first>=4) {
+            module.private_words.insert(it->first);
+            if (std::uint64_t(it->first)+4<=section.size() && !u32(section,it->first)) module.zero_words.insert(it->first);
+        }
+    }
     std::set<Word> relocated;
     for (std::size_t offset = 0; offset < relocs.size(); offset += 10) {
         const auto at = u32(relocs, offset);
+        for (auto it=module.zero_words.lower_bound(at>3?at-3:0);it!=module.zero_words.end() && *it<std::uint64_t(at)+4;)
+            it=module.zero_words.erase(it);
         const auto reference = slice(symbols, std::size_t{18} * u32(relocs, offset + 4), 18);
         const auto kind = u16(relocs, offset + 8);
         const auto section_number = u16(reference, 12);
@@ -194,6 +224,7 @@ ModuleObject read_module(Bytes object, std::string_view name) {
             throw std::runtime_error(std::format("Unbound Xbox module relocation at {} (type {}, section {}, symbol {})",
                 hex32(at), hex32(kind), hex32(section_number), hex_bytes(reference.first(8))));
         const auto value = u32(section, at) + u32(reference, 8);
+        if (kind==6 && at>=module.text.size()) module.data_references.insert(value);
         if (at < module.text.size()) {
             if (!relocated.insert(at).second || at + 4 > module.text.size())
                 throw std::runtime_error("Invalid Xbox module relocation at " + hex32(at));
@@ -311,6 +342,7 @@ struct LogicRecord {
     std::string name, path, hash;
     DiscEntry file;
     Word object, size;
+    bool has_registrar;
 };
 
 struct LogicIndex {
@@ -371,7 +403,15 @@ LogicIndex logic_records(Disc& disc) {
                     throw std::runtime_error("XBR COFF strings exceed their bounds in " + std::string(path));
                 const auto hash = disc.file_sha256(file, object, size);
                 ++index.instances;
-                unique.try_emplace(hash, LogicRecord{std::string(name), std::string(path), hash, file, object, static_cast<Word>(size)});
+                if (!unique.contains(hash)) {
+                    std::vector<std::byte> names(static_cast<std::size_t>(size-strings));
+                    disc.read(file,object+strings,names);
+                    auto label="_"+std::string(name)+"Register";
+                    label.push_back('\0');
+                    const std::string_view strings_view(reinterpret_cast<const char*>(names.data()),names.size());
+                    unique.emplace(hash,LogicRecord{std::string(name),std::string(path),hash,file,object,static_cast<Word>(size),
+                                                    strings_view.find(label)!=strings_view.npos});
+                }
             }
         }
     });
@@ -380,10 +420,13 @@ LogicIndex logic_records(Disc& disc) {
     return index;
 }
 
-struct GeneratedModules { std::string summary; std::size_t xbr_files{}, object_instances{}, unresolved_calls{}; };
+struct GeneratedModules {
+    std::string summary;
+    std::size_t xbr_files{}, object_instances{}, unresolved_calls{}, fixed_calls{}, installed_calls{}, named_calls{}, named_methods{}, abi_calls{}, conditional_calls{}, passed_arguments{};
+};
 
 GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Decoder& decoder, const Path& staging,
-                                  std::map<std::string, std::string>& assembly) {
+                                  std::map<std::string, std::string>& assembly, CallEvidence& evidence, bool emit) {
     std::optional<Disc> media;
     LogicIndex inventory;
     if (!disc.empty()) {
@@ -399,9 +442,49 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
             }
         }
     }
-    std::ostringstream declarations, index, summary;
-    std::size_t count = 0, registry_size = 0, unresolved_calls = 0;
-    std::ofstream unresolved;
+    std::ostringstream declarations, index, destructors, summary, abi_tables, abi_index;
+    const auto interface_slots=evidence.interface_tables(abi_tables);
+    std::size_t conditional_calls=0, passed_arguments=0;
+    std::size_t count = 0, registry_size = 0, unresolved_calls = 0, fixed_calls = 0, abi_modules = 0, abi_calls = 0;
+    std::ofstream unresolved, argument_evidence;
+    std::ofstream exports, fixed, abi_sites;
+    if (!inventory.records.empty()) {
+        exports.exceptions(std::ios::failbit | std::ios::badbit);
+        exports.open(staging / "module-exports.tsv");
+        exports << "xbe_site\tobject_sha256\tsymbol\tfunction_offset\n";
+        abi_sites.exceptions(std::ios::failbit | std::ios::badbit);
+        abi_sites.open(staging / "module-abi-calls.tsv");
+        abi_sites << "object_sha256\tfunction_offset\tsite_offset\tengine_offset\txbe_target\tmodule_slot\ttable\tmethod_offset\tgetter\tname\tbinding\n";
+    }
+    // Only 33 supported objects export Register. Index their named methods before
+    // resolving consumers so disc ordering and level-specific providers cannot affect the result.
+    for (const auto& entry:inventory.records) if (entry.has_registrar) {
+        std::vector<std::byte> bytes(entry.size);
+        media->read(entry.file,entry.object,bytes);
+        const auto module=read_module(bytes,entry.name);
+        std::map<Word,CallSources> flows;
+        std::set<Word> exports,taken=module.data_references;
+        for (auto [offset,caller]:module.exports) exports.insert(offset);
+        for (auto [at,value]:module.relocations) if (module.functions.contains(value)) taken.insert(value);
+        InterfaceCells cells(module.private_words,module.relocations,module.data_references);
+        for (auto fn:module.functions) {
+            const auto original=module_function(fn,module,decoder);
+            flows.emplace(fn,trace_call_sources(original,module.relocations));
+            for (const auto& [pc,ins]:original.instructions) {
+                cells.instruction(fn,ins);
+                if (ins.cross_function_branch && ins.target()) taken.insert(*ins.target());
+                if (ins.cross_function_fallthrough) taken.insert(pc+ins.decoded.length);
+                taken.insert(ins.external_jump_targets.begin(),ins.external_jump_targets.end());
+            }
+        }
+        const auto trusted=CallEvidence::interface_functions(exports,taken,flows);
+        std::map<Word,std::string_view> missing;
+        const auto getters=cells.verified_getters(trusted,flows,missing);
+        for (const auto& [offset,caller]:module.exports) if (caller==logic_register_call && trusted.contains(offset)) {
+            evidence.register_provider(entry.hash,std::format("module_{}_{}",entry.hash,module.exports.front().second),module.text,
+                                       module.functions,offset,flows.at(offset),getters);
+        }
+    }
     for (const auto& entry : inventory.records) {
         std::vector<std::byte> bytes(entry.size);
         media->read(entry.file, entry.object, bytes);
@@ -414,23 +497,44 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
         }();
         if (module.exports.empty()) throw std::runtime_error("No named registration export for " + entry.name + " in " + entry.path);
         const auto ns = "module_" + entry.hash;
+        std::map<Word,CallSources> sources;
+        InterfaceCells cells(module.private_words,module.relocations,module.data_references);
+        std::set<Word> api_entries;
+        for (const auto& [offset,caller]:module.exports) api_entries.insert(offset);
+        std::map<Word,std::vector<LogicAbiCall>> rules;
+        std::set<Word> other_entries=module.data_references, shared_sites;
+        struct Unresolved { Word fn, pc; std::string bytes; PointerValue value; const CallSource* flow; };
+        std::vector<Unresolved> remaining;
         std::ostringstream output;
         output << "#include \"xbox/cpu.h\"\nnamespace xbox_native {\nnamespace " << ns << " {\n";
         for (auto address : module.functions) output << std::format("void guest_{:08X}(Cpu&, Memory&);\n", address);
         for (auto address : module.functions) {
             const auto lowered = [&] {
                 try {
-                    const auto fn = module_function(address, module, decoder);
-                    for (const auto& [pc, ins] : fn.instructions) {
-                        if (ins.decoded.meta.category != ZYDIS_CATEGORY_CALL || ins.target()) continue;
-                        if (!unresolved_calls) {
-                            unresolved.exceptions(std::ios::failbit | std::ios::badbit);
-                            unresolved.open(staging / "module-indirect.tsv");
-                            unresolved << "object_sha256\tfunction_offset\tsite_offset\tbytes\n";
+                    auto fn = module_function(address, module, decoder);
+                    const auto& flow = sources.emplace(address,trace_call_sources(fn,module.relocations)).first->second;
+                    std::map<Word,const CallSource*> origins;
+                    for (const auto& call : flow.calls) {
+                        if (!call.direct) origins.emplace(call.site,&call);
+                        if (call.direct || call.target.kind != PointerSource::relocated || !module.functions.contains(call.target.base)) continue;
+                        fn.instructions.at(call.site).checked_target = call.target.base;
+                        if (!fixed.is_open()) {
+                            fixed.exceptions(std::ios::failbit | std::ios::badbit);
+                            fixed.open(staging / "module-fixed-calls.tsv");
+                            fixed << "object_sha256\tfunction_offset\tsite_offset\ttarget_offset\n";
                         }
-                        ++unresolved_calls;
-                        unresolved << entry.hash << '\t' << hex32(address) << '\t' << hex32(pc) << '\t'
-                                   << hex_bytes(Bytes(ins.bytes).first(ins.decoded.length)) << '\n';
+                        fixed << entry.hash << '\t' << hex32(address) << '\t' << hex32(call.site) << '\t' << hex32(call.target.base) << '\n';
+                        ++fixed_calls;
+                    }
+                    for (const auto& [pc, ins] : fn.instructions) {
+                        cells.instruction(address,ins);
+                        if (ins.cross_function_branch && ins.target()) other_entries.insert(*ins.target());
+                        if (ins.cross_function_fallthrough) other_entries.insert(pc+ins.decoded.length);
+                        other_entries.insert(ins.external_jump_targets.begin(),ins.external_jump_targets.end());
+                        if (ins.decoded.meta.category != ZYDIS_CATEGORY_CALL || ins.target() || ins.checked_target) continue;
+                        const auto origin=origins.find(pc);
+                        const auto* source=origin==origins.end() ? nullptr : origin->second;
+                        remaining.push_back({address,pc,hex_bytes(Bytes(ins.bytes).first(ins.decoded.length)),source ? source->target : PointerValue{},source});
                     }
                     return lower(fn);
                 } catch (const std::runtime_error& error) {
@@ -442,8 +546,156 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
                 throw std::runtime_error("Cannot lower Xbox logic module " + std::string(entry.name) + " at " +
                                          hex32(issue.address) + " [" + issue.bytes + "]: " + issue.reason);
             }
-            output << lowered.source;
+            if (emit) output << lowered.source;
             for (const auto& [helper, definition] : lowered.native_helpers) assembly.emplace(helper, definition);
+        }
+        // Only the loader supplies the canonical interface. A function also called
+        // internally or through a relocated pointer can have a different first argument.
+        for (auto [at,value]:module.relocations) if (module.functions.contains(value)) other_entries.insert(value);
+        const auto interface_functions=CallEvidence::interface_functions(api_entries,other_entries,sources);
+        evidence.module(entry.hash,module.text,module.functions,api_entries,sources);
+        evidence.add_registered_cells(entry.hash,sources);
+        std::map<Word,std::string_view> missing_cells;
+        const auto getters=cells.verified_getters(interface_functions,sources,missing_cells);
+        const auto names=CallEvidence::cache_names(module.text,sources,getters);
+        other_entries.insert(api_entries.begin(),api_entries.end());
+        if (module.destructor) other_entries.insert(*module.destructor);
+        const auto table_args=CallEvidence::table_arguments(other_entries,getters,sources);
+        std::map<std::pair<Word,Word>,std::set<Word>> callbacks;
+        std::set<std::pair<Word,Word>> unknown_arguments;
+        for (const auto& [fn,flow]:sources) for (const auto& call:flow.calls) {
+            if (!call.direct || other_entries.contains(call.target.base)) continue;
+            const std::array args{call.first_argument,call.second_argument,call.third_argument};
+            for (Word i=0;i<args.size();++i) {
+                const auto key=std::pair{call.target.base,i};
+                if (args[i].kind==PointerSource::relocated && module.functions.contains(args[i].base)) callbacks[key].insert(args[i].base);
+                else unknown_arguments.insert(key);
+            }
+        }
+        const auto abi_rule=[&](Word fn,Word pc,PointerValue value) {
+            CallSource call{};
+            call.site=pc;call.target=value;
+            std::optional<LogicAbiCall> rule;
+            if (value.kind==PointerSource::module_method) {
+                const auto it=getters.find(value.base);
+                if (it!=getters.end()) rule=evidence.table_call(call,it->second);
+                if (!rule && names.contains(value.base)) rule=evidence.named_call(call,names.at(value.base));
+            } else if (value.kind==PointerSource::returned_method && interface_functions.contains(fn)) {
+                call.target.base=logic_getter_result;
+                rule=evidence.table_call(call,value.base);
+            } else if (interface_functions.contains(fn)) rule=evidence.export_call(call);
+            else if (value.kind==PointerSource::argument_method && !value.base && table_args.contains(fn)) {
+                call.target.base=table_args.at(fn);
+                rule=evidence.table_call(call,getters.at(call.target.base));
+                if (!rule && names.contains(call.target.base)) rule=evidence.named_call(call,names.at(call.target.base));
+            }
+            return rule;
+        };
+        for (const auto& site:remaining) {
+            std::span<const PointerValue> origins{&site.value,1};
+            const auto& alternatives=sources.at(site.fn).alternatives;
+            if (site.value.kind==PointerSource::unknown && alternatives.contains(site.pc)) origins=alternatives.at(site.pc);
+            std::vector<LogicAbiCall> accepted;
+            const auto& guards=sources.at(site.fn).nonzero_cells;
+            if (auto guard=guards.find(site.pc);guard!=guards.end() && module.zero_words.contains(guard->second) && cells.unchanged(guard->second)) {
+                // Every path to this CALL requires a private, permanently null pointer to be nonzero.
+                accepted.push_back({site.pc,guard->second,0,logic_unreachable});
+                origins={};
+            }
+            for (auto value:origins) {
+                const auto key=std::pair{site.fn,value.base};
+                if (value.kind==PointerSource::argument && callbacks.contains(key) && !unknown_arguments.contains(key)) {
+                    for (auto offset:callbacks.at(key)) accepted.push_back({site.pc,value.base,offset,logic_local_function});
+                } else if (auto rule=abi_rule(site.fn,site.pc,value)) accepted.push_back(*rule);
+                else {accepted.clear();break;}
+            }
+            if (accepted.empty()) {shared_sites.insert(site.pc);continue;}
+            const auto [pos,added]=rules.try_emplace(site.pc,std::move(accepted));
+            if (!added && pos->second!=accepted) shared_sites.insert(site.pc);
+        }
+        for (auto site:shared_sites) rules.erase(site);
+        // Conditional checks are kept in the unresolved inventory until every
+        // incoming edge is known. At runtime a verified caller can establish
+        // the table type for this particular invocation of a callback.
+        std::map<Word,std::optional<LogicAbiCall>> conditional;
+        std::map<std::pair<Word,Word>,Word> passed;
+        for (const auto& site:remaining) {
+            if (const auto it=rules.find(site.pc);it!=rules.end()) {
+                for (const auto& rule:it->second) abi_sites<<entry.hash<<'\t'<<hex32(site.fn)<<'\t'<<hex32(site.pc)<<'\t'<<hex32(rule.slot)<<'\t'<<hex32(rule.target)
+                         <<'\t'<<hex32(rule.source)<<'\t'<<hex32(rule.table)<<'\t'<<hex32(rule.method)<<'\t'<<hex32(rule.getter)
+                         <<'\t'<<(rule.named==UINT32_MAX ? "-" : names.at(rule.source))<<'\t'
+                         <<(rule.source==logic_unreachable ? "guarded-null" : rule.source==logic_local_function ? "local-callback" :
+                            rule.named!=UINT32_MAX ? "named-method" : "engine-method")<<'\n';
+                ++abi_calls;
+            } else {
+                const auto arg=site.value.base;
+                std::optional<LogicAbiCall> parameter;
+                if (site.flow && site.value.kind==PointerSource::argument_method && arg<3 &&
+                    (site.flow->frame_arguments & (1u<<arg)) && !(site.value.offset&3))
+                    parameter=LogicAbiCall{site.pc,arg,0,logic_passed_argument,0,site.value.offset};
+                auto [item,added]=conditional.try_emplace(site.pc,parameter);
+                if (!added && item->second!=parameter) item->second.reset();
+                const auto inputs=site.flow ? std::array{site.flow->first_argument,site.flow->second_argument,site.flow->third_argument}
+                                            : std::array<PointerValue,3>{};
+                const auto ret=site.pc+static_cast<Word>(site.bytes.size()/2);
+                for (Word i=0;i<inputs.size();++i) {
+                    const auto& input=inputs[i];
+                    const bool known=input.kind==PointerSource::module_slot && getters.contains(input.base) &&
+                                     interface_slots.contains(getters.at(input.base));
+                    const Word cell=known ? input.base : UINT32_MAX;
+                    auto [p,first]=passed.try_emplace(std::pair{ret,i},cell);
+                    if (!first && p->second!=cell) p->second=UINT32_MAX;
+                }
+                if (!unresolved.is_open()) {
+                    unresolved.exceptions(std::ios::failbit|std::ios::badbit);
+                    unresolved.open(staging/"module-indirect.tsv");
+                    unresolved<<"object_sha256\tfunction_offset\tsite_offset\tbytes\tsource\tbase\tfield\tmissing_evidence\n";
+                }
+                std::string_view missing="pointer-origin";
+                if (site.value.kind==PointerSource::module_method) {
+                    const auto it=missing_cells.find(site.value.base);
+                    missing=it!=missing_cells.end()?it->second:!module.private_words.contains(site.value.base)?"non-private-cell":
+                        !getters.contains(site.value.base)?"unexplained-cell-writer":"interface-method";
+                } else if (site.value.kind==PointerSource::argument_method) missing="caller-argument";
+                unresolved<<entry.hash<<'\t'<<hex32(site.fn)<<'\t'<<hex32(site.pc)<<'\t'<<site.bytes<<'\t'<<source_name(site.value.kind)
+                          <<'\t'<<hex32(site.value.base)<<'\t'<<hex32(site.value.offset)<<'\t'<<missing<<'\n';
+                ++unresolved_calls;
+            }
+        }
+        std::erase_if(conditional,[](const auto& item){return !item.second;});
+        std::erase_if(passed,[](const auto& item){return item.second==UINT32_MAX;});
+        if ((!conditional.empty() || !passed.empty()) && !argument_evidence.is_open()) {
+            argument_evidence.exceptions(std::ios::failbit|std::ios::badbit);
+            argument_evidence.open(staging/"module-argument-calls.tsv");
+            argument_evidence<<"object_sha256\trole\toffset\targument\tmethod_offset\tcached_table_cell\tengine_getter_offset\n";
+        }
+        for (const auto& [pc,rule]:conditional) {
+            rules[pc].push_back(*rule);
+            argument_evidence<<entry.hash<<"\tmethod-call\t"<<hex32(pc)<<'\t'<<rule->slot<<'\t'<<hex32(rule->method)<<"\t-\t-\n";
+        }
+        for (const auto& [key,cell]:passed)
+            argument_evidence<<entry.hash<<"\tcaller-return\t"<<hex32(key.first)<<'\t'<<key.second<<"\t-\t"
+                             <<hex32(cell)<<'\t'<<hex32(getters.at(cell))<<'\n';
+        conditional_calls+=conditional.size();
+        passed_arguments+=passed.size();
+        if (emit && (!rules.empty() || !passed.empty())) {
+            std::string checks="{}", arguments="{}";
+            if (!rules.empty()) {
+                checks="abi_"+std::to_string(abi_modules);
+                abi_tables<<"constexpr LogicAbiCall "<<checks<<"[]{\n";
+                for (const auto& [site,choices]:rules) for (const auto& rule:choices)
+                    abi_tables<<std::format("    {{{},{},{},{}U,{},{},{},{}U}},\n",site,rule.slot,rule.target,rule.source,rule.table,rule.method,rule.getter,rule.named);
+                abi_tables<<"};\n";
+            }
+            if (!passed.empty()) {
+                arguments="args_"+std::to_string(abi_modules);
+                abi_tables<<"constexpr LogicPassedInterface "<<arguments<<"[]{\n";
+                for (const auto& [key,cell]:passed)
+                    abi_tables<<std::format("    {{{},{},{},&iface_{}}},\n",key.first,key.second,cell,getters.at(cell));
+                abi_tables<<"};\n";
+            }
+            abi_index<<std::format("    {{&{}_{}, {}, {}}},\n",ns,module.exports.front().second,checks,arguments);
+            ++abi_modules;
         }
         output << "constexpr CompiledFunction functions[] = {\n";
         for (auto address : module.functions) {
@@ -453,7 +705,7 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
         for (const auto [offset, value] : module.relocations)
             output << std::format("    {{{}U, {}U}},\n", hex32(offset), hex32(value));
         output << "}};\nconstexpr std::string_view code =\n";
-        for (std::size_t offset = 0; offset < module.text.size(); offset += 64) {
+        for (std::size_t offset = 0; emit && offset < module.text.size(); offset += 64) {
             output << "    \"" << hex_bytes(Bytes(module.text).subspan(offset, std::min(module.text.size() - offset, std::size_t{64}))) << "\"\n";
         }
         output << ";\n}\n";
@@ -463,10 +715,19 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
             output << std::format("extern constinit const CompiledModule {}{{\"{}\", {}U, {}U, {}::code, {}::relocations, {}::functions}};\n",
                                   symbol, entry.name, hex32(offset), hex32(caller), ns, ns, ns);
             index << "    " << symbol << ",\n";
+            exports << hex32(caller) << '\t' << entry.hash << "\t_" << entry.name
+                    << (caller == logic_register_call ? "Register" : "Constructor") << '\t' << hex32(offset) << '\n';
+            ++registry_size;
+        }
+        if (module.destructor) {
+            const auto symbol = std::format("{}_{}",ns,module.exports.front().second);
+            destructors << std::format("    destructor({}, {}U),\n",symbol,hex32(*module.destructor));
+            exports << hex32(logic_destructor_call) << '\t' << entry.hash << "\t_" << entry.name
+                    << "Destructor\t" << hex32(*module.destructor) << '\n';
             ++registry_size;
         }
         output << "}\n";
-        write_text(staging / ("game.logic." + entry.hash + ".cpp"), output.str());
+        if (emit) write_text(staging / ("game.logic." + entry.hash + ".cpp"), output.str());
         if (count) summary << ',';
         summary << "{\"name\":" << json(entry.name) << ",\"disc_path\":" << json(entry.path)
                 << ",\"object_offset\":" << entry.object << ",\"object_sha256\":" << json(entry.hash)
@@ -474,12 +735,17 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
                 << ",\"entry_offset\":" << json(hex32(module.exports.front().first)) << '}';
         ++count;
     }
-    const auto module_index = std::format("#include \"xbox/cpu.h\"\nnamespace xbox_native {{\n{}namespace {{\n"
-        "const std::array<CompiledModule, {}> modules{{{{\n{}}}}};\n}}\n"
-        "const std::span<const CompiledModule> compiled_modules{{modules}};\n}}\n", declarations.str(), registry_size, index.str());
-    write_text(staging / "game.module.cpp", module_index);
+    const auto module_index = std::format("#include \"xbox/cpu.h\"\n#include \"xbox/logic_exports.h\"\nnamespace xbox_native {{\n{}namespace {{\n"
+        "CompiledModule destructor(CompiledModule module, std::uint32_t offset) {{\n"
+        "    module.registration = offset; module.registration_call = logic_destructor_call; return module;\n}}\n"
+        "const std::array<CompiledModule, {}> modules{{{{\n{}{}}}}};\n{}const std::array<LogicAbiModule,{}> abi_modules{{{{\n{}}}}};\n{} }}\n"
+        "const std::span<const CompiledModule> compiled_modules{{modules}};\nconst std::span<const LogicAbiModule> compiled_logic_abi{{abi_modules}};\n"
+        "const std::span<const LogicNamedMethod> compiled_named_methods{{named_methods}};\n}}\n",
+        declarations.str(), registry_size, index.str(),destructors.str(),abi_tables.str(),abi_modules,abi_index.str(),evidence.provider_tables());
+    if (emit) write_text(staging / "game.module.cpp", module_index);
     if (unresolved.is_open()) unresolved.close();
-    return {summary.str(),inventory.files,inventory.instances,unresolved_calls};
+    if (argument_evidence.is_open()) argument_evidence.close();
+    return {summary.str(),inventory.files,inventory.instances,unresolved_calls,fixed_calls,evidence.installed_sites,evidence.named_sites,evidence.named_methods,abi_calls,conditional_calls,passed_arguments};
 }
 
 struct Program;
@@ -491,6 +757,8 @@ struct Program {
     std::map<Word, Word> alternate_owners;
     std::map<Word, std::set<Word>> slot_targets;
     std::map<Word, Word> indexed_jumps;
+    std::map<Word,std::set<Word>> callers;
+    std::set<Word> branch_targets, file_pointers;
     std::vector<Word> starts;
     std::size_t mapped_rows{}, split_waits{}, recovered_instructions{}, static_instructions{};
 
@@ -568,15 +836,98 @@ struct Program {
         return {};
     }
 
+    void index_file_pointers(File& file) {
+        // An unaligned pointer in code, data or a loader record can publish an
+        // entry without a direct CALL. Treat every such word conservatively.
+        constexpr std::size_t chunk=64*1024;
+        std::array<std::byte,chunk+3> buffer;
+        for (std::uint64_t at=0;at<file.size();at+=chunk) {
+            const auto n=static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(),file.size()-at));
+            file.read(at,std::span(buffer).first(n));
+            for (std::size_t i=0;i+4<=n;++i) {
+                const auto value=u32(buffer,i);
+                if (units.contains(value)) file_pointers.insert(value);
+            }
+        }
+    }
+
+    std::map<Word,Word> callback_callers(Word entry,Word argument,CodeCache& code,const Decoder& decoder) const {
+        const auto sites=callers.find(entry);
+        if (sites==callers.end() || file_pointers.contains(entry) || branch_targets.contains(entry) ||
+            !units.at(entry).alternate_entries.empty()) return {};
+        std::map<Word,Word> result;
+        for (const auto site:sites->second) {
+            const auto call=decoder.decode(site,code.window(site,15));
+            const auto owner=map.containing(site)->entry;
+            auto it=std::ranges::lower_bound(starts,site);
+            auto cursor=site, left=argument;
+            bool bound=false;
+            // Only an uninterrupted sequence which constructs the actual stack
+            // argument can establish the callback for this return address.
+            for (unsigned i=0;i<32 && it!=starts.begin() && !branch_targets.contains(cursor) &&
+                                !callers.contains(cursor) && !callable_owner(cursor);++i) {
+                const auto pc=*--it;
+                const auto ins=decoder.decode(pc,code.window(pc,15));
+                if (!local(pc,owner) || pc+ins.decoded.length!=cursor) break;
+                if (ins.decoded.mnemonic==ZYDIS_MNEMONIC_PUSH && ins.decoded.operand_width==32) {
+                    if (!left) {
+                        const auto& op=ins.operands[0];
+                        if (op.type==ZYDIS_OPERAND_TYPE_IMMEDIATE && callable_owner(static_cast<Word>(op.imm.value.u))) {
+                            result.emplace(site+call.decoded.length,static_cast<Word>(op.imm.value.u));
+                            bound=true;
+                        }
+                        break;
+                    }
+                    --left;
+                } else if (ins.decoded.meta.category==ZYDIS_CATEGORY_CALL || !falls_through(ins) ||
+                           std::ranges::any_of(std::span(ins.operands).first(ins.decoded.operand_count),[](const auto& op) {
+                               return (op.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) && (op.type==ZYDIS_OPERAND_TYPE_MEMORY ||
+                                   (op.type==ZYDIS_OPERAND_TYPE_REGISTER && ZydisRegisterGetLargestEnclosing(
+                                       ZYDIS_MACHINE_MODE_LEGACY_32,op.reg.value)==ZYDIS_REGISTER_ESP));
+                           })) break;
+                cursor=pc;
+            }
+            if (!bound) return {};
+        }
+        return result;
+    }
+
 private:
     void recover_static_flow(Xbe& image, CodeCache& code, const Decoder& decoder) {
         struct Edge { Word destination, owner; bool call; };
         std::vector<Edge> pending;
         std::set<Word> slots;
         std::map<Word, std::set<Word>> assignments;
+        // The title builds its four allocator callbacks on the stack. The SDK's
+        // non-null initialization path copies that table over its CRT defaults.
+        if (hex_bytes(code.read(0x4cebe,16)) != "68000020008D4424205350E8B2910500" ||
+            hex_bytes(code.read(0xa60dd,10)) != "8B4C240851E879250000" ||
+            hex_bytes(code.read(0xa866a,8)) != "8B44240485C07429")
+            throw std::runtime_error("Unverified XBE allocator callback installation");
+        constexpr std::array<Word,4> stack_stores{0x4cea9,0x4cea1,0x4ceb1,0x4ce99};
+        constexpr std::array<Word,4> copies{0xa8672,0xa867a,0xa8683,0xa868c};
+        for (unsigned i=0; i<stack_stores.size(); ++i) {
+            const auto from=decoder.decode(stack_stores[i],code.read(stack_stores[i],8));
+            const auto read=decoder.decode(copies[i],code.window(copies[i],15));
+            const auto pc=copies[i]+read.decoded.length;
+            const auto store=decoder.decode(pc,code.window(pc,15));
+            const auto slot=absolute_word(store.operands[0]);
+            if (from.decoded.mnemonic!=ZYDIS_MNEMONIC_MOV || from.operands[0].type!=ZYDIS_OPERAND_TYPE_MEMORY ||
+                from.operands[0].mem.base!=ZYDIS_REGISTER_ESP || from.operands[0].mem.disp.value!=0x1c+4*i ||
+                from.operands[1].type!=ZYDIS_OPERAND_TYPE_IMMEDIATE || read.decoded.mnemonic!=ZYDIS_MNEMONIC_MOV ||
+                read.operands[1].type!=ZYDIS_OPERAND_TYPE_MEMORY || read.operands[1].mem.base!=ZYDIS_REGISTER_EAX ||
+                read.operands[1].mem.disp.value!=4*i || store.decoded.mnemonic!=ZYDIS_MNEMONIC_MOV ||
+                read.operands[0].reg.value!=store.operands[1].reg.value || slot!=0x1f4e790+4*i)
+                throw std::runtime_error("Invalid allocator callback field at "+hex32(pc));
+            assignments[*slot].insert(static_cast<Word>(from.operands[1].imm.value.u));
+        }
         const auto follow = [&](const Instruction& instruction, Word owner) {
             const auto category = instruction.decoded.meta.category;
             if (category == ZYDIS_CATEGORY_CALL || category == ZYDIS_CATEGORY_COND_BR || category == ZYDIS_CATEGORY_UNCOND_BR) {
+                if (const auto target=instruction.target()) {
+                    if (category==ZYDIS_CATEGORY_CALL) callers[*target].insert(instruction.address);
+                    else branch_targets.insert(*target);
+                }
                 if (const auto target = instruction.target(); target &&
                     (category == ZYDIS_CATEGORY_CALL ? !callable_owner(*target) : !local(*target, owner))) {
                     pending.push_back({*target, owner, category == ZYDIS_CATEGORY_CALL});
@@ -596,10 +947,22 @@ private:
                 instruction.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && instruction.operands[1].size == 32) {
                 if (const auto slot = absolute_word(instruction.operands[0])) {
                     assignments[*slot].insert(static_cast<Word>(instruction.operands[1].imm.value.u));
+                } else if (instruction.operands[0].type==ZYDIS_OPERAND_TYPE_REGISTER &&
+                           instruction.operands[0].size==32 && file_backed_code(image,static_cast<Word>(instruction.operands[1].imm.value.u))) {
+                    const auto next=instruction.address+instruction.decoded.length;
+                    if (local(next,owner)) {
+                        const auto store=decoder.decode(next,code.window(next,ZYDIS_MAX_INSTRUCTION_LENGTH));
+                        const auto destination=absolute_word(store.operands[0]);
+                        if (destination && store.decoded.mnemonic==ZYDIS_MNEMONIC_MOV &&
+                            store.operands[1].type==ZYDIS_OPERAND_TYPE_REGISTER &&
+                            store.operands[1].reg.value==instruction.operands[0].reg.value)
+                            assignments[*destination].insert(static_cast<Word>(instruction.operands[1].imm.value.u));
+                    }
                 }
             }
             const auto next = instruction.address + instruction.decoded.length;
             if (falls_through(instruction) && !local(next, owner)) pending.push_back({next, owner, false});
+            if (falls_through(instruction) && units.contains(next) && next!=owner) branch_targets.insert(next);
         };
         for (const auto& [owner, unit] : units) {
             for (const auto [address, length] : unit.rows) follow(decoder.decode(address, code.read(address, length)), owner);
@@ -994,6 +1357,15 @@ Function build_function(Word entry, Unit& unit, const Program& program, const Ju
                     throw std::runtime_error("Unverified longjmp transfer");
                 instruction.resumes_jump = true;
                 add_binding("longjmp", "Original CRT restores the saved registers and jumps to the saved continuation");
+            } else if (logic_export_field(address)) {
+                const auto opcode = address == logic_register_call ? "FF5118" :
+                                    address == logic_constructor_call ? "FF15EC55EF01" : "FF15E855EF01";
+                if (hex_bytes(Bytes(instruction.bytes).first(length)) != opcode ||
+                    (address!=logic_destructor_call && hex_bytes(code.read(address-5,5))!="681857EF01") ||
+                    hex_bytes(code.read(0x3A47A,3)) != "894810" || hex_bytes(code.read(0x3A4CA,3)) != "894814" ||
+                    hex_bytes(code.read(0x3A512,3)) != "894218")
+                    throw std::runtime_error("Unverified logic export installation at " + hex32(address));
+                add_binding("module_export","Named COFF export in module-exports.tsv; loaded owner, text, relocations and field checked at dispatch");
             } else if (import) {
                 instruction.kernel_ordinal = import->ordinal;
                 add_binding("kernel_import", std::string(import->name) + " (ordinal " + std::to_string(import->ordinal) + ")");
@@ -1020,7 +1392,7 @@ Function build_function(Word entry, Unit& unit, const Program& program, const Ju
                     if (const auto owner = program.callable_owner(target)) reference(target, *owner);
                     else add_site("callback_target", "No compiled entry for " + hex32(target) + " stored in " + hex32(*slot));
                 }
-                add_binding("callback_slot", "Original initialization or immediate assignment to " + hex32(*slot),
+                add_binding("callback_slot", "Original initialization or callback assignment to " + hex32(*slot),
                             {targets.begin(), targets.end()});
             } else {
                 add_binding("runtime_dispatch", "Target is read from guest state and checked against the compiled index");
@@ -1036,6 +1408,59 @@ Function build_function(Word entry, Unit& unit, const Program& program, const Ju
             }
         }
         function.instructions.emplace(address, std::move(instruction));
+    }
+    if (std::ranges::any_of(unit.bindings, [](const Site& s) {return s.kind=="runtime_dispatch" || s.kind=="callback_slot";})) {
+        for (const auto& call: trace_call_sources(function).calls) {
+            if (call.direct) continue;
+            const auto binding=std::ranges::find(unit.bindings,call.site,&Site::address);
+            if (binding==unit.bindings.end() || (binding->kind!="runtime_dispatch" && binding->kind!="callback_slot")) continue;
+            const auto source=call.target;
+            if (source.kind==PointerSource::argument) {
+                const auto callers=program.callback_callers(entry,source.base,code,decoder);
+                if (!callers.empty()) {
+                    auto& pairs=function.instructions.at(call.site).caller_targets;
+                    pairs.assign(callers.begin(),callers.end());
+                    binding->kind="caller_callback";
+                    binding->reason="Original stack argument "+std::to_string(source.base+1)+" at verified return addresses";
+                    std::set<Word> targets;
+                    for (auto [return_pc,target]:callers) {
+                        binding->reason+=" "+hex32(return_pc)+"->"+hex32(target);
+                        reference(target,*program.callable_owner(target));
+                        targets.insert(target);
+                    }
+                    binding->targets.assign(targets.begin(),targets.end());
+                }
+                continue;
+            }
+            std::optional<Word> target;
+            std::string reason;
+            if (source.kind==PointerSource::constant) {
+                target=source.base;
+                reason="Register target fixed by the original instructions";
+            } else if (source.kind==PointerSource::absolute_slot) {
+                const auto immutable=std::ranges::any_of(image.sections(),[&](const Section& s) {
+                    return !(s.flags & 1) && source.base>=s.address && std::uint64_t(source.base-s.address)+4<=std::min(s.size,s.raw_size);
+                });
+                if (!immutable) continue;
+                const auto* import=image.kernel_import(source.base);
+                if (import && kernel_data_export(import->ordinal)) continue;
+                if (import) {
+                    target=kernel_call_address(import->ordinal);
+                    reason=std::string(import->name)+" from the verified import at "+hex32(source.base);
+                } else {
+                    target=image.initial_word(source.base);
+                    reason="Pointer from the read-only XBE word at "+hex32(source.base);
+                }
+            }
+            if (!target) continue;
+            const auto owner=program.callable_owner(*target);
+            if (owner) reference(*target,*owner);
+            else if (source.kind!=PointerSource::absolute_slot || !image.kernel_import(source.base)) continue;
+            function.instructions.at(call.site).checked_target=*target;
+            binding->kind="fixed_call";
+            binding->reason=std::move(reason);
+            binding->targets={*target};
+        }
     }
     return function;
 }
@@ -1117,6 +1542,14 @@ std::string report(const Xbe& image, const Program& program, std::size_t helpers
     out << ",\n  \"xbr_files_indexed\":" << modules.xbr_files << ",\n  \"logic_object_instances\":" << modules.object_instances
         << ",\n  \"unresolved_module_calls\":" << modules.unresolved_calls;
     if (modules.unresolved_calls) out << ",\n  \"module_indirect_sites\":\"module-indirect.tsv\"";
+    if (modules.fixed_calls) out << ",\n  \"fixed_module_calls\":" << modules.fixed_calls << ",\n  \"module_fixed_sites\":\"module-fixed-calls.tsv\"";
+    if (modules.object_instances) out << ",\n  \"module_exports\":\"module-exports.tsv\""
+        << ",\n  \"verified_module_abi_calls\":" << modules.abi_calls << ",\n  \"module_abi_sites\":\"module-abi-calls.tsv\""
+        << ",\n  \"conditional_argument_methods\":" << modules.conditional_calls << ",\n  \"verified_outgoing_table_arguments\":" << modules.passed_arguments
+        << ",\n  \"module_call_evidence\":\"module-call-evidence.tsv\",\n  \"module_api_providers\":\"module-api-providers.tsv\""
+        << ",\n  \"installed_module_calls\":" << modules.installed_calls << ",\n  \"named_module_calls\":" << modules.named_calls
+        << ",\n  \"named_provider_methods\":" << modules.named_methods;
+    if (modules.conditional_calls || modules.passed_arguments) out << ",\n  \"module_argument_evidence\":\"module-argument-calls.tsv\"";
     out << ",\n  \"logic_modules\":[" << modules.summary << "],\n  \"functions\":[" << functions.str() << "\n  ]\n}\n";
     return out.str();
 }
@@ -1150,8 +1583,13 @@ int recompile_xbe(const Path& input, const Path& maps, const Path& output, bool 
     if (std::filesystem::exists(output)) throw std::runtime_error("Output directory already exists");
     Decoder decoder;
     CodeCache code(image);
+    if (hex_bytes(code.read(0x68480,24))!="8B4C2408C1E90285C9760C8B44240C578B7C2408F3AB5FC3")
+        throw std::runtime_error("Unverified SDK interface table fill");
     Program program(maps, image, code, decoder);
+    File executable(input);
+    program.index_file_pointers(executable);
     const auto jumps = jump_targets(maps, program, image, code, decoder);
+    for (const auto& [site,jump]:jumps) program.branch_targets.insert(jump.targets.begin(),jump.targets.end());
     constexpr unsigned shard_count = 64;
     constexpr std::size_t max_source_bytes = 256 * 1024 * 1024;
     std::array<std::string, shard_count + 1> shards;
@@ -1169,11 +1607,13 @@ int recompile_xbe(const Path& input, const Path& maps, const Path& output, bool 
     for (const auto& [entry, unit] : program.units)
         if (!unit.recovered) total_rows += unit.rows.size();
     const auto rows_per_shard = std::max<std::size_t>(1,(total_rows+shard_count-1)/shard_count);
+    CallEvidence evidence;
     for (auto& [entry, unit] : program.units) {
         const auto name = symbol(entry);
         auto& declarations = unit.recovered ? index_declarations : header;
         declarations << "void " << name << "(Cpu&, Memory&);\n";
         auto function = build_function(entry, unit, program, jumps, image, code, decoder);
+        evidence.executable_function(function);
         auto lowered = lower(function);
         unit.lowered = lowered.issues.empty();
         for (auto& issue : lowered.issues) {
@@ -1233,7 +1673,14 @@ int recompile_xbe(const Path& input, const Path& maps, const Path& output, bool 
     staging += ".tmp";
     if (!std::filesystem::create_directory(staging)) throw std::runtime_error("Cannot create batch staging directory");
     try {
-        const auto modules = (closed || allow_partial) ? generate_modules(disc, image, decoder, staging, assembly) : GeneratedModules{};
+        GeneratedModules modules;
+        if (closed || allow_partial) {
+            // Release every stream before removing a failed staging directory on Windows.
+            auto writer=std::move(evidence);
+            if (!disc.empty()) writer.open(staging);
+            modules=generate_modules(disc,image,decoder,staging,assembly,writer,allow_partial || xbe_targets_verified);
+            if (!disc.empty()) writer.close();
+        }
         const bool targets_verified = xbe_targets_verified && modules.object_instances && !modules.unresolved_calls;
         complete = closed && targets_verified;
         const auto summary = report(image, program, assembly.size(), complete, targets_verified, modules);

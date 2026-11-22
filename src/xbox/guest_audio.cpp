@@ -1,4 +1,5 @@
 #include "guest_audio.h"
+#include "audio_effects.h"
 #include "file.h"
 #include "platform_bindings.h"
 
@@ -187,7 +188,13 @@ Word GuestAudio::load_effects(Cpu& cpu, Word image, Word size, Word locations, W
             release(base);
             return result;
         }
+        // The control program at 0xEA6F0 reads the decrypted image at scratch offset 0.
+        // Its DMA descriptors use DSP scratch addresses, independently of the guest pointers above.
+        const auto kernel = Bytes(static_cast<const std::byte*>(memory_.access(0x000EA6F0,0x5cc)),0x5cc);
+        const auto decoded = Bytes(static_cast<const std::byte*>(memory_.access(base,map_offset)),static_cast<std::size_t>(map_offset));
+        auto effects = std::make_unique<AudioEffects>(kernel,decoded,scratch_base+scratch);
         if (output) memory_.store(output, descriptor);
+        audio_->install_effects(std::move(effects));
     } catch (...) {
         release(base);
         throw;

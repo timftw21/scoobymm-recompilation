@@ -34,6 +34,8 @@ struct KernelServices {
     bool (*platform)(void*, Cpu&, Memory&, std::uint32_t) = nullptr;
     NativeFunction (*resolve_module)(void*, Cpu&, std::uint32_t) = nullptr;
     std::uint32_t (*camera_extent)(void*, std::uint32_t camera, unsigned field, std::uint32_t value) = nullptr;
+    void (*name_widget)(void*, std::uint32_t handle, std::uint32_t name) = nullptr;
+    void (*draw_widget)(void*, std::uint32_t widget) = nullptr;
 };
 struct GuestClock {
     void* context = nullptr;

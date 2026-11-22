@@ -37,6 +37,7 @@ struct Gpu::Impl {
     const std::byte* notification_ram = nullptr;
     bool ordered_notifications = false, fifo_reads_notifications = false;
     std::array<std::uint32_t,3> widescreen_buffers{};
+    int hud_side{};
     std::array<std::array<std::uint32_t,2048>,8> registers{};
     std::array<std::uint32_t,8> objects{};
     std::array<std::uint32_t,8> classes{};
@@ -343,8 +344,10 @@ struct Gpu::Impl {
         ProgramView view{};
         view.depth_scale=depth_max();
         const auto color_address = reg(0x210);
-        if (color_address && std::ranges::find(widescreen_buffers,color_address) != widescreen_buffers.end())
+        if (color_address && std::ranges::find(widescreen_buffers,color_address) != widescreen_buffers.end()) {
             view.horizontal_scale = .75f;
+            view.horizontal_offset = hud_side * (1.f - view.horizontal_scale);
+        }
         const auto render_state=state(view);
         auto& draw=draws[draw_count];draw.stream_count=0;draw.view=view;draw.packed.clear();
         draw.current=current;draw.constants=constants;draw.count=count;
@@ -412,6 +415,7 @@ struct Gpu::Impl {
             out << "{\"primitive\":" << primitive << ",\"target\":" << target
                 << ",\"color_address\":" << reg(0x210) << ",\"depth_address\":" << reg(0x214)
                 << ",\"transform_mode\":" << mode << ",\"horizontal_scale\":" << view.horizontal_scale
+                << ",\"horizontal_offset\":" << view.horizontal_offset
                 << ",\"first\":" << first << ",\"vertices\":" << count << ",\"indices\":" << draw.indices.size()
                 << ",\"inline\":" << (inlined ? "true" : "false") << ",\"vertex_inputs\":[";
             for (unsigned input = 0; input < 16; ++input) {
@@ -704,7 +708,7 @@ Gpu::Gpu(Renderer& renderer,Memory& memory,std::uint32_t semaphore_base,std::spa
          NotificationDelivery delivery):impl_(std::make_unique<Impl>(renderer,memory,*this,semaphore_base,profile,delivery)) {}
 Gpu::~Gpu()=default;
 void Gpu::widescreen_buffers(std::array<std::uint32_t,3> addresses) { impl_->widescreen_buffers = addresses; }
-void Gpu::submit(std::uint32_t begin,std::uint32_t end) {
+void Gpu::submit(std::uint32_t begin,std::uint32_t end,std::span<const HudAnchor> anchors) {
     auto& g=*impl_;
     if(end<begin || ((end-begin)&3) || end-begin>4*1024*1024) throw std::runtime_error("Invalid native GPU submission range");
     // Guest CPU writes can occur between submissions. A semaphore write or
@@ -723,24 +727,33 @@ void Gpu::submit(std::uint32_t begin,std::uint32_t end) {
         begin += sizeof(value);
         return value;
     };
-    while(begin<end) {
-        const auto header=next_word();++g.statistics.packets;
-        if(header&0xA0030003U) throw std::runtime_error(std::format("Unsupported NV2A packet 0x{:08X} at 0x{:08X}",header,begin-4));
-        const auto count=(header>>18)&0x7FF,first=header&0x1FFC,subchannel=(header>>13)&7;
-        if(count>(end-begin)/4 || (!(header&0x40000000U) && count && first+(count-1)*4>=0x2000))
-            throw std::runtime_error("NV2A packet extends beyond its submission or method bank");
-        if (count && !subchannel && g.classes[0] == 0x97) {
-            const bool repeated = (header & 0x40000000U) != 0;
-            const bool inline_data = repeated && (first == 0x1800 || first == 0x1808 || first == 0x1818);
-            if (inline_data) g.inline_packet(first,fifo,count);
-            if (inline_data || (!repeated && g.transform_packet(first,fifo,count))) {
-                fifo += 4*count; begin += 4*count; continue;
+    for (;;) {
+        const auto limit = anchors.empty() ? end : anchors.front().address;
+        if (limit < begin || limit > end || ((limit-begin) & 3))
+            throw std::runtime_error("HUD draw boundary outside submission");
+        while (begin < limit) {
+            const auto header=next_word();++g.statistics.packets;
+            if(header&0xA0030003U) throw std::runtime_error(std::format("Unsupported NV2A packet 0x{:08X} at 0x{:08X}",header,begin-4));
+            const auto count=(header>>18)&0x7FF,first=header&0x1FFC,subchannel=(header>>13)&7;
+            if(count>(limit-begin)/4 || (!(header&0x40000000U) && count && first+(count-1)*4>=0x2000))
+                throw std::runtime_error("NV2A packet extends beyond its submission or method bank");
+            if (count && !subchannel && g.classes[0] == 0x97) {
+                const bool repeated = (header & 0x40000000U) != 0;
+                const bool inline_data = repeated && (first == 0x1800 || first == 0x1808 || first == 0x1818);
+                if (inline_data) g.inline_packet(first,fifo,count);
+                if (inline_data || (!repeated && g.transform_packet(first,fifo,count))) {
+                    fifo += 4*count; begin += 4*count; continue;
+                }
+            }
+            for(unsigned word=0;word<count;++word) {
+                const auto method=first+((header&0x40000000U)?0:word*4);
+                g.method(subchannel,method,next_word());
             }
         }
-        for(unsigned word=0;word<count;++word) {
-            const auto method=first+((header&0x40000000U)?0:word*4);
-            g.method(subchannel,method,next_word());
-        }
+        if (anchors.empty()) break;
+        g.emit_arrays();
+        g.hud_side = anchors.front().side;
+        anchors = anchors.subspan(1);
     }
     g.fence(0,0);g.dispatch_fences();g.submission_fenced = true;g.poll(false);
 }

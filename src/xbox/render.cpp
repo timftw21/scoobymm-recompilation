@@ -173,8 +173,8 @@ struct alignas(16) ProgramUniforms {
     std::array<std::uint32_t,4> fixed_flags{};
     std::array<std::array<std::uint32_t,4>,4> fixed_texgen{};
     std::array<std::uint32_t,4> fixed_matrices{};
-    float horizontal_scale = 1;
-    std::array<float,3> padding{};
+    float horizontal_scale = 1, horizontal_offset = 0;
+    std::array<float,2> padding{};
 };
 struct AttributeFormat {DXGI_FORMAT native;unsigned bytes,fetched;};
 AttributeFormat attribute_format(std::uint32_t format) {
@@ -1192,6 +1192,7 @@ void Renderer::draw_program(const RenderState& state,std::uint32_t program,const
     ProgramUniforms uniforms{constants,{2.0f/r.width,2.0f/r.height,1/view.depth_scale,view.subpixel_bias},
         {state.fog_parameters[0],state.fog_parameters[1],float(mode),state.fog_enable?(absolute?2.0f:1.0f):0.0f},view.texture_scales};
     uniforms.horizontal_scale = view.horizontal_scale;
+    uniforms.horizontal_offset = view.horizontal_offset;
     r.draw(state,std::as_bytes(vertices),vertices.size(),indices,&r.programs[program-1],&uniforms);
 }
 void Renderer::draw_streams(const RenderState& state,std::uint32_t layout,const VertexConstants& constants,const ProgramView& view,
@@ -1210,6 +1211,7 @@ void Renderer::draw_streams(const RenderState& state,std::uint32_t layout,const 
     ProgramUniforms uniforms{constants,{2.0f/r.width,2.0f/r.height,1/view.depth_scale,view.subpixel_bias},
         {state.fog_parameters[0],state.fog_parameters[1],float(mode),state.fog_enable?(absolute?2.0f:1.0f):0.0f},view.texture_scales};
     uniforms.horizontal_scale = view.horizontal_scale;
+    uniforms.horizontal_offset = view.horizontal_offset;
     uniforms.input_formats = prepared.input_formats;
     const Impl::StreamDraw source{prepared,streams,current};
     r.draw(state,{},count,indices,&r.programs[prepared.program-1],&uniforms,&source);

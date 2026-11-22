@@ -12,6 +12,7 @@
 
 struct SDL_AudioStream;
 namespace xbox_native {
+class AudioEffects;
 
 struct SpatialResult { float gain=1; std::array<float,2> pan{1,1},front_back{1,0},environment_gain{1,0},environment_pole{}; double pitch=1; };
 struct AudioFormat {
@@ -72,6 +73,7 @@ public:
     void frequency(std::uint32_t,std::uint32_t hz);
     void route(std::uint32_t,std::uint32_t destination);
     void spatial(std::uint32_t,const SpatialResult&);
+    void install_effects(std::unique_ptr<AudioEffects>);
     void mix(std::span<float> stereo);
     std::uint64_t sample_clock() const {return frames_processed_.load(std::memory_order_relaxed);}
     float output_peak() const {return output_peak_.load(std::memory_order_relaxed);}
@@ -105,7 +107,8 @@ private:
         std::uint32_t level_frames=0;
         bool stop_after_ramp=false;
         std::array<float,2> spatial_pan{1,1};
-        std::array<float,2> front_back{1,0},environment_gain{1,0},environment_pole{};
+        // Explicit mix-bin routes have unity gain until a spatial voice supplies its attenuation.
+        std::array<float,2> front_back{1,1},environment_gain{1,1},environment_pole{};
         std::array<std::array<float,2>,2> environment_history{};
         double spatial_pitch=1;
         std::array<std::uint32_t,8> bins{0,1};
@@ -128,6 +131,9 @@ private:
 
 
     SDL_AudioStream* stream_=nullptr;
+    std::unique_ptr<AudioEffects> effects_;
+    std::array<float,64> effect_output_{};
+    unsigned effect_offset_{};
     std::array<Voice,256> voices_{};
     std::array<std::uint32_t,32> bin_headroom_{};
     std::atomic<std::uint64_t> frames_processed_{0};

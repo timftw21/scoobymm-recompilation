@@ -22,7 +22,9 @@ if ($Scene -ne 'Movie') {
     foreach ($n in 1..$last) { $options += '--start-at-scanout', [string]($n*10) }
 }
 switch ($Scene) {
-    'Movie' { $start = 32 }
+    # A 100-frame sample starting at scanout 100 stays inside WBPH.XMV,
+    # where consecutive pictures are 33 or 34 milliseconds apart.
+    'Movie' { $start = 70 }
     'Menu' {
         $options += '--start-at-scanout', '720'
         $start = 800
@@ -61,7 +63,9 @@ if ($stats.scanouts -ne $Frames) { throw "Measurement ended early. See $run/perf
 if ($Scene -ne 'Movie' -and ($stats.overlay_scanouts -or $stats.guest_flips -ne $Frames -or !$stats.engine_updates)) {
     throw "The sample left the rendered game scene. Check $run/scene.png and performance.csv."
 }
-if ($Scene -eq 'Movie' -and !$stats.overlay_scanouts) { throw "The sample missed the movie. Check $run/scene.png." }
+if ($Scene -eq 'Movie' -and ($stats.overlay_scanouts -lt [Math]::Min(100,$Frames) -or $stats.presentations -lt $stats.overlay_scanouts)) {
+    throw "The movie sample missed overlays or dropped presentations. Check $run/performance."
+}
 if ($Scene -ne 'Movie') {
     $session = Get-Content -Raw "$run/session.json" | ConvertFrom-Json
     $sceneModule = switch ($Scene) {

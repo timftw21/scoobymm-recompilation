@@ -28,7 +28,7 @@ public:
     explicit PlayWindow(PlayOptions& options);
     bool launcher();
     void overlay(bool measuring);
-    bool frame_due(bool movie, std::uint32_t scanout, std::uint64_t vblank);
+    bool frame_due(bool movie, std::uint32_t scanout);
     void pace_game(bool movie);
     float gain() const;
     Renderer& renderer() const { return *renderer_; }
@@ -50,8 +50,7 @@ private:
     PlayOptions& options_;
     bool hidden_, playing_{}, focused_{};
     int pacing_rate_ = -1;
-    std::uint64_t deadline_{}, movie_bucket_{};
-    int movie_rate_ = -1;
+    std::uint64_t deadline_{};
     unsigned skip_{};
     void pace(int hz);
     std::unique_ptr<Renderer> renderer_;

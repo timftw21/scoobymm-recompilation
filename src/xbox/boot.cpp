@@ -5,6 +5,8 @@
 #include "guest_graphics.h"
 #include "kernel_names.h"
 #include "platform_bindings.h"
+#include "logic_exports.h"
+#include "kernel_imports.h"
 #include "play_diagnostics.h"
 #include "play_window.h"
 #include "sha1.h"
@@ -31,7 +33,7 @@ namespace xbox_native {
 namespace {
 using Word = std::uint32_t;
 constexpr Word guest_base = 0x10000, ram_end = 0x4000000, page = 4096;
-constexpr Word kernel_base = 0x80010000, function_base = 0xFFF00000, return_address = 0xFFFFFFF0;
+constexpr Word kernel_base = 0x80010000, return_address = 0xFFFFFFF0;
 constexpr Word audio_register_page = 0xFE801000;
 constexpr Word gamepad_type = 0x00144374;
 constexpr Word gdt = kernel_base + page, shutdown_list = gdt + 64;
@@ -96,7 +98,13 @@ struct Thread {
 };
 struct Timer { std::uint64_t due; Word dpc; };
 struct Event { std::string name; bool auto_reset, signaled; };
-struct ModuleInstance { const CompiledModule* module; Word base, owner; };
+struct ModuleInstance {
+    const CompiledModule* module;
+    Word base, owner;
+    std::span<const LogicAbiCall> abi;
+    std::span<const LogicPassedInterface> arguments;
+    bool contains(Word pc) const { return pc>=base && pc-base<module->code_hex.size()/2; }
+};
 struct FileTimes {
     std::uint64_t created{}, accessed{}, written{}, changed{};
 };
@@ -154,14 +162,20 @@ public:
                 if (field != 0x68 || !boot.window_->settings().widescreen) return value;
                 const auto scene = boot.memory_.load<Word>(0x01EED360);
                 if (!scene || boot.memory_.load<Word>(camera + 0x14) != 1) return value;
-                // Widen the two scene cameras' CPU visibility bounds. Vertex
-                // output gets the matching horizontal scale at the backbuffer.
+                // RenderWare and both game-object frusta share the display projection.
+                // The HUD camera and offscreen cameras keep their authored extents.
                 for (const auto slot : {4U, 8U}) {
                     const auto object = boot.memory_.load<Word>(scene + slot);
                     if (object && boot.memory_.load<Word>(object + 0x30) == camera)
                         return std::bit_cast<Word>(std::bit_cast<float>(value) * (4.f / 3.f));
                 }
                 return value;
+            };
+            services_.name_widget = [](void* context, Word handle, Word name) {
+                static_cast<OfflineBoot*>(context)->graphics_.name_widget(handle,name);
+            };
+            services_.draw_widget = [](void* context, Word widget) {
+                static_cast<OfflineBoot*>(context)->graphics_.draw_widget(widget);
             };
             clock_.frame_step = [](void* context, Word authored) {
                 const auto& boot = *static_cast<OfflineBoot*>(context);
@@ -413,12 +427,8 @@ private:
         memory_.store<Word>(shutdown_list, shutdown_list);
         memory_.store<Word>(shutdown_list + 4, shutdown_list);
         for (const auto& import : image_.imports()) {
-            Word address = function_base + import.ordinal * 16;
-            switch (import.ordinal) {
-            case 16: case 40: case 71: case 156: case 164: case 322: case 323: case 324: case 326: case 356:
-                address = kernel_base + 2 * page + import.ordinal * 64;
-                break;
-            }
+            const Word address = kernel_data_export(import.ordinal) ? kernel_base + 2 * page + import.ordinal * 64 :
+                                                                     kernel_call_address(import.ordinal);
             memory_.store(import.address, address);
             if (import.ordinal == 323) {
                 std::memcpy(memory_.access(address,storage_key_.size()),storage_key_.data(),storage_key_.size());
@@ -490,7 +500,8 @@ private:
         memory_.store<Word>(tib + 4, stack_top);
         memory_.store<Word>(tib + 8, base + page);
         memory_.store<Word>(tib + 0x18, tib);
-        memory_.store<Word>(tib + 0x20, object);
+        memory_.store<Word>(tib + 0x1C, tib);
+        memory_.store<Word>(tib + 0x20, tib + 0x28);
         memory_.store<Word>(tib + 0x28, object);
         auto& cpu = thread.cpu;
         cpu.kernel = &services_;
@@ -998,27 +1009,88 @@ bool OfflineBoot::input_api(PlatformApi api, Cpu& cpu) {
 NativeFunction OfflineBoot::resolve_module(Cpu& cpu, Word caller) {
     // EF_LOGIC_CODE stores the loaded text base at +0x264 and clears it on release.
     constexpr Word text_field = 0x264;
-    std::erase_if(modules_, [&](const ModuleInstance& instance) {
-        return memory_.load<Word>(instance.owner + text_field) != instance.base;
-    });
     const auto address = cpu.eip;
-    const auto owner = cpu.registers[ecx];
+    const auto field = logic_export_field(caller);
+    const auto owner = cpu.registers[caller == logic_destructor_call ? eax : ecx];
     const auto active = [&](const ModuleInstance& instance) -> NativeFunction {
-        const auto& [module, base, object] = instance;
-        if (address < base || address - base >= module->code_hex.size() / 2) return nullptr;
-        const auto offset = address - base;
-        const auto found = std::ranges::lower_bound(module->functions, offset, {}, &CompiledFunction::address);
-        return found != module->functions.end() && found->address == offset ? found->run : nullptr;
+        const auto offset = address - instance.base;
+        const auto functions=instance.module->functions;
+        const auto found = std::ranges::lower_bound(functions, offset, {}, &CompiledFunction::address);
+        return found != functions.end() && found->address == offset ? found->run : nullptr;
     };
-    if (caller != 0x0003A6B5 && caller != 0x0003D42F) {
-        for (const auto& module : modules_) if (const auto function = active(module)) return function;
+    if (!field) {
+        const auto instance_at=[&](Word pc) -> const ModuleInstance* {
+            if (modules_.empty() || pc<modules_.front().base ||
+                std::uint64_t(pc)>=std::uint64_t(modules_.back().base)+modules_.back().module->code_hex.size()/2) return nullptr;
+            const auto& found=*std::prev(std::ranges::upper_bound(modules_,pc,{},&ModuleInstance::base));
+            return found.contains(pc) ? &found : nullptr;
+        };
+        if (const auto* source=instance_at(caller)) {
+            const auto offset=caller-source->base;
+            const auto rules=source->abi;
+            if (!rules.empty() && offset>=rules.front().site && offset<=rules.back().site) {
+                auto rule=std::ranges::lower_bound(rules,offset,{},&LogicAbiCall::site);
+                if (rule!=rules.end() && rule->site==offset) {
+                    const auto matches=[&](const LogicAbiCall& r) {
+                        if (r.source==logic_unreachable) return false;
+                        if (r.source==logic_local_function) return address-source->base==r.target;
+                        if (r.source==logic_passed_argument) {
+                            // The original EBP frame still contains the return PC
+                            // and this unmodified argument. Look up its producer.
+                            const Word frame=cpu.registers[ebp];
+                            const Word ret=memory_.load<Word>(frame+4);
+                            const auto* parent=instance_at(ret-1);
+                            if (!parent) return true;
+                            const auto key=std::pair{ret-parent->base,r.slot};
+                            const auto position=[](const LogicPassedInterface& a){return std::pair{a.return_site,a.argument};};
+                            const auto passed=std::ranges::lower_bound(parent->arguments,key,{},position);
+                            if (passed==parent->arguments.end() || position(*passed)!=key) return true;
+                            const auto& api=*passed->definition;
+                            if (memory_.load<Word>(parent->owner+text_field)!=parent->base ||
+                                memory_.load<Word>(parent->base+passed->cell)!=api.table ||
+                                memory_.load<Word>(frame+8+r.slot*4)!=api.table ||
+                                memory_.load<Word>(logic_engine_api+api.slot)!=api.getter) return false;
+                            const auto index=r.method/4;
+                            if (index>=api.methods.size() || !api.methods[index]) return true;
+                            return address==api.methods[index] && memory_.load<Word>(api.table+r.method)==address;
+                        }
+                        const auto engine_method=memory_.load<Word>(logic_engine_api+r.slot);
+                        if (r.source==logic_root_argument) return engine_method==address && address==r.target;
+                        if (r.table==logic_engine_api) return engine_method==address && address==r.target &&
+                            memory_.load<Word>(source->base+r.source)==logic_engine_api;
+                        if (engine_method!=r.getter) return false;
+                        if (r.named==UINT32_MAX) return address==r.target &&
+                            (r.source==logic_getter_result || memory_.load<Word>(source->base+r.source)==r.table) &&
+                            memory_.load<Word>(r.table+r.method)==address;
+                        const auto* provider=instance_at(address);
+                        if (!provider || memory_.load<Word>(provider->owner+text_field)!=provider->base) return false;
+                        const auto& method=compiled_named_methods[r.named];
+                        if (!std::ranges::any_of(method.providers,[&](const LogicProvider& p) {
+                            return p.object->functions.data()==provider->module->functions.data() && address-provider->base==p.offset;
+                        })) return false;
+                        const auto table=memory_.load<Word>(source->base+r.source);
+                        return table>=guest_base && std::uint64_t(table)+method.field+4<=ram_end &&
+                               memory_.load<Word>(table+method.field)==address;
+                    };
+                    while (rule!=rules.end() && rule->site==offset && !matches(*rule)) ++rule;
+                    if (rule==rules.end() || rule->site!=offset || memory_.load<Word>(source->owner+text_field)!=source->base)
+                        throw NativeBoundary(caller,std::format("{} call at +{} has no matching binding for {}",
+                                             source->module->name,hex32(offset),hex32(address)));
+                }
+            }
+        }
+        if (const auto* target=instance_at(address); target && memory_.load<Word>(target->owner+text_field)==target->base)
+            return active(*target);
         return nullptr;
     }
+    if (owner < guest_base || owner >= ram_end - text_field - 4 || memory_.load<Word>(owner+field) != address)
+        return nullptr;
+    if (caller!=logic_destructor_call && memory_.load<Word>(cpu.registers[esp]+4)!=logic_engine_api)
+        return nullptr;
     std::string mismatch;
     std::size_t matched_bytes = 0;
     for (const auto& module : compiled_modules) {
-        if (caller != module.registration_call || address < module.registration || owner < guest_base ||
-            owner >= ram_end - text_field - 4) continue;
+        if (caller != module.registration_call || address < module.registration) continue;
         const auto base = address - module.registration;
         const auto size = module.code_hex.size() / 2;
         if (base < guest_base || base > ram_end || size > ram_end - base ||
@@ -1051,9 +1123,18 @@ NativeFunction OfflineBoot::resolve_module(Cpu& cpu, Word caller) {
             }
         }
         if (!identical) continue;
-        std::erase_if(modules_, [&](const ModuleInstance& instance) { return instance.owner == owner || instance.base == base; });
-        modules_.push_back({&module, base, owner});
-        return active(modules_.back());
+        std::erase_if(modules_, [&](const ModuleInstance& instance) {
+            return instance.owner==owner || instance.base==base || memory_.load<Word>(instance.owner+text_field)!=instance.base;
+        });
+        const auto pos=std::ranges::lower_bound(modules_,base,{},&ModuleInstance::base);
+        if ((pos!=modules_.begin() && std::prev(pos)->contains(base)) || (pos!=modules_.end() && size>pos->base-base))
+            throw NativeBoundary(address,"Overlapping loaded logic objects");
+        const auto policy=std::ranges::find_if(compiled_logic_abi,[&](const LogicAbiModule& abi) {
+            return abi.object->functions.data()==module.functions.data();
+        });
+        const auto rules=policy==compiled_logic_abi.end()?std::span<const LogicAbiCall>{}:policy->calls;
+        const auto arguments=policy==compiled_logic_abi.end()?std::span<const LogicPassedInterface>{}:policy->arguments;
+        return active(*modules_.insert(pos,{&module,base,owner,rules,arguments}));
     }
     if (!mismatch.empty()) throw NativeBoundary(address, std::move(mismatch));
     return nullptr;
@@ -2028,10 +2109,10 @@ void OfflineBoot::report(std::ostream& output, std::string_view status, std::str
     }
     out << "],\"logic_modules\":[";
     bool first_module = true;
-    for (const auto& [module, base, owner] : modules_) {
+    for (const auto& instance : modules_) {
         if (!std::exchange(first_module, false)) out << ',';
-        out << "{\"name\":" << json(module->name) << ",\"base\":" << json(hex32(base))
-            << ",\"compiled_index\":" << (module - compiled_modules.data()) << '}';
+        out << "{\"name\":" << json(instance.module->name) << ",\"base\":" << json(hex32(instance.base))
+            << ",\"compiled_index\":" << (instance.module - compiled_modules.data()) << '}';
     }
     out << "],\"last_io_path\":" << json(last_io_path_) << ",\"threads\":[";
     for (const auto& thread : threads_) {

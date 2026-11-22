@@ -76,20 +76,11 @@ void PlayWindow::overlay(bool measuring) {
     menu_->draw(true, diagnostic_keys_, measuring);
 }
 
-bool PlayWindow::frame_due(bool movie, std::uint32_t scanout, std::uint64_t vblank) {
+bool PlayWindow::frame_due(bool movie, std::uint32_t scanout) {
     if (options_.refresh_at == scanout) options_.refresh_rate = options_.scripted_rate;
     const auto hz = options_.refresh_rate;
-    if (movie) {
-        if (!hz || hz >= 60) { movie_rate_ = hz; return true; }
-        // XMV overlays become visible on a guest 60 Hz vblank. Use that clock
-        // so host scheduling jitter cannot discard an on-time movie frame.
-        const auto bucket = vblank * hz / 60;
-        const bool show = movie_rate_ != hz || bucket != movie_bucket_;
-        movie_bucket_ = bucket;
-        movie_rate_ = hz;
-        return show;
-    }
-    movie_rate_ = -1;
+    // The movie decoder already schedules each overlay from its own timestamps.
+    if (movie) { skip_ = 0; return true; }
     // 0x184BB clamps a simulation step to 50 ms. For slow displays run full
     // updates at a multiple of the cap and select complete guest frames.
     if (hz <= 0 || hz >= 20) { skip_ = 0; return true; }
