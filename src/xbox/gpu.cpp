@@ -380,7 +380,9 @@ struct Gpu::Impl {
             if(inlined) {layout[attribute]={0,inline_stride,type};inline_stride+=(bytes+3)&~3U;continue;}
             if(!stride || stride>2048 || stride<bytes) throw std::runtime_error("Invalid NV097 vertex stream stride");
             const auto address=reg(0x1720+attribute*4)&0x0FFFFFFF;
-            const auto alignment = vertex_attribute_alignment(type);
+            // D3D11 aligns the whole element, up to four bytes. Three Xbox
+            // bytes are fetched as R8G8B8A8 and also require four-byte alignment.
+            const auto alignment = bytes <= 2 ? bytes : 4U;
             unsigned stream=0;
             for (; stream < draw.stream_count; ++stream) {
                 if (strides[stream] != stride || address < bases[stream]) continue;

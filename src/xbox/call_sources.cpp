@@ -10,9 +10,16 @@ namespace {
 using Word = std::uint32_t;
 using Kind = PointerSource;
 using Reg = ZydisRegister;
+struct StoredFunction {
+    Reg base{};
+    Word displacement{};
+    PointerValue value{};
+    bool operator==(const StoredFunction&) const = default;
+};
 struct State {
     std::array<PointerValue,8> regs{};
     PointerValue top{}, second{}, third{}, nonzero{};
+    StoredFunction stored{};
     unsigned overwritten_arguments{};
     std::map<Word,PointerValue> locals;
 };
@@ -22,6 +29,16 @@ int index(Reg reg) {
 }
 PointerValue plus(PointerValue value, Word offset) {
     if (!offset) return value;
+    if (value.kind==Kind::argument || value.kind==Kind::argument_address) {
+        value.offset+=offset;
+        value.kind=value.offset ? Kind::argument_address : Kind::argument;
+        return value;
+    }
+    if (value.kind==Kind::module_slot || value.kind==Kind::object_address) {
+        value.offset+=offset;
+        value.kind=value.offset ? Kind::object_address : Kind::module_slot;
+        return value;
+    }
     if (value.kind != Kind::constant && value.kind != Kind::relocated && value.kind != Kind::stack) return {};
     value.base += offset;
     return value;
@@ -34,8 +51,11 @@ PointerValue load(PointerValue base, Word displacement) {
     }
     case Kind::constant: return {Kind::absolute_slot,base.base+displacement};
     case Kind::relocated: return {Kind::module_slot,base.base+displacement};
-    case Kind::argument: return {Kind::argument_method,base.base,displacement};
+    case Kind::argument:
+    case Kind::argument_address: return {Kind::argument_method,base.base,base.offset+displacement};
     case Kind::module_slot: return {Kind::module_method,base.base,displacement};
+    case Kind::object_address: return {Kind::module_method,base.base,base.offset+displacement};
+    case Kind::module_method: return {Kind::object_field_method,base.base,displacement,base.offset};
     case Kind::absolute_slot: return {Kind::absolute_method,base.base,displacement};
     case Kind::getter_result: return {Kind::returned_method,base.base,displacement,base.producer};
     default: return {};
@@ -60,6 +80,8 @@ PointerValue operand(const Instruction& ins,const ZydisDecodedOperand& op,const 
         if (it!=state.locals.end()) return it->second;
     }
     auto value=address ? plus(base,displacement) : load(base,displacement);
+    if (!address && state.stored.base!=ZYDIS_REGISTER_NONE && op.mem.base==state.stored.base &&
+        displacement==state.stored.displacement && !ins.relocated_displacement) value=state.stored.value;
     if (value.kind==Kind::argument && (state.overwritten_arguments & (1u<<value.base))) return {};
     return value;
 }
@@ -92,6 +114,7 @@ void execute(const Instruction& ins,State& state,CallSources* report,bool cdecl)
     }
     if (op==ZYDIS_MNEMONIC_POP && dst.type==ZYDIS_OPERAND_TYPE_REGISTER && dst.reg.value!=ZYDIS_REGISTER_ESP) {
         const auto r=index(dst.reg.value);
+        if (r>=0 && r==index(state.stored.base)) state.stored={};
         if (r>=0) state.regs[r]=dst.size==32?state.top:PointerValue{};
         sp=plus(sp,ins.decoded.operand_width/8);
         state.top=dst.size==32?state.second:PointerValue{};
@@ -115,6 +138,7 @@ void execute(const Instruction& ins,State& state,CallSources* report,bool cdecl)
             const auto intact=frame==PointerValue{Kind::stack,0u-4} ? (~state.overwritten_arguments & 7u) : 0u;
             report->calls.push_back({ins.address,target,state.top,state.second,state.third,direct.has_value(),
                                      ins.address+ins.decoded.length,intact});
+            if (sp.kind==Kind::stack) if (const auto arg=state.locals.find(sp.base+12);arg!=state.locals.end()) report->calls.back().fourth_argument=arg->second;
         }
         if (report && !direct && state.nonzero.kind==Kind::module_slot)
             report->nonzero_cells.emplace(ins.address,state.nonzero.base);
@@ -129,12 +153,15 @@ void execute(const Instruction& ins,State& state,CallSources* report,bool cdecl)
         const Word name = state.top.kind == Kind::relocated ? state.top.base : UINT32_MAX;
         if (target.kind == Kind::argument_method && target.base == 0)
             state.regs[0] = {Kind::getter_result,target.offset,name,ins.address};
+        else if (target.kind==Kind::object_field_method && target.offset==0x74 && state.top.kind==Kind::constant)
+            state.regs[0]={Kind::callback_result,target.base,state.top.base,ins.address};
         else if (target.kind==Kind::module_method && target.offset==0x6c && name!=UINT32_MAX)
             state.regs[0]={Kind::cached_lookup,target.base,name,ins.address};
         else if ((target.kind == Kind::module_method || target.kind == Kind::returned_method) && target.offset == 0 && name != UINT32_MAX)
             state.regs[0] = {Kind::method_result,ins.address};
         state.top = state.second = state.third = {};
         state.locals.clear();
+        state.stored={};
         if (!cdecl) sp={};
         return;
     }
@@ -154,14 +181,22 @@ void execute(const Instruction& ins,State& state,CallSources* report,bool cdecl)
                 report->getter_stores.push_back({ins.address,addr.base,UINT32_MAX,UINT32_MAX});
             if (report && addr.kind==Kind::relocated && result.kind==Kind::cached_lookup && dst.size==32)
                 report->getter_stores.push_back({ins.address,addr.base,0x6c,result.offset,result.base});
+            if (report && addr.kind==Kind::relocated && result.kind==Kind::argument && dst.size==32)
+                report->argument_stores.push_back({ins.address,addr.base,result.base});
             if (report && addr.kind==Kind::relocated && result.kind==Kind::method_result)
                 report->allocation_stores.push_back({ins.address,addr.base,result.base});
+            if (report && dst.size==32 && (result.kind==Kind::relocated || result==PointerValue{Kind::argument,0}) &&
+                (addr.kind==Kind::object_address || addr.kind==Kind::module_slot ||
+                 addr.kind==Kind::argument_address || addr.kind==Kind::argument))
+                report->object_stores.push_back({ins.address,addr,result});
             if (report && result.kind == Kind::relocated && dst.size==32 && dst.mem.index==ZYDIS_REGISTER_NONE) {
                 const auto r=index(dst.mem.base);
                 if (r>=0 && state.regs[r].kind==Kind::method_result)
                     report->method_stores.push_back({state.regs[r].base,ins.address,static_cast<Word>(dst.mem.disp.value),result.base});
             }
         }
+    } else if (op==ZYDIS_MNEMONIC_MOVZX && dst.size==32 && src.size==8) {
+        result={Kind::unsigned_byte};
     } else if ((op == ZYDIS_MNEMONIC_ADD || op == ZYDIS_MNEMONIC_SUB) && src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
         auto amount=static_cast<Word>(src.imm.value.u);
         result=plus(operand(ins,dst,state),op == ZYDIS_MNEMONIC_ADD ? amount : -amount);
@@ -170,6 +205,18 @@ void execute(const Instruction& ins,State& state,CallSources* report,bool cdecl)
         const auto& item=ins.operands[i];
         if (item.type==ZYDIS_OPERAND_TYPE_MEMORY && (item.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE)) {
             const auto location=operand(ins,item,state,true);
+            // A literal callback can be read back through the same unmodified
+            // base register. Keep it over disjoint writes to that object.
+            // Unknown writers and calls invalidate it. PUSH uses the outgoing stack.
+            const Word disp=static_cast<Word>(item.mem.disp.value);
+            if (item.mem.base!=state.stored.base || item.mem.index!=ZYDIS_REGISTER_NONE ||
+                ins.relocated_displacement || (item.mem.segment!=ZYDIS_REGISTER_DS && item.mem.segment!=ZYDIS_REGISTER_SS) ||
+                !item.size || disp-state.stored.displacement<4 || state.stored.displacement-disp<(item.size+7u)/8) state.stored={};
+            if (i==0 && op==ZYDIS_MNEMONIC_MOV && item.size==32 && result.kind==Kind::relocated &&
+                !ins.relocated_displacement && index(item.mem.base)>=0 && item.mem.base!=ZYDIS_REGISTER_ESP &&
+                item.mem.base!=ZYDIS_REGISTER_EBP && (location.kind==Kind::argument || location.kind==Kind::argument_address ||
+                location.kind==Kind::module_slot || location.kind==Kind::object_address))
+                state.stored={item.mem.base,disp,result};
             if (location.kind==Kind::stack) {
                 if (location==sp) state.top=result;
                 if (location==plus(sp,4)) state.second=result;
@@ -183,6 +230,7 @@ void execute(const Instruction& ins,State& state,CallSources* report,bool cdecl)
         if (item.type != ZYDIS_OPERAND_TYPE_REGISTER || !(item.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE)) continue;
         const auto r=index(item.reg.value);
         if (r<0) continue;
+        if (r==index(state.stored.base)) state.stored={};
         if (item.reg.value==ZYDIS_REGISTER_ESP) state.top=state.second=state.third={};
         state.regs[r] = i==0 && item.size==32 && !(item.actions & ZYDIS_OPERAND_ACTION_CONDWRITE) ? result : PointerValue{};
     }
@@ -209,15 +257,8 @@ CallSources trace_call_sources(const Function& fn,const std::map<Word,Word>& rel
     std::deque<Word> work;
     State entry{};
     entry.regs[ZYDIS_REGISTER_ESP-ZYDIS_REGISTER_EAX]={Kind::stack};
-    std::map<Word,std::vector<State>> predecessors;
-    bool recording_edges=false;
     auto visit=[&](Word pc,const State& state) {
         if (!fn.instructions.contains(pc)) return;
-        if (recording_edges) {
-            const auto it=predecessors.find(pc);
-            if (it!=predecessors.end() && it->second.size()<=16) it->second.push_back(state);
-            return;
-        }
         auto [it,added]=states.try_emplace(pc,state);
         bool changed=added;
         if (!added) {
@@ -226,6 +267,10 @@ CallSources trace_call_sources(const Function& fn,const std::map<Word,Word>& rel
             changed |= merge(it->second.second,state.second);
             changed |= merge(it->second.third,state.third);
             changed |= merge(it->second.nonzero,state.nonzero);
+            if (it->second.stored.base!=ZYDIS_REGISTER_NONE && it->second.stored!=state.stored) {
+                it->second.stored={};
+                changed=true;
+            }
             changed |= std::erase_if(it->second.locals,[&](const auto& item) {
                 const auto next=state.locals.find(item.first);
                 return next==state.locals.end() || next->second!=item.second;
@@ -238,7 +283,7 @@ CallSources trace_call_sources(const Function& fn,const std::map<Word,Word>& rel
     };
     visit(fn.entry,entry);
     for (const auto pc:fn.alternate_entries) visit(pc,State{});
-    auto block=[&](Word start,State state,CallSources* report) {
+    auto block=[&](Word start,State state,CallSources* report,const auto& edge) {
         auto it=fn.instructions.find(start);
         PointerValue tested;
         while (it!=fn.instructions.end()) {
@@ -260,10 +305,10 @@ CallSources trace_call_sources(const Function& fn,const std::map<Word,Word>& rel
                 if (!report) {
                     if (const auto target=ins.target()) {
                         if (ins.decoded.mnemonic==ZYDIS_MNEMONIC_JNZ && tested.kind==Kind::module_slot) {
-                            auto taken=state; taken.nonzero=tested; visit(*target,taken);
-                        } else visit(*target,state);
+                            auto taken=state; taken.nonzero=tested; edge(*target,taken);
+                        } else edge(*target,state);
                     }
-                    for (auto target:ins.jump_targets) visit(target,state);
+                    for (auto target:ins.jump_targets) edge(target,state);
                 }
                 if (cat==ZYDIS_CATEGORY_UNCOND_BR) break;
                 if (ins.decoded.mnemonic==ZYDIS_MNEMONIC_JZ && tested.kind==Kind::module_slot) state.nonzero=tested;
@@ -273,7 +318,7 @@ CallSources trace_call_sources(const Function& fn,const std::map<Word,Word>& rel
                 rhs.type==ZYDIS_OPERAND_TYPE_REGISTER && lhs.reg.value==rhs.reg.value ? operand(ins,lhs,state) : PointerValue{};
             if (cat==ZYDIS_CATEGORY_RET || it==fn.instructions.end() || it->first!=next) break;
             if (leaders.contains(next)) {
-                if (!report) visit(next,state);
+                if (!report) edge(next,state);
                 break;
             }
         }
@@ -281,36 +326,67 @@ CallSources trace_call_sources(const Function& fn,const std::map<Word,Word>& rel
     while (!work.empty()) {
         const auto start=work.front();
         work.pop_front();
-        block(start,states.at(start),nullptr);
+        block(start,states.at(start),nullptr,visit);
     }
     CallSources report;
+    std::map<Word,std::vector<Word>> unknown;
     for (const auto& [start,state]:states) {
         const auto first=report.calls.size();
-        block(start,state,&report);
-        if (std::ranges::any_of(std::span(report.calls).subspan(first),[](const auto& c){return !c.direct && c.target.kind==Kind::unknown;}))
-            predecessors.try_emplace(start);
+        block(start,state,&report,visit);
+        for (const auto& c:std::span(report.calls).subspan(first))
+            if (!c.direct && (c.target.kind==Kind::unknown ||
+                ((c.target.kind==Kind::argument_method || c.target.kind==Kind::module_method) &&
+                 !report.object_stores.empty()))) unknown[start].push_back(c.site);
     }
-    if (!predecessors.empty()) {
-        // Revisit a join separately along every incoming edge. A different method
-        // selected on each branch can still have a complete, finite target set.
-        recording_edges=true;
-        visit(fn.entry,entry);
-        for (auto pc:fn.alternate_entries) visit(pc,State{});
-        for (const auto& [start,state]:states) block(start,state,nullptr);
-        for (const auto& [start,inputs]:predecessors) {
-            if (inputs.size()<2 || inputs.size()>16) continue;
-            for (const auto& in:inputs) {
-                CallSources path;
-                block(start,in,&path);
-                for (const auto& c:path.calls) if (!c.direct) {
-                    auto& values=report.alternatives[c.site];
-                    if (std::ranges::find(values,c.target)==values.end()) values.push_back(c.target);
-                }
+    if (unknown.empty()) return report;
+    std::map<Word,std::set<Word>> parents;
+    for (const auto& [start,state]:states) block(start,state,nullptr,[&](Word pc,const State&){parents[pc].insert(start);});
+    // A common CALL can be preceded by another join that selects its table.
+    // Replay both levels with the original edge states. On a loop the outer
+    // edge starts from its fixed-point state, which includes all iterations.
+    const auto inputs=[&](Word pc,bool expand) {
+        constexpr unsigned limit=16;
+        std::vector<State> result;
+        const auto collect=[&](Word dst,const State& s){if (dst==pc && result.size()<=limit) result.push_back(s);};
+        const auto incoming=[&](Word target,const auto& accept) {
+            if (target==fn.entry) accept(entry);
+            if (std::ranges::find(fn.alternate_entries,target)!=fn.alternate_entries.end()) accept(State{});
+            for (Word from:parents[target]) block(from,states.at(from),nullptr,[&](Word dst,const State& s){
+                if (dst==target) accept(s);
+            });
+        };
+        if (!expand) incoming(pc,[&](const State& s){collect(pc,s);});
+        else {
+            if (pc==fn.entry) collect(pc,entry);
+            if (std::ranges::find(fn.alternate_entries,pc)!=fn.alternate_entries.end()) collect(pc,State{});
+            for (Word from:parents[pc]) {
+                if (result.size()>limit) break;
+                incoming(from,[&](const State& s){if (result.size()<=limit) block(from,s,nullptr,collect);});
             }
         }
-        std::erase_if(report.alternatives,[](const auto& item) {
-            return item.second.empty() || std::ranges::any_of(item.second,[](auto v){return v.kind==Kind::unknown;});
-        });
+        if (result.size()>limit) result.clear();
+        return result;
+    };
+    for (const auto& [start,sites]:unknown) for (bool expand:{false,true}) {
+        const auto paths=inputs(start,expand);
+        if (paths.size()<2) continue;
+        std::map<Word,std::vector<PointerValue>> choices;
+        std::map<Word,std::vector<std::array<PointerValue,3>>> arguments;
+        for (const auto& in:paths) {
+            CallSources path;
+            block(start,in,&path,visit);
+            for (const auto& c:path.calls) if (!c.direct) {
+                auto& values=choices[c.site];
+                if (std::ranges::find(values,c.target)==values.end()) values.push_back(c.target);
+                arguments[c.site].push_back({c.first_argument,c.second_argument,c.third_argument});
+            }
+        }
+        for (Word site:sites) {
+            const auto& values=choices.at(site);
+            if (std::ranges::none_of(values,[](auto v){return v.kind==Kind::unknown;}) && report.alternatives.try_emplace(site,values).second)
+                report.alternative_arguments.try_emplace(site,arguments.at(site));
+        }
+        if (std::ranges::all_of(sites,[&](Word site){return report.alternatives.contains(site);})) break;
     }
     return report;
 }
@@ -319,12 +395,17 @@ std::string_view source_name(PointerSource source) {
     case Kind::unknown: return "unknown";
     case Kind::stack: return "stack";
     case Kind::argument: return "argument";
+    case Kind::argument_address: return "argument-address";
     case Kind::constant: return "constant";
+    case Kind::unsigned_byte: return "unsigned-byte";
     case Kind::relocated: return "module-address";
     case Kind::absolute_slot: return "absolute-slot";
     case Kind::module_slot: return "module-slot";
+    case Kind::object_address: return "object-address";
     case Kind::argument_method: return "argument-method";
     case Kind::module_method: return "module-method";
+    case Kind::object_field_method: return "object-field-method";
+    case Kind::callback_result: return "callback-lookup-result";
     case Kind::absolute_method: return "absolute-method";
     case Kind::getter_result: return "getter-result";
     case Kind::returned_method: return "returned-method";

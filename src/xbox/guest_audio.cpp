@@ -1,5 +1,6 @@
 #include "guest_audio.h"
 #include "audio_effects.h"
+#include "disc.h"
 #include "file.h"
 #include "platform_bindings.h"
 
@@ -133,7 +134,30 @@ Word GuestAudio::call_guest(Cpu& cpu, Word address, std::span<const Word> argume
     return result;
 }
 
-Word GuestAudio::load_effects(Cpu& cpu, Word image, Word size, Word locations, Word output) {
+void GuestAudio::prepare_disc_effects(Disc& disc) {
+    // Use the title's decryptor and the same loader as a DirectSound download.
+    // These two images are the environmental effects on the supported disc.
+    for (const auto path : {"STREAM\\DSP\\bidon.bin", "STREAM\\DSP\\simple.bin"}) {
+        const auto entry = disc.lookup(path);
+        if (!entry || entry->directory || entry->size > 1024 * 1024) continue;
+        constexpr Word stack_size = 0x10000;
+        const auto workspace = allocate(stack_size + entry->size);
+        if (!workspace) throw std::runtime_error("Could not reserve memory for audio effects preparation");
+        try {
+            const auto data = workspace + stack_size;
+            disc.read(*entry, 0, {static_cast<std::byte*>(memory_.access(data, entry->size)), entry->size});
+            Cpu cpu;
+            cpu.registers[esp] = data - 16;
+            load_effects(cpu, data, entry->size, 0, 0, true);
+        } catch (...) {
+            release(workspace);
+            throw;
+        }
+        release(workspace);
+    }
+}
+
+Word GuestAudio::load_effects(Cpu& cpu, Word image, Word size, Word locations, Word output, bool prepare) {
     // The original SDK reads the image header at 0x800 and locates the map after its code and state.
     constexpr Word payload = 0x818, map_size = 32, scratch_base = 0xC000;
     if (!image || size < payload + 8 || size > 1024 * 1024) return invalid_argument;
@@ -192,9 +216,27 @@ Word GuestAudio::load_effects(Cpu& cpu, Word image, Word size, Word locations, W
         // Its DMA descriptors use DSP scratch addresses, independently of the guest pointers above.
         const auto kernel = Bytes(static_cast<const std::byte*>(memory_.access(0x000EA6F0,0x5cc)),0x5cc);
         const auto decoded = Bytes(static_cast<const std::byte*>(memory_.access(base,map_offset)),static_cast<std::size_t>(map_offset));
-        auto effects = std::make_unique<AudioEffects>(kernel,decoded,scratch_base+scratch);
+        const auto scratch_size = scratch_base + scratch;
+        const auto match = std::ranges::find_if(prepared_effects_, [&](const PreparedEffect& effect) {
+            return effect.scratch_size == scratch_size && std::ranges::equal(effect.kernel, kernel)
+                && std::ranges::equal(effect.image, decoded);
+        });
+        if (prepare) {
+            if (match == prepared_effects_.end()) {
+                auto effects = std::make_shared<AudioEffects>(kernel, decoded, scratch_size);
+                effects->save_initial_state();
+                startup_effect_blocks_ += effects->compiled_blocks();
+                prepared_effects_.push_back({{kernel.begin(), kernel.end()}, {decoded.begin(), decoded.end()},
+                                             scratch_size, std::move(effects)});
+            }
+            release(base);
+            return 0;
+        }
+        const bool prepared = match != prepared_effects_.end();
+        auto effects = prepared ? match->processor : std::make_shared<AudioEffects>(kernel, decoded, scratch_size);
         if (output) memory_.store(output, descriptor);
-        audio_->install_effects(std::move(effects));
+        audio_->install_effects(std::move(effects), prepared);
+        prepared_installs_ += prepared;
     } catch (...) {
         release(base);
         throw;

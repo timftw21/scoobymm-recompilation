@@ -531,8 +531,16 @@ void Audio::mix_bins(std::span<float> output,unsigned frame_count) {
         for(auto& sample:output.subspan(bin*frame_count,frame_count)) sample=std::clamp(sample*gain,-1.0f,1.0f);
     }
 }
-void Audio::install_effects(std::unique_ptr<AudioEffects> image) {
+std::uint64_t Audio::gameplay_effect_blocks() {
     StreamLock lock(stream_);
+    return prior_effect_blocks_ + (effects_ ? effects_->compiled_blocks() - initial_effect_blocks_ : 0);
+}
+
+void Audio::install_effects(std::shared_ptr<AudioEffects> image, bool prepared) {
+    StreamLock lock(stream_);
+    if (effects_) prior_effect_blocks_ += effects_->compiled_blocks() - initial_effect_blocks_;
+    initial_effect_blocks_ = prepared ? image->compiled_blocks() : 0;
+    if (prepared) image->restore_initial_state();
     effects_.swap(image);
     effect_offset_ = 0;
     effect_output_.fill(0);

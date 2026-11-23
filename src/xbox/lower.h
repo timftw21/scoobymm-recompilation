@@ -18,6 +18,10 @@ struct Instruction {
     std::vector<std::pair<std::uint32_t,std::uint32_t>> caller_targets;
     std::vector<std::uint32_t> jump_targets;
     std::vector<std::uint32_t> external_jump_targets;
+    // Evidence-bound destinations of an indirect CALL or JMP, sorted.
+    std::vector<std::uint32_t> allowed_targets;
+    bool reject_transfer{}; // No original value can reach this indirect transfer.
+    bool address_taken_bound{}; // Any XBE routine whose address the image contains, or a module routine.
     bool cross_function_branch{};
     bool missing_target{};
     bool missing_fallthrough{};

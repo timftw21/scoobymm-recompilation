@@ -220,6 +220,7 @@ public:
         }
         if (!storage_.empty()) open_storage();
         initialize_exports();
+        if (window && disc) audio_.prepare_disc_effects(*disc);
         if (window && diagnostics) {
             diagnostics_ = std::make_unique<PlayDiagnostics>(*diagnostics, *window,
                 [this](const std::filesystem::path& dir) { capture_state(dir); },
@@ -304,6 +305,65 @@ public:
         report(output, status, reason, boot_thread);
         if (unfinished || graphics_.capture_pending()) return 3;
         return status == "returned" || status == "breakpoint" || status == "closed" || status == "frame_limit" ? 0 : status == "budget" ? 4 : 3;
+    }
+
+    std::vector<VertexProgram> material_programs() {
+        // XAPI startup initializes the CRT heap before calling game main. The
+        // offline builder needs the heap and SDK assembler, but no disc or GPU.
+        std::ostringstream startup;
+        if (run(startup) || stop_address_ != game_main)
+            throw std::runtime_error("Could not initialize the shader assembler: " + startup.str());
+        auto cpu = threads_.front().cpu;
+        cpu.preempt = nullptr;
+        cpu.diagnostic = nullptr;
+        const Word stack = (cpu.registers[esp] - 128) & ~15U;
+        const auto call = [&](Word target, Word argument) {
+            cpu.registers[esp] = stack;
+            memory_.store(stack, return_address);
+            memory_.store(stack + 4, argument);
+            invoke_native(cpu, memory_, target);
+            if (cpu.eip != return_address || cpu.registers[esp] != stack + 4)
+                throw NativeBoundary(target, "Unexpected shader builder return");
+            return cpu.registers[eax];
+        };
+        // Default RenderWare allocation and formatting callbacks installed by
+        // 0xA869B and 0xB1F20. All three targets are in the verified executable.
+        memory_.store<Word>(0x01F4E790, 0x000BD62E);
+        memory_.store<Word>(0x01F4E794, 0x000BD72D);
+        memory_.store<Word>(0x01F4E750, 0x000BAC05);
+        std::vector<VertexProgram> programs;
+        // The SDK selects these three built-in transforms at 0x118771–0x11878F.
+        for (const auto [address, slots] : {std::pair{0x00121A00U,12U}, {0x00121AC0U,11U}, {0x00121B70U,12U}}) {
+            VertexProgram program;
+            std::memcpy(program.tokens.data(), memory_.access(address, slots * 16), slots * 16);
+            programs.push_back(normalize_vertex_program(program));
+        }
+        // 0xB8689 stores the skin weight count. The draw at 0xB912A supplies
+        // the two light counts and the high material flag. Bake common lighting
+        // combinations; the general bytecode handles other uploads.
+        for (Word weights = 1; weights <= 4; ++weights) {
+            for (Word directional = 0; directional <= 1; ++directional) {
+                for (Word point = 0; point <= 3; ++point) {
+                    for (Word material_flag : {0U, 0x80000000U}) {
+                        const Word key = weights | (directional << 8) | (point << 16) | material_flag;
+                        memory_.store(stack + 16, key);
+                        const Word address = call(0x000B7720, stack + 16);
+                        VertexProgram program;
+                        const auto count = memory_.load<std::uint16_t>(address + 2);
+                        if (!count || count > program.tokens.size())
+                            throw NativeBoundary(address, "Invalid assembled material " + hex32(key));
+                        std::memcpy(program.tokens.data(), memory_.access(address + 4, count * 16), count * 16);
+                        if (!(program.tokens[count-1][3] & 1))
+                            throw NativeBoundary(address, "Unterminated material program " + hex32(key));
+                        programs.push_back(normalize_vertex_program(program));
+                        call(0x000BD72D, address);
+                    }
+                }
+            }
+        }
+        std::ranges::sort(programs);
+        programs.erase(std::unique(programs.begin(), programs.end()), programs.end());
+        return programs;
     }
 
 private:
@@ -1032,12 +1092,55 @@ NativeFunction OfflineBoot::resolve_module(Cpu& cpu, Word caller) {
                 auto rule=std::ranges::lower_bound(rules,offset,{},&LogicAbiCall::site);
                 if (rule!=rules.end() && rule->site==offset) {
                     const auto matches=[&](const LogicAbiCall& r) {
-                        if (r.source==logic_unreachable) return false;
-                        if (r.source==logic_local_function) return address-source->base==r.target;
+                        if (r.source==logic_unreachable || r.source==logic_unreferenced || r.source==logic_unset_field) return false;
+                        if (r.source==logic_local_function || r.source==logic_field_function || r.source==logic_installed_callback)
+                            return address-source->base==r.target;
+                        const auto loaded_routine=[&](std::span<const LogicProvider> list) {
+                            const auto* provider=instance_at(address);
+                            if (!provider || memory_.load<Word>(provider->owner+text_field)!=provider->base) return false;
+                            return std::ranges::any_of(list,[&](const LogicProvider& p) {
+                                return p.object->functions.data()==provider->module->functions.data() && address-provider->base==p.offset;
+                            });
+                        };
+                        if (r.source==logic_descriptor_callback) return loaded_routine(compiled_descriptor_callbacks);
+                        if (r.source==logic_registered_callback)
+                            return r.table<compiled_registered_callbacks.size() && loaded_routine(compiled_registered_callbacks[r.table]);
+                        if (r.source==logic_saved_interface)
+                            return memory_.load<Word>(logic_engine_api+r.slot)==address && address==r.target;
+                        if (r.source==logic_entry_contract) {
+                            // The caller's frame holds its return PC and the unmodified
+                            // argument. That original call must pass a verified interface.
+                            const Word frame=cpu.registers[ebp], ret=memory_.load<Word>(frame+4);
+                            const auto* parent=instance_at(ret-1);
+                            if (!parent || memory_.load<Word>(parent->owner+text_field)!=parent->base) return false;
+                            const auto key=std::pair{ret-parent->base,r.slot};
+                            const auto position=[](const LogicPassedInterface& a){return std::pair{a.return_site,a.argument};};
+                            const auto passed=std::ranges::lower_bound(parent->arguments,key,{},position);
+                            if (passed==parent->arguments.end() || position(*passed)!=key) return false;
+                            const auto& api=*passed->definition;
+                            const auto index=r.method/4;
+                            return memory_.load<Word>(parent->base+passed->cell)==api.table &&
+                                   memory_.load<Word>(frame+8+r.slot*4)==api.table &&
+                                   memory_.load<Word>(logic_engine_api+api.slot)==api.getter &&
+                                   index<api.methods.size() && api.methods[index] && address==api.methods[index] &&
+                                   (!r.target || address==r.target) && memory_.load<Word>(api.table+r.method)==address;
+                        }
+                        if (r.source==logic_indexed_local) {
+                            const Word table=source->base+r.table;
+                            return cpu.registers[r.method]==r.slot && address-source->base==r.target &&
+                                memory_.load<Word>(source->base+r.getter)==table && memory_.load<Word>(table+4*r.slot)==address;
+                        }
                         if (r.source==logic_passed_argument) {
                             // The original EBP frame still contains the return PC
                             // and this unmodified argument. Look up its producer.
                             const Word frame=cpu.registers[ebp];
+                            const auto input=[&]{return memory_.load<Word>(frame+8+r.slot*4);};
+                            // The function reads this field from the original
+                            // argument. Its particle-table target is known even
+                            // when the calling object's return PC is unavailable.
+                            if (r.table && input()==r.table &&
+                                (memory_.load<Word>(logic_engine_api+logic_particle_interface_slot)!=r.getter ||
+                                 address!=r.target || memory_.load<Word>(r.table+r.method)!=address)) return false;
                             const Word ret=memory_.load<Word>(frame+4);
                             const auto* parent=instance_at(ret-1);
                             if (!parent) return true;
@@ -1048,7 +1151,7 @@ NativeFunction OfflineBoot::resolve_module(Cpu& cpu, Word caller) {
                             const auto& api=*passed->definition;
                             if (memory_.load<Word>(parent->owner+text_field)!=parent->base ||
                                 memory_.load<Word>(parent->base+passed->cell)!=api.table ||
-                                memory_.load<Word>(frame+8+r.slot*4)!=api.table ||
+                                input()!=api.table ||
                                 memory_.load<Word>(logic_engine_api+api.slot)!=api.getter) return false;
                             const auto index=r.method/4;
                             if (index>=api.methods.size() || !api.methods[index]) return true;
@@ -2049,6 +2152,7 @@ void OfflineBoot::report(std::ostream& output, std::string_view status, std::str
     std::ostringstream out;
     const auto& cpu = *last_cpu_;
     const auto graphics = graphics_.stats();
+    const auto render = graphics_.render_stats();
     const bool main_reached = diagnostic_.reached_watch || (status == "breakpoint" && stop_address_ == game_main);
     out << "{\"format\":\"scoobymm-offline-boot-v1\",\"sha256\":" << json(image_.sha256)
         << ",\"entry\":" << json(hex32(image_.entry)) << ",\"status\":" << json(status)
@@ -2078,6 +2182,9 @@ void OfflineBoot::report(std::ostream& output, std::string_view status, std::str
         << ",\"mixed_frames\":" << audio_.frames() << ",\"play_calls\":" << audio_.plays()
         << ",\"stream_packets\":" << audio_.stream_packets() << ",\"stream_completions\":" << audio_.stream_completions()
         << ",\"effects_loaded\":" << audio_.effect_count()
+        << ",\"startup_effect_blocks\":" << audio_.startup_effect_blocks()
+        << ",\"gameplay_effect_blocks\":" << audio_.gameplay_effect_blocks()
+        << ",\"prepared_effect_installs\":" << audio_.prepared_effect_installs()
         << ",\"offline_peak\":" << audio_.peak()
         << ",\"offline_peak_since_effect_load\":" << audio_.peak_since_effect_load();
     if (const auto peak = audio_.peak_since_capture()) out << ",\"offline_peak_since_capture\":" << *peak;
@@ -2087,6 +2194,7 @@ void OfflineBoot::report(std::ostream& output, std::string_view status, std::str
             << ",\"header\":" << json(hex_bytes(std::span(block->header).first(block->channels * 4))) << '}';
     }
     out << "},\"graphics\":{\"initialized\":" << (graphics_.ready() ? "true" : "false")
+        << ",\"shader_compilations\":" << render.shader_compilations << ",\"general_vertex_programs\":" << render.general_programs
         << ",\"submissions\":" << graphics.submissions << ",\"draws\":" << graphics.draws
         << ",\"flips\":" << graphics.flips << ",\"clears\":" << graphics.clears
         << ",\"blits\":" << graphics.blits << ",\"overlay_frames\":" << graphics_.overlay_frames()
@@ -2149,6 +2257,12 @@ void OfflineBoot::report(std::ostream& output, std::string_view status, std::str
 }
 }
 
+std::vector<VertexProgram> material_shader_programs(const std::filesystem::path& executable) {
+    Xbe image(executable);
+    OfflineBoot boot(image, nullptr, 1000000, game_main, false, {}, 1, {});
+    return boot.material_programs();
+}
+
 std::uint32_t xbox_language(std::string_view code) {
     // The XGetLanguage switch at 0x11480 indexes the title's EN/DE/FR strings.
     if (code == "en") return 1;
@@ -2157,7 +2271,6 @@ std::uint32_t xbox_language(std::string_view code) {
     throw std::invalid_argument("Supported languages are en, fr and de");
 }
 int play_game(PlayOptions& options, std::ostream& report) {
-    use_shader_cache(options.shader_cache);
     PlayWindow window(options);
     if (options.launcher && !window.launcher()) {
         report << "{\"status\":\"closed\"}\n";

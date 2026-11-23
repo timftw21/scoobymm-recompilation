@@ -9,12 +9,17 @@
 #include <optional>
 
 namespace xbox_native {
+class Disc;
 enum class PlatformApi : std::uint32_t;
 
 class GuestAudio {
 public:
     GuestAudio(Memory& memory, GuestAllocator allocator, bool output)
         : memory_(memory), allocator_(allocator), output_(output) {}
+    void prepare_disc_effects(Disc& disc);
+    std::uint64_t gameplay_effect_blocks() const { return audio_ ? audio_->gameplay_effect_blocks() : 0; }
+    std::uint64_t prepared_effect_installs() const { return prepared_installs_; }
+    std::uint64_t startup_effect_blocks() const { return startup_effect_blocks_; }
     bool invoke(PlatformApi api, Cpu& cpu, std::uint64_t checkpoints);
     void output_gain(float gain) {
         if (output_gain_ == gain) return;
@@ -54,6 +59,13 @@ private:
         bool flushing{};
     };
 
+    struct PreparedEffect {
+        std::vector<std::byte> kernel, image;
+        std::size_t scratch_size;
+        std::shared_ptr<AudioEffects> processor;
+    };
+    std::vector<PreparedEffect> prepared_effects_;
+    std::uint64_t prepared_installs_{}, startup_effect_blocks_{};
     Memory& memory_;
     GuestAllocator allocator_;
     bool output_;
@@ -77,7 +89,7 @@ private:
     void tick(std::uint64_t checkpoints);
     std::uint32_t call_guest(Cpu& cpu, std::uint32_t address, std::span<const std::uint32_t> arguments);
     std::uint32_t load_effects(Cpu& cpu, std::uint32_t image, std::uint32_t size,
-                               std::uint32_t locations, std::uint32_t output);
+                               std::uint32_t locations, std::uint32_t output, bool prepare = false);
     void complete_packet(Cpu& cpu, std::uint32_t callback, std::uint32_t context, const Packet& packet, std::uint32_t status);
     void service_streams(Cpu& cpu, bool work = false);
     void finish(Cpu& cpu, unsigned count, std::optional<std::uint32_t> result = {});

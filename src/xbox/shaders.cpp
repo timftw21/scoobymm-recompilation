@@ -1,4 +1,5 @@
 #include "shaders.h"
+#include "gui_shaders.h"
 #include <d3dcommon.h>
 #include <Windows.h>
 #include <format>
@@ -146,8 +147,10 @@ float4 main(P p):SV_Target {
 }
 ID3DBlob* shader_blob(ShaderKind kind) {return new ShaderBlob(shader_binary(kind).bytes);}
 const char* shader_profile(ShaderKind kind) {
+    if(kind==ShaderKind::gui_vertex) return "vs_4_0";
+    if(kind==ShaderKind::gui_pixel) return "ps_4_0";
     if(kind==ShaderKind::launch) return "cs_5_0";
-    if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::video_overlay || kind==ShaderKind::gui_pixel ||
+    if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::video_overlay ||
        (kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8) ||
        (kind>=ShaderKind::color && kind<=ShaderKind::modulate3d)) return "ps_5_0";
     return "vs_5_0";
@@ -167,6 +170,10 @@ std::string shader_source(ShaderKind kind) {
         return std::format("#define COMBINER_COUNT {}\n",unsigned(kind)-unsigned(ShaderKind::combiner0))+std::string(combiner_source);
     if(kind>=ShaderKind::fixed0 && kind<=ShaderKind::fixed6) return fixed_transform_source(unsigned(kind)-unsigned(ShaderKind::fixed0));
     switch(kind) {
+    case ShaderKind::gui_vertex: return std::string(gui_vertex_source);
+    case ShaderKind::gui_pixel: return std::string(gui_pixel_source);
+    case ShaderKind::vertex: return token_transform_source(false);
+    case ShaderKind::launch: return token_transform_source(true);
     case ShaderKind::passthrough:return R"(
 struct V {float4 p:POSITION;float4 c:COLOR0;float4 s:COLOR1;
  float4 t0:TEXCOORD0;float4 t1:TEXCOORD1;float4 t2:TEXCOORD2;float4 t3:TEXCOORD3;float fog:TEXCOORD4;};

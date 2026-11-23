@@ -27,7 +27,7 @@ struct DiagnosticOptions {
 };
 
 struct PlayOptions : PlayerSettings {
-    std::filesystem::path shader_cache, capture, storage;
+    std::filesystem::path capture, storage;
     std::string settings_error;
     std::uint32_t capture_index = 1, frames = 0;
     std::uint32_t language = 1;

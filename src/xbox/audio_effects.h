@@ -12,6 +12,9 @@ public:
     ~AudioEffects();
     std::span<std::uint32_t, 1024> mix_bins();
     void process();
+    void save_initial_state();
+    void restore_initial_state();
+    std::uint64_t compiled_blocks() const;
 private:
     struct Processor;
     std::unique_ptr<Processor> processor_;

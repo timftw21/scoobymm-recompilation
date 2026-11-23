@@ -21,19 +21,24 @@ Dsp56300MemoryRegion buffer(Word start, Word end, Word* data, Word offset = 0) {
     region.data.buffer = {data,offset};
     return region;
 }
-}
 
-struct AudioEffects::Processor {
+struct EffectMemory {
     std::array<Word,4096> x{}, program{};
     std::array<Word,2048> y{};
     std::vector<std::byte> scratch;
-    std::unique_ptr<Dsp56300Jit,decltype(&dsp56300_destroy)> core{nullptr,dsp56300_destroy};
     Word interrupts{}, next = dma_end, start = dma_end, control{}, configuration{}, status_reads{};
     int cycle_credit = 500000;
+};
+}
+
+struct AudioEffects::Processor : EffectMemory {
+    std::unique_ptr<Dsp56300Jit,decltype(&dsp56300_destroy)> core{nullptr,dsp56300_destroy};
+    std::unique_ptr<EffectMemory> initial_memory;
+    Dsp56300State initial_state{};
     const char* fault = nullptr;
 
-    Processor(std::span<const std::byte> kernel, std::span<const std::byte> image, std::size_t scratch_size)
-        : scratch(scratch_size) {
+    Processor(std::span<const std::byte> kernel, std::span<const std::byte> image, std::size_t scratch_size) {
+        scratch.resize(scratch_size);
         if (kernel.size() != 0x5cc || image.size() > scratch.size())
             throw std::runtime_error("Invalid Xbox global processor image");
         std::memcpy(program.data(),kernel.data(),kernel.size());
@@ -158,6 +163,29 @@ AudioEffects::AudioEffects(std::span<const std::byte> kernel,std::span<const std
     process(); // Load the effect code and state before the audio callback sees the image.
 }
 AudioEffects::~AudioEffects() = default;
+
+void AudioEffects::save_initial_state() {
+    auto& p = *processor_;
+    p.initial_memory = std::make_unique<EffectMemory>(p);
+    dsp56300_get_state(p.core.get(), &p.initial_state);
+}
+
+void AudioEffects::restore_initial_state() {
+    auto& p = *processor_;
+    if (!p.initial_memory) return;
+    // Compiled blocks reference this processor's RAM. Keep its addresses stable
+    // and invalidate translations if the sound program changed its code.
+    if (p.program != p.initial_memory->program) dsp56300_invalidate_cache(p.core.get());
+    static_cast<EffectMemory&>(p) = *p.initial_memory;
+    p.fault = nullptr;
+    dsp56300_set_state(p.core.get(), &p.initial_state);
+}
+
+std::uint64_t AudioEffects::compiled_blocks() const {
+    Dsp56300JitStats stats{};
+    dsp56300_get_jit_stats(processor_->core.get(), &stats);
+    return stats.compiles;
+}
 
 std::span<std::uint32_t,1024> AudioEffects::mix_bins() { return std::span(processor_->x).subspan<0xc00,1024>(); }
 void AudioEffects::process() {

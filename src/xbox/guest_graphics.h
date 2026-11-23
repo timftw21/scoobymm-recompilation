@@ -19,6 +19,7 @@ public:
     bool captured() const { return captured_; }
     bool capture_pending() const { return !capture_.empty() && !captured_; }
     void diagnostics(PlayDiagnostics* value) { diagnostics_ = value; }
+    RenderStats render_stats() const { return renderer_ ? renderer_->stats() : RenderStats{}; }
     GpuStats stats() const { return gpu_ ? gpu_->stats() : GpuStats{}; }
     void advance_display(std::uint64_t now);
     void name_widget(std::uint32_t handle,std::uint32_t name);

@@ -135,12 +135,15 @@ if(XBOX_GENERATED_SOURCE)
         URL_HASH SHA256=F7BF6BC76E5D79D40D751096663E6C5D18DAF08129DD52E7F7B09E4251C8EEEE
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
     FetchContent_MakeAvailable(imgui)
+    include(cmake/imgui-shaders.cmake)
     add_library(scoobymm-imgui STATIC
         "${imgui_SOURCE_DIR}/imgui.cpp" "${imgui_SOURCE_DIR}/imgui_draw.cpp"
         "${imgui_SOURCE_DIR}/imgui_tables.cpp" "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
-        "${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp" "${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp")
+        "${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp" "${CMAKE_CURRENT_BINARY_DIR}/generated/imgui_impl_dx11.cpp")
+    target_compile_features(scoobymm-imgui PRIVATE cxx_std_23)
+    target_include_directories(scoobymm-imgui PRIVATE src/xbox)
     target_include_directories(scoobymm-imgui PUBLIC "${imgui_SOURCE_DIR}" "${imgui_SOURCE_DIR}/backends")
-    target_link_libraries(scoobymm-imgui PRIVATE SDL3::SDL3 d3dcompiler)
+    target_link_libraries(scoobymm-imgui PRIVATE SDL3::SDL3)
     find_package(Git REQUIRED)
     find_program(CARGO_EXECUTABLE cargo REQUIRED)
     FetchContent_Declare(dsp56300
@@ -161,7 +164,7 @@ if(XBOX_GENERATED_SOURCE)
         src/xbox/settings.cpp src/xbox/settings_menu.cpp
         src/xbox/boot.cpp src/xbox/audio.cpp src/xbox/audio_effects.cpp src/xbox/guest_audio.cpp
         src/xbox/guest_graphics.cpp src/xbox/gpu.cpp src/xbox/render.cpp src/xbox/shaders.cpp
-        src/xbox/shader_compiler.cpp src/xbox/vertex_program.cpp src/xbox/play_window.cpp src/xbox/play_diagnostics.cpp)
+        src/xbox/vertex_program.cpp src/xbox/play_window.cpp src/xbox/play_diagnostics.cpp)
     target_compile_features(xbox-runtime PUBLIC cxx_std_23)
     add_dependencies(xbox-runtime scoobymm-dsp)
     target_include_directories(xbox-runtime PRIVATE "${dsp56300_SOURCE_DIR}/crates/emu-ffi/include")
@@ -169,19 +172,20 @@ if(XBOX_GENERATED_SOURCE)
     target_include_directories(xbox-runtime PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_compile_options(xbox-runtime PRIVATE /W4)
     set_target_properties(xbox-runtime PROPERTIES CXX_EXTENSIONS OFF)
-    target_link_libraries(xbox-runtime PRIVATE xbox-media xbox-recompiled SDL3::SDL3 scoobymm-imgui d3d11 dxgi d3dcompiler windowscodecs ole32 advapi32 comdlg32)
+    target_link_libraries(xbox-runtime PRIVATE xbox-media xbox-recompiled SDL3::SDL3 scoobymm-imgui d3d11 dxgi windowscodecs ole32 advapi32 comdlg32)
     target_compile_definitions(native-recompiler PRIVATE XBOX_OFFLINE_BOOT=1)
-    target_sources(native-recompiler PRIVATE src/xbox/stream_check.cpp)
-    target_link_libraries(native-recompiler PRIVATE xbox-runtime)
+    target_sources(native-recompiler PRIVATE src/xbox/stream_check.cpp src/xbox/shader_compiler.cpp)
+    target_link_libraries(native-recompiler PRIVATE xbox-runtime d3dcompiler)
     enable_language(RC)
+    set(XBOX_EXECUTABLE "${CMAKE_CURRENT_SOURCE_DIR}/data/local/default.xbe" CACHE FILEPATH "Verified Xbox executable for material shader generation")
     set(shader_bank "${CMAKE_CURRENT_BINARY_DIR}/generated/scoobymm-shaders.bin")
     add_custom_command(OUTPUT "${shader_bank}"
-        COMMAND native-recompiler bake-shaders "${shader_bank}" "${CMAKE_CURRENT_BINARY_DIR}/shader-cache"
-        DEPENDS native-recompiler
-        COMMENT "Compiling built-in HLSL shaders"
+        COMMAND native-recompiler bake-shaders "${shader_bank}" "${CMAKE_CURRENT_BINARY_DIR}/shader-cache" "${XBOX_EXECUTABLE}"
+        DEPENDS native-recompiler "${XBOX_EXECUTABLE}"
+        COMMENT "Compiling renderer and Xbox material shaders"
         VERBATIM)
     add_custom_target(scoobymm-shaders DEPENDS "${shader_bank}")
-    add_executable(scoobymm src/play.cpp resources/scoobymm.rc)
+    add_executable(scoobymm src/play.cpp src/xbox/shader_bank.cpp resources/scoobymm.rc)
     add_dependencies(scoobymm scoobymm-shaders)
     set_source_files_properties(resources/scoobymm.rc PROPERTIES
         OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/scoobymm.ico;${shader_bank}")

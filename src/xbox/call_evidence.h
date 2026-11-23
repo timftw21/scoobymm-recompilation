@@ -13,7 +13,9 @@ class InterfaceCells {
 public:
     InterfaceCells(const std::set<Word>& words,const std::map<Word,Word>& relocations,const std::set<Word>& data_references);
     void instruction(Word function,const Instruction&);
+    void output_argument(const Instruction&);
     bool unchanged(Word slot) const;
+    bool writers_within(std::uint32_t slot,const std::set<std::uint32_t>& sites) const;
     std::map<Word,Word> verified_getters(const std::set<Word>& interface_functions,const std::map<Word,CallSources>&,
                                         std::map<Word,std::string_view>& missing) const;
 private:
@@ -35,12 +37,15 @@ public:
     void add_registered_cells(std::string_view hash,std::map<std::uint32_t,CallSources>&) const;
     std::optional<LogicAbiCall> named_call(const CallSource&,std::string_view name) const;
     std::string provider_tables() const;
+    // Named-method indices whose provider list contains this object routine.
+    std::map<std::uint32_t,std::vector<std::uint32_t>> provided_methods(std::string_view symbol) const;
     std::set<std::uint32_t> interface_tables(std::ostream& generated) const;
     static std::map<std::uint32_t,std::string_view> cache_names(Bytes,const std::map<std::uint32_t,CallSources>&,
                                                                const std::map<std::uint32_t,std::uint32_t>& getters);
     static std::set<std::uint32_t> interface_functions(const std::set<std::uint32_t>& exports,
             const std::set<std::uint32_t>& address_taken, const std::map<std::uint32_t,CallSources>&);
-    static std::map<std::uint32_t,std::uint32_t> table_arguments(const std::set<std::uint32_t>& externally_callable,
+    using Parameter=std::pair<std::uint32_t,std::uint32_t>; // Function entry and zero-based parameter.
+    static std::map<Parameter,std::uint32_t> table_arguments(const std::set<std::uint32_t>& externally_callable,
             const std::map<std::uint32_t,std::uint32_t>& cells,const std::map<std::uint32_t,CallSources>&);
     void module(std::string_view hash, std::span<const std::byte> text,
                 const std::set<std::uint32_t>& functions, const std::set<std::uint32_t>& entry_points,
@@ -58,4 +63,16 @@ private:
     std::map<std::string,std::map<std::pair<std::uint32_t,std::uint32_t>,std::uint32_t>,std::less<>> registrations_;
     std::ofstream bindings_, providers_;
 };
+
+// Follow a single original load of an object's base. Record every store
+// through it. Losing a copy or passing the base out of the routine leaves
+// the write set open. Values loaded from fields are separate from their base.
+struct ObjectAccess { std::uint32_t pc, offset, bytes; };
+struct ObjectUses {
+    std::vector<ObjectAccess> reads, writes;
+    std::vector<std::pair<std::uint32_t,std::uint32_t>> pushes;
+    std::set<std::pair<ZydisRegister,std::uint32_t>> returns;
+};
+bool object_accesses(const Function&,std::uint32_t load,ObjectUses&);
+bool object_accesses_after(const Function&,std::uint32_t pc,ZydisRegister,std::uint32_t offset,ObjectUses&);
 }

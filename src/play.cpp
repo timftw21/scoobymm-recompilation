@@ -40,7 +40,7 @@ void usage() {
                  "  --refresh-rate HZ    Rendering cap, or 0 for unlimited\n"
                  "  --refresh-at-scanout N HZ   Change the cap at a repeatable benchmark boundary\n"
                  "  --widescreen         Use the Xbox widescreen display setting\n"
-                 "  --shader-cache DIR   Cached native shaders\n"
+                 "  --shader-cache DIR   Accepted for compatibility. Player shaders are embedded.\n"
                  "  --storage DIR        Playtest save directory (default data/user)\n"
                  "  --language en|fr|de   Xbox game language\n"
                  "  --report JSON        New session report\n"
@@ -76,7 +76,6 @@ int wmain(int argc, wchar_t* argv[]) {
             options.xbe = root / "data/local/default.xbe";
             options.disc = root / "Scooby-Doo! Mystery Mayhem/Scooby-Doo! Mystery Mayhem (USA, Europe) (En,Fr,De).xiso.iso";
         }
-        options.shader_cache = root / "build/shader-cache";
         options.storage = root / "data/user";
         bool set_fullscreen = false, set_mute = false, set_no_vsync = false, set_wide = false;
         std::optional<int> refresh;
@@ -124,7 +123,7 @@ int wmain(int argc, wchar_t* argv[]) {
             }
             else if (option == L"--hidden") options.hidden = true;
             else if (option == L"--frames") options.frames = nonzero();
-            else if (option == L"--shader-cache") options.shader_cache = argument();
+            else if (option == L"--shader-cache") (void)argument();
             else if (option == L"--storage") options.storage = argument();
             else if (option == L"--language") options.language = xbox_native::xbox_language(std::filesystem::path(argument()).string());
             else if (option == L"--report") report_path = argument();

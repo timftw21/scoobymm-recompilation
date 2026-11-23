@@ -66,8 +66,9 @@ std::string ilu_operation(unsigned opcode) {
 }
 }
 namespace {
-std::string draw_source(const std::string& body) {
+std::string draw_source(const std::string& body, std::string_view declarations = {}) {
     std::string source(helpers);
+    source += declarations;
     source+=R"(
 cbuffer Program:register(b1) { float4 k[192]; float4 viewport; float4 fog_params; float4 uv_scales[4]; uint4 input_formats[4];
  uint4 fixed_flags;uint4 fixed_texgen[4];uint4 fixed_matrices; float horizontal_scale, horizontal_offset; };
@@ -119,6 +120,74 @@ void validate_fixed_transform(const FixedTransform& state) {
             throw std::runtime_error("Invalid NV097 texgen component");
     }
 }
+std::string token_transform_source(bool launch) {
+    // The title can assemble new instruction sequences from live lighting and
+    // skinning state. The general shader accepts the upload as constant data.
+    std::string declarations = R"(
+cbuffer Microcode : register(b2) { uint4 tokens[136]; };
+float4 swizzle_source(float4 v, uint sw, uint negative) {
+    // Swizzles are bit selections. A floating-point dot with a lane mask
+    // would turn an unselected infinity into NaN through zero times infinity.
+    uint4 bits = asuint(v);
+    uint4 value = uint4(bits[(sw >> 6)&3],bits[(sw >> 4)&3],bits[(sw >> 2)&3],bits[sw&3]);
+    return asfloat(value ^ (negative << 31));
+}
+float4 merge_lanes(float4 old, float4 value, uint mask) {
+    return float4((mask&8)?value.x:old.x, (mask&4)?value.y:old.y,
+                  (mask&2)?value.z:old.z, (mask&1)?value.w:old.w);
+}
+)";
+    const std::string setup = R"(
+float4 r[13], o[13];
+[unroll] for (uint j=0; j<13; ++j) { r[j]=0; o[j]=float4(0,0,0,1); }
+int a0=0;
+[loop] for (uint pc=0; pc<136; ++pc) {
+    uint4 t=tokens[pc];
+    uint mac=(t.y>>21)&15, ilu=(t.y>>25)&7, attr=(t.y>>9)&15;
+    int ci=int((t.y>>13)&255) + ((t.w&2) ? a0 : 0);
+    float4 constantValue=ci>=0 && ci<192 ? k[ci] : 0;
+    r[12]=o[0];
+    uint at=(t.z>>26)&3, bt=(t.z>>11)&3, ct=(t.w>>28)&3;
+    float4 a=swizzle_source(at==1?r[min(t.z>>28,12u)]:at==2?v[attr]:constantValue,t.y,(t.y>>8)&1);
+    float4 b=swizzle_source(bt==1?r[min((t.z>>13)&15,12u)]:bt==2?v[attr]:constantValue,t.z>>17,(t.z>>25)&1);
+    float4 c=swizzle_source(ct==1?r[min(((t.z&3)<<2)|(t.w>>30),12u)]:ct==2?v[attr]:constantValue,t.z>>2,(t.z>>10)&1);
+    float4 m=0,s=0;
+    switch (mac) {
+)";
+    std::string body=setup;
+    for (unsigned op=1; op<=13; ++op) body+=std::format("case {}: m={}; break;\n",op,mac_operation(op));
+    body+="}\nswitch (ilu) {\n";
+    for (unsigned op=1; op<=7; ++op) body+=std::format("case {}: s={}; break;\n",op,ilu_operation(op));
+    body+=R"(
+    }
+    uint temp=(t.w>>20)&15, mm=(t.w>>24)&15, im=(t.w>>16)&15, om=(t.w>>12)&15;
+    if (mac==13) a0=int(m.x);
+    else if (mac && mm && !(ilu && temp==1)) {
+        if (temp==12) o[0]=merge_lanes(o[0],m,mm);
+        else r[temp]=merge_lanes(r[temp],m,mm);
+    }
+    if (ilu && im) {
+        uint dest=mac?1:temp;
+        if (dest==12) o[0]=merge_lanes(o[0],s,im);
+        else r[dest]=merge_lanes(r[dest],s,im);
+    }
+    if (om && ((t.w&4)?ilu:mac)) {
+        uint dest=(t.w>>3)&255;
+        float4 value=(t.w&4)?s:m;
+        if (t.w&2048) o[dest]=merge_lanes(o[dest],value,om);
+)";
+    if (launch) body+="else k[dest]=merge_lanes(k[dest],value,om);\n";
+    body+="}\nif (t.w&1) break;\n}\n";
+    if (!launch) return draw_source(body,declarations);
+    return std::string(helpers)+declarations+R"(
+RWStructuredBuffer<float4> k:register(u0);
+StructuredBuffer<float4> inputs:register(t0);
+[numthreads(1,1,1)] void main() {
+    float4 v[16];
+    [unroll] for(uint i=0;i<16;++i) v[i]=inputs[i];
+)"+body+"}\n";
+}
+
 std::string fixed_transform_source(std::uint32_t skin) {
     if(skin>6) throw std::runtime_error("Reserved NV097 skin mode");
     const auto matrix=[](std::string_view vector,unsigned row) {
@@ -239,29 +308,67 @@ VertexProgram normalize_vertex_program(const VertexProgram& program) {
     }
     throw std::runtime_error("NV2A vertex program has no final instruction within 136 slots");
 }
-VertexTranslation translate_vertex_program(const VertexProgram& program,bool launch) {
-    if(program.start>=program.tokens.size()) throw std::runtime_error("NV2A vertex start exceeds 136 slots");
+VertexTranslation validate_vertex_program(const VertexProgram& program, bool launch) {
+    if (program.start >= program.tokens.size()) throw std::runtime_error("NV2A vertex start exceeds 136 slots");
     VertexTranslation result;
+    for (unsigned slot=program.start; slot<program.tokens.size(); ++slot) {
+        const auto& t = program.tokens[slot];
+        const auto mac=bits(t[1],21,4), ilu=bits(t[1],25,3), constant=bits(t[1],13,8);
+        const auto fail = [&](std::string_view reason) {
+            throw std::runtime_error(std::format("NV2A vertex slot {}: {}",slot,reason));
+        };
+        const auto source = [&](unsigned type, unsigned index) {
+            if (!type || (type==1 && index>12) || (type==3 && !(t[3]&2) && constant>=192))
+                fail("invalid source register");
+        };
+        if (mac>13) fail("invalid MAC operation");
+        if (mac) source(bits(t[2],26,2),bits(t[2],28,4));
+        if (mac>=2 && mac!=3 && mac!=13) source(bits(t[2],11,2),bits(t[2],13,4));
+        if (mac==3 || mac==4 || ilu) source(bits(t[3],28,2),bits(t[2],0,2)*4+bits(t[3],30,2));
+        const auto temporary=bits(t[3],20,4), mm=bits(t[3],24,4), im=bits(t[3],16,4), om=bits(t[3],12,4);
+        const bool scalar=(t[3]&4)!=0;
+        if (mac==13 && (mm || (om && !scalar))) fail("conflicting address-register outputs");
+        if ((mac && mac!=13 && mm && !(ilu && temporary==1)) || (ilu && im && !mac)) {
+            if (temporary>12) fail("invalid temporary register");
+            if (temporary==12) result.output_masks[0] |= mac ? mm : im;
+        }
+        if (om && (scalar?ilu:mac)) {
+            const auto dest=bits(t[3],3,8);
+            if (t[3]&2048) {
+                if (dest>=13 || dest==1 || dest==2) fail("invalid output register");
+                result.output_masks[dest] |= om;
+            } else {
+                if (!launch || dest>=192) fail("invalid context write");
+                result.writes_context = true;
+            }
+        }
+        ++result.instructions;
+        if (t[3]&1) {
+            if (!launch && (result.output_masks[0]&14)!=14) fail("incomplete position");
+            return result;
+        }
+    }
+    throw std::runtime_error("NV2A vertex program has no final instruction within 136 slots");
+}
+
+VertexTranslation translate_vertex_program(const VertexProgram& program,bool launch) {
+    auto result = validate_vertex_program(program, launch);
     std::string body="float4 r[12]; float4 o[13]; int a0=0;\n[unroll] for(int i=0;i<12;++i) r[i]=0;\n[unroll] for(int i=0;i<13;++i) o[i]=float4(0,0,0,1);\n";
-    bool final=false;
-    for(unsigned slot=program.start;slot<program.tokens.size();++slot) {
+    for(unsigned slot=program.start;slot<program.start+result.instructions;++slot) {
         const auto& t=program.tokens[slot];
         const auto mac=bits(t[1],21,4),ilu=bits(t[1],25,3),input=bits(t[1],9,4),constant=bits(t[1],13,8);
         const bool relative=bits(t[3],1,1)!=0;
         const auto temporary=bits(t[3],20,4),mm=bits(t[3],24,4),im=bits(t[3],16,4),om=bits(t[3],12,4);
         const auto output=bits(t[3],3,8);
         const bool output_register=bits(t[3],11,1)!=0,scalar_output=bits(t[3],2,1)!=0;
-        if(mac>13) throw std::runtime_error(std::format("NV2A slot {} has reserved MAC opcode {}",slot,mac));
         const auto source=[&](unsigned type,unsigned index,unsigned swizzle,bool negative) {
             std::string value;
             if(type==1) {
-                if(index>12) throw std::runtime_error(std::format("NV2A slot {} reads reserved R{}",slot,index));
                 value=index==12?"o[0]":std::format("r[{}]",index);
             } else if(type==2) value=std::format("v[{}]",input);
-            else if(type==3) {
-                if(!relative && constant>=192) throw std::runtime_error(std::format("NV2A slot {} reads invalid constant {}",slot,constant));
+            else {
                 value=relative?std::format("((a0+{}>=0 && a0+{}<192)?k[a0+{}]:float4(0,0,0,0))",constant,constant,constant):std::format("k[{}]",constant);
-            } else throw std::runtime_error(std::format("NV2A slot {} has an absent required input",slot));
+            }
             std::string swz;
             for(unsigned lane=0;lane<4;++lane) swz+="xyzw"[(swizzle>>(6-lane*2))&3];
             return (negative?"-":"")+std::string("(")+value+")."+swz;
@@ -270,9 +377,7 @@ VertexTranslation translate_vertex_program(const VertexProgram& program,bool lau
             if(mask) body+=destination+'.'+lanes(mask)+'='+std::string(value)+'.'+lanes(mask)+";\n";
         };
         const auto write_temp=[&](unsigned index,std::string_view value,unsigned mask) {
-            if(index>12) throw std::runtime_error(std::format("NV2A slot {} writes reserved R{}",slot,index));
             write(index==12?"o[0]":std::format("r[{}]",index),value,mask);
-            if(index==12) result.output_masks[0]|=mask;
         };
         body+=std::format("{{ // NV2A slot {}\n",slot);
         if(mac) body+="float4 a="+source(bits(t[2],26,2),bits(t[2],28,4),bits(t[1],0,8),bits(t[1],8,1)!=0)+";\n";
@@ -284,29 +389,22 @@ VertexTranslation translate_vertex_program(const VertexProgram& program,bool lau
         if(mac) body+="float4 m="+mac_operation(mac)+";\n";
         if(ilu) body+="float4 s="+ilu_operation(ilu)+";\n";
         if(mac==13) {
-            if(mm || (om && !scalar_output)) throw std::runtime_error(std::format("NV2A slot {} has conflicting ARL outputs",slot));
             body+="a0=int(m.x);\n";
         } else if(mac && mm && !(ilu && temporary==1)) write_temp(temporary,"m",mm);
         if(ilu && im) write_temp(mac?1:temporary,"s",im);
         if(om && (scalar_output?ilu:mac)) {
             if(output_register) {
-                if(output>=13 || output==1 || output==2) throw std::runtime_error(std::format("NV2A slot {} writes reserved output {}",slot,output));
-                write(std::format("o[{}]",output),scalar_output?"s":"m",om); result.output_masks[output]|=om;
+                write(std::format("o[{}]",output),scalar_output?"s":"m",om);
             } else {
-                if(output>=192) throw std::runtime_error(std::format("NV2A slot {} writes invalid constant {}",slot,output));
-                result.writes_context=true; write(std::format("k[{}]",output),scalar_output?"s":"m",om);
+                write(std::format("k[{}]",output),scalar_output?"s":"m",om);
             }
         }
-        body+="}\n"; ++result.instructions;
-        if(t[3]&1) {final=true;break;}
+        body+="}\n";
     }
-    if(!final) throw std::runtime_error("NV2A vertex program has no final instruction within 136 slots");
-    if(result.writes_context && !launch) throw std::runtime_error("A context-writing program requires the transform launch path");
     result.source=std::string(helpers);
     if(launch) {
         result.source+="RWStructuredBuffer<float4> k:register(u0); StructuredBuffer<float4> inputs:register(t0);\n[numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) { float4 v[16]; [unroll] for(int i=0;i<16;++i) v[i]=inputs[i];\n"+body+"}\n";
     } else {
-        if((result.output_masks[0]&14)!=14) throw std::runtime_error("NV2A vertex program does not write complete position XYZ");
         result.source=draw_source(body);
     }
     return result;

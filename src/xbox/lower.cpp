@@ -32,6 +32,20 @@ ZydisDecodedOperand register_operand(ZydisRegister value) {
 }
 std::string constant(std::uint32_t value) { return std::format("0x{:08X}U", value); }
 std::string label(std::uint32_t address) { return std::format("i_{:08X}", address); }
+// Reject a destination outside an evidence-bound set at the originating instruction.
+std::string allowed_check(const Instruction& instruction, std::string_view at) {
+    if (instruction.reject_transfer)
+        return std::format("    throw xbox_native::NativeBoundary({}, \"indirect transfer has no original destination\");\n", at);
+    if (instruction.address_taken_bound)
+        return std::format("    if (!xbox_native::address_taken_target(target)) throw xbox_native::NativeBoundary({}, "
+                           "std::format(\"indirect transfer to 0x{{:08X}}, which the image never names\", target));\n", at);
+    if (instruction.allowed_targets.empty()) return {};
+    std::string list;
+    for (const auto target : instruction.allowed_targets) list += constant(target) + ",";
+    return std::format("    {{ static constexpr std::uint32_t allowed[]{{{}}};\n"
+                       "      if (!std::ranges::binary_search(allowed, target)) throw xbox_native::NativeBoundary({}, "
+                       "std::format(\"indirect transfer to 0x{{:08X}} outside its evidence-bound targets\", target)); }}\n", list, at);
+}
 std::string jump_stack(std::uint32_t address) { return std::format("setjmp_esp_{:08X}", address); }
 std::string type(unsigned bits) {
     if (bits != 8 && bits != 16 && bits != 32) throw std::runtime_error("Unsupported operand width");
@@ -660,7 +674,8 @@ public:
             }
             else {
                 calls=restores=returns=true;
-                body << "    const auto target=" << read(operands[0]) << ";\n    commit();\n"
+                body << "    const auto target=" << read(operands[0]) << ";\n" << allowed_check(instruction, pc(instruction.address))
+                     << "    commit();\n"
                     << "    cpu.eip = " << pc(instruction.address) << ";\n"
                     << "    xbox_native::invoke_native(cpu,memory,target);\n    restore();\n    goto done;\n";
             }
@@ -714,7 +729,7 @@ public:
             }
             calls = restores = true;
             const bool indirect=!instruction.target() && !instruction.kernel_ordinal;
-            if(indirect) body << "    const auto target=" << read(operands[0]) << ";\n";
+            if(indirect) body << "    const auto target=" << read(operands[0]) << ";\n" << allowed_check(instruction, pc(instruction.address));
             if (!instruction.caller_targets.empty()) {
                 body<<"    std::uint32_t callback = 0;\n    switch (guest_caller) {\n";
                 for (const auto [caller,destination]:instruction.caller_targets)

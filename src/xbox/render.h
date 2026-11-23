@@ -88,15 +88,9 @@ struct VertexAttribute {
 };
 using VertexLayout=std::array<VertexAttribute,16>;
 struct VertexStream { Bytes bytes;std::uint32_t stride; };
-inline unsigned vertex_attribute_alignment(std::uint32_t format) {
-    const auto type = format & 15;
-    if (type == 2) return 4;
-    if (type == 1 || type == 5 || format == 0x16) return 2;
-    return 1;
-}
 
 struct RenderStats {
-    std::uint64_t draws = 0, vertices = 0, shader_compilations = 0, vertex_bytes = 0;
+    std::uint64_t draws = 0, vertices = 0, shader_compilations = 0, general_programs = 0, vertex_bytes = 0;
     double gpu_ms = 0;
     bool gpu_timing_valid = false;
 };

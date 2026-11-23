@@ -73,7 +73,8 @@ public:
     void frequency(std::uint32_t,std::uint32_t hz);
     void route(std::uint32_t,std::uint32_t destination);
     void spatial(std::uint32_t,const SpatialResult&);
-    void install_effects(std::unique_ptr<AudioEffects>);
+    void install_effects(std::shared_ptr<AudioEffects>, bool prepared);
+    std::uint64_t gameplay_effect_blocks();
     void mix(std::span<float> stereo);
     std::uint64_t sample_clock() const {return frames_processed_.load(std::memory_order_relaxed);}
     float output_peak() const {return output_peak_.load(std::memory_order_relaxed);}
@@ -131,7 +132,8 @@ private:
 
 
     SDL_AudioStream* stream_=nullptr;
-    std::unique_ptr<AudioEffects> effects_;
+    std::shared_ptr<AudioEffects> effects_;
+    std::uint64_t prior_effect_blocks_{}, initial_effect_blocks_{};
     std::array<float,64> effect_output_{};
     unsigned effect_offset_{};
     std::array<Voice,256> voices_{};

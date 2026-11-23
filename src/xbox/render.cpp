@@ -323,14 +323,15 @@ struct Renderer::Impl {
         const Pipeline* pipeline{};
         ID3D11InputLayout* layout{};
         ID3D11VertexShader* vertex{};
+        ID3D11Buffer* tokens{};
         ID3D11PixelShader* pixel{};
         D3D11_PRIMITIVE_TOPOLOGY topology{};
         std::array<ID3D11ShaderResourceView*,12> textures{};
         UINT stencil_reference{};
     } bound;
     struct Program {
-        VertexProgram key;
         bool launch;
+        ComPtr<ID3D11Buffer> tokens;
         ComPtr<ID3D11VertexShader> vertex;
         ComPtr<ID3D11ComputeShader> compute;
         ComPtr<ID3D11InputLayout> layout;
@@ -339,11 +340,15 @@ struct Renderer::Impl {
         FixedTransform fixed_key{};
     };
     std::vector<Program> programs;
+    std::array<std::map<VertexProgram,std::uint32_t>,2> program_ids;
+    ComPtr<ID3D11VertexShader> token_vertex;
+    ComPtr<ID3D11ComputeShader> token_launch;
+    ComPtr<ID3D11InputLayout> token_layout;
     struct StreamLayout {
         std::uint32_t program;
         VertexLayout attributes;
         ComPtr<ID3D11InputLayout> native;
-        std::array<unsigned,16> required{}, fetched{}, alignment{}, input_formats{};
+        std::array<unsigned,16> required{}, fetched{}, input_formats{};
         unsigned stream_count{};
     };
     std::vector<StreamLayout> stream_layouts;
@@ -429,6 +434,10 @@ struct Renderer::Impl {
         std::array<D3D11_INPUT_ELEMENT_DESC,16> program_inputs{};
         for(unsigned i=0;i<program_inputs.size();++i)
             program_inputs[i]={"TEXCOORD",i,DXGI_FORMAT_R32G32B32A32_FLOAT,0,i*16,D3D11_INPUT_PER_VERTEX_DATA,0};
+        const auto token_code = shader(ShaderKind::vertex), launch_code = shader(ShaderKind::launch);
+        checked(device->CreateVertexShader(token_code.data(),token_code.size(),nullptr,&token_vertex),"General vertex transform");
+        checked(device->CreateComputeShader(launch_code.data(),launch_code.size(),nullptr,&token_launch),"General transform launch");
+        checked(device->CreateInputLayout(program_inputs.data(),16,token_code.data(),token_code.size(),&token_layout),"General transform layout");
         for(unsigned i=0;i<fixed_vertices.size();++i) {
             const auto fixed=shader(ShaderKind(unsigned(ShaderKind::fixed0)+i));fixed_signatures[i]=fixed;
             checked(device->CreateVertexShader(fixed.data(),fixed.size(),nullptr,&fixed_vertices[i]),"Fixed transform shader");
@@ -553,7 +562,7 @@ struct Renderer::Impl {
 };
 Renderer::Renderer(std::uint32_t width, std::uint32_t height, bool warp, bool debug)
     : impl_(std::make_unique<Impl>(width, height, warp, debug)) {
-    for(const auto& shader:static_vertex_shaders()) prepare_program(shader.program,shader.launch);
+    for(const auto& shader:static_vertex_shaders()) prepare_program(shader.program);
 }
 Renderer::~Renderer() = default;
 void Renderer::resize(std::uint32_t width, std::uint32_t height) { impl_->resize(width,height); }
@@ -994,15 +1003,26 @@ std::uint32_t Renderer::prepare_program(const VertexProgram& program,bool launch
     auto& r=*impl_;
     if(r.recording) throw std::runtime_error("Prepare vertex programs before frame submission");
     const auto key=normalize_vertex_program(program);
-    for(std::size_t i=0;i<r.programs.size();++i)
-        if(!r.programs[i].fixed && r.programs[i].launch==launch && r.programs[i].key==key) return static_cast<std::uint32_t>(i+1);
+    auto& ids = r.program_ids[launch];
+    const auto slot = ids.lower_bound(key);
+    if (slot != ids.end() && slot->first == key) return slot->second;
     if(r.programs.size()>=1024) throw std::runtime_error("Vertex program cache limit reached");
-    const auto code=r.shader(launch?ShaderKind::launch:ShaderKind::vertex,&key);
+    const auto binary=shader_binary(launch?ShaderKind::launch:ShaderKind::vertex,&key);
+    r.stats.shader_compilations += binary.compiled;
+    const auto code=binary.bytes;
     Impl::Program prepared{};
-    prepared.key = key;
     prepared.launch = launch;
+    if (binary.uses_tokens) {
+        ++r.stats.general_programs;
+        validate_vertex_program(key, launch);
+        D3D11_BUFFER_DESC desc{};
+        desc.ByteWidth=sizeof(key.tokens); desc.Usage=D3D11_USAGE_IMMUTABLE; desc.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+        const D3D11_SUBRESOURCE_DATA initial{key.tokens.data(),0,0};
+        checked(r.device->CreateBuffer(&desc,&initial,&prepared.tokens),"NV2A transform instructions");
+    }
     if(launch) {
-        checked(r.device->CreateComputeShader(code.data(),code.size(),nullptr,&prepared.compute),"Transform launch shader");
+        if (binary.uses_tokens) prepared.compute=r.token_launch;
+        else checked(r.device->CreateComputeShader(code.data(),code.size(),nullptr,&prepared.compute),"Transform launch shader");
         if(!r.launch_constants) {
             D3D11_BUFFER_DESC description{};
             description.ByteWidth=sizeof(VertexConstants); description.StructureByteStride=sizeof(Float4);
@@ -1022,6 +1042,8 @@ std::uint32_t Renderer::prepare_program(const VertexProgram& program,bool launch
             description.Usage=D3D11_USAGE_STAGING; description.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
             checked(r.device->CreateBuffer(&description,nullptr,&r.launch_readback),"Transform launch readback");
         }
+    } else if (binary.uses_tokens) {
+        prepared.vertex=r.token_vertex; prepared.layout=r.token_layout; prepared.signature=code;
     } else {
         prepared.signature=code;
         checked(r.device->CreateVertexShader(code.data(),code.size(),nullptr,&prepared.vertex),"Translated vertex shader");
@@ -1031,7 +1053,9 @@ std::uint32_t Renderer::prepare_program(const VertexProgram& program,bool launch
         checked(r.device->CreateInputLayout(inputs.data(),static_cast<UINT>(inputs.size()),code.data(),code.size(),&prepared.layout),"Program vertex layout");
     }
     r.programs.push_back(std::move(prepared));
-    return static_cast<std::uint32_t>(r.programs.size());
+    const auto id = static_cast<std::uint32_t>(r.programs.size());
+    ids.emplace_hint(slot, key, id);
+    return id;
 }
 std::uint32_t Renderer::prepare_fixed(const FixedTransform& transform) {
     auto& r=*impl_;
@@ -1064,7 +1088,6 @@ std::uint32_t Renderer::prepare_layout(std::uint32_t program,const VertexLayout&
         if (slot < 16) {
             layout.required[slot] = std::max(layout.required[slot],attribute.offset+format.bytes);
             layout.fetched[slot] = std::max(layout.fetched[slot],attribute.offset+format.fetched);
-            layout.alignment[slot] = std::max(layout.alignment[slot],vertex_attribute_alignment(attribute.format));
             layout.input_formats[i] = attribute.format;
             layout.stream_count = std::max(layout.stream_count,slot+1);
         }
@@ -1095,6 +1118,8 @@ void Renderer::launch_program(std::uint32_t program,VertexConstants& constants,c
     auto output=r.launch_output.Get(); auto inputs=r.launch_input.Get();
     r.context->CSSetUnorderedAccessViews(0,1,&output,nullptr);
     r.context->CSSetShaderResources(0,1,&inputs);
+    auto tokens=r.programs[program-1].tokens.Get();
+    r.context->CSSetConstantBuffers(2,1,&tokens);
     r.context->CSSetShader(r.programs[program-1].compute.Get(),nullptr,0);
     r.context->Dispatch(1,1,1);
     ID3D11UnorderedAccessView* no_output=nullptr; ID3D11ShaderResourceView* no_input=nullptr;
@@ -1309,9 +1334,10 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
             if(source.stride>2048 || (source.stride && required[i]>source.stride) ||
                 source.bytes.size()<(vertex_count-1)*source.stride+required[i]) throw std::runtime_error("Vertex stream stride or storage is too small");
             total=(total+15)&~std::size_t(15);stream_offsets[i+1]=static_cast<UINT>(total);
-            const auto alignment = layout.alignment[i];
             const auto stride = std::max(source.stride, fetched[i]);
-            stream_strides[i+1] = source.stride ? (stride + alignment - 1) & ~(alignment - 1) : 0;
+            // Each native vertex starts on a DWORD boundary, including when
+            // a packed Xbox record is split across multiple input slots.
+            stream_strides[i+1] = source.stride ? (stride + 3U) & ~3U : 0;
             total+=source.stride?vertex_count*stream_strides[i+1]:fetched[i];
         }
         if(total>std::size_t(max_vertices)*sizeof(ProgramVertex)) throw std::runtime_error("Native vertex streams exceed upload storage");
@@ -1366,6 +1392,8 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         r.context->VSSetConstantBuffers(1,1,&program_buffer);
         r.context->PSSetConstantBuffers(0,1,&factor_buffer);
     }
+    auto tokens=program?program->tokens.Get():nullptr;
+    if (std::exchange(bound.tokens,tokens)!=tokens) r.context->VSSetConstantBuffers(2,1,&tokens);
     if (std::exchange(bound.layout,layout)!=layout) r.context->IASetInputLayout(layout);
     if (std::exchange(bound.topology,topology)!=topology) r.context->IASetPrimitiveTopology(topology);
     if (std::exchange(bound.vertex,vertex)!=vertex) r.context->VSSetShader(vertex,nullptr,0);

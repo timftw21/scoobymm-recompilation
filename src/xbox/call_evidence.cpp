@@ -2,6 +2,7 @@
 #include "file.h"
 
 #include <algorithm>
+#include <tuple>
 #include <sstream>
 
 namespace xbox_native {
@@ -55,8 +56,18 @@ void InterfaceCells::instruction(Word function,const Instruction& ins) {
 }
 
 bool InterfaceCells::unchanged(Word slot) const {
-    return words_.contains(slot) && !escaped_.contains(slot) && !writers_.contains(slot) &&
-        std::ranges::none_of(unchecked_,[&](const auto& ref){return ref.second==slot;});
+    return writers_within(slot,{});
+}
+
+void InterfaceCells::output_argument(const Instruction& push) {
+    unchecked_.erase(push.address+push.decoded.raw.imm[0].offset);
+}
+
+bool InterfaceCells::writers_within(Word slot,const std::set<Word>& sites) const {
+    if (!words_.contains(slot) || escaped_.contains(slot) ||
+        std::ranges::any_of(unchecked_,[&](const auto& ref){return ref.second==slot;})) return false;
+    const auto writers=writers_.find(slot);
+    return writers==writers_.end() || std::ranges::all_of(writers->second,[&](auto writer){return sites.contains(writer.second);});
 }
 
 std::map<Word,Word> InterfaceCells::verified_getters(const std::set<Word>& interface_functions,
@@ -258,6 +269,13 @@ std::set<Word> CallEvidence::interface_tables(std::ostream& generated) const {
     return slots;
 }
 
+std::map<Word,std::vector<Word>> CallEvidence::provided_methods(std::string_view symbol) const {
+    std::map<Word,std::vector<Word>> result;
+    for (const auto& [key,method]:names_) for (const auto& [object,offset]:method.providers)
+        if (object==symbol) result[offset].push_back(method.index);
+    return result;
+}
+
 std::string CallEvidence::provider_tables() const {
     std::ostringstream code;
     std::vector<std::string> entries(names_.size());
@@ -378,33 +396,37 @@ void CallEvidence::module(std::string_view hash,Bytes text,const std::set<Word>&
     }
 }
 
-std::map<Word,Word> CallEvidence::table_arguments(const std::set<Word>& externally_callable,
+std::map<CallEvidence::Parameter,Word> CallEvidence::table_arguments(const std::set<Word>& externally_callable,
         const std::map<Word,Word>& cells,const std::map<Word,CallSources>& sources) {
-    // A direct helper can take a cached SDK table as argument zero. Join every
-    // caller, including callers that forward their own argument through recursion.
-    std::map<Word,Word> incoming;
-    std::map<Word,std::vector<Word>> forwarded;
-    std::vector<Word> work;
-    const auto offer=[&](Word fn,Word cell) {
+    // Join each parameter independently. A caller can reorder parameters when forwarding them.
+    std::map<Parameter,Word> incoming;
+    std::map<Parameter,std::vector<Parameter>> forwarded;
+    std::vector<Parameter> work;
+    const auto offer=[&](Parameter fn,Word cell) {
         auto [it,added]=incoming.emplace(fn,cell);
         if (added) work.push_back(fn);
         else if (it->second!=cell && it->second!=UINT32_MAX) {it->second=UINT32_MAX;work.push_back(fn);}
     };
-    for (auto fn:externally_callable) offer(fn,UINT32_MAX);
     for (const auto& [fn,flow]:sources) for (const auto& call:flow.calls) if (call.direct) {
-        auto src=call.first_argument;
-        if (src==PointerValue{Kind::argument,0}) forwarded[fn].push_back(call.target.base);
-        else offer(call.target.base,src.kind==Kind::module_slot && cells.contains(src.base) ? src.base : UINT32_MAX);
+        const std::array args{call.first_argument,call.second_argument,call.third_argument};
+        for (Word i=0;i<args.size();++i) {
+            const auto src=args[i];
+            const Parameter dest{call.target.base,i};
+            if (externally_callable.contains(dest.first)) offer(dest,UINT32_MAX);
+            else if (src.kind==Kind::argument && src.base<args.size()) forwarded[{fn,src.base}].push_back(dest);
+            else offer(dest,src.kind==Kind::module_slot && cells.contains(src.base) ? src.base : UINT32_MAX);
+        }
     }
     auto propagate=[&] {
         while (!work.empty()) {
             auto fn=work.back();work.pop_back();
             const auto value=incoming.at(fn);
-            for (auto next:forwarded[fn]) offer(next,value);
+            if (auto edges=forwarded.find(fn);edges!=forwarded.end())
+                for (auto next:edges->second) offer(next,value);
         }
     };
     propagate();
-    for (const auto& [fn,flow]:sources) if (!incoming.contains(fn)) offer(fn,UINT32_MAX);
+    for (const auto& [parameter,edges]:forwarded) if (!incoming.contains(parameter)) offer(parameter,UINT32_MAX);
     propagate();
     std::erase_if(incoming,[](const auto& kv){return kv.second==UINT32_MAX;});
     return incoming;
@@ -412,5 +434,90 @@ std::map<Word,Word> CallEvidence::table_arguments(const std::set<Word>& external
 void CallEvidence::close() {
     bindings_.close();
     providers_.close();
+}
+
+bool object_accesses(const Function& fn,Word load,ObjectUses& uses) {
+    const auto& seed=fn.instructions.at(load);
+    const auto& dst=seed.operands[0];
+    if (seed.decoded.mnemonic!=ZYDIS_MNEMONIC_MOV || dst.type!=ZYDIS_OPERAND_TYPE_REGISTER || dst.size!=32) return false;
+    return object_accesses_after(fn,load+seed.decoded.length,dst.reg.value,0,uses);
+}
+
+bool object_accesses_after(const Function& fn,Word start,ZydisRegister base,Word displacement,ObjectUses& uses) {
+    using Token=std::tuple<Word,ZydisRegister,Word>;
+    std::set<Token> seen;
+    std::vector<Token> work{{start,base,displacement}};
+    const auto full=[](ZydisRegister r){return ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LEGACY_32,r);};
+    while (!work.empty()) {
+        const auto token=work.back();work.pop_back();
+        if (!seen.insert(token).second) continue;
+        const auto [pc,reg,offset]=token;
+        if (seen.size()>4096 || !fn.instructions.contains(pc)) return false;
+        const auto& ins=fn.instructions.at(pc);
+        const auto& d=ins.decoded;
+        const auto& a=ins.operands[0];
+        const auto& b=ins.operands[1];
+        const Word next=pc+d.length;
+        if (d.meta.category==ZYDIS_CATEGORY_RET) {
+            if (reg==ZYDIS_REGISTER_EAX || reg==ZYDIS_REGISTER_EDX) uses.returns.emplace(reg,offset);
+            continue;
+        }
+        if (d.meta.category==ZYDIS_CATEGORY_CALL) {
+            if (ins.call_next_instruction || (a.type==ZYDIS_OPERAND_TYPE_REGISTER && full(a.reg.value)==reg) ||
+                (a.type==ZYDIS_OPERAND_TYPE_MEMORY && (a.mem.base==reg || a.mem.index==reg))) return false;
+            if (reg!=ZYDIS_REGISTER_EAX && reg!=ZYDIS_REGISTER_ECX && reg!=ZYDIS_REGISTER_EDX)
+                work.emplace_back(next,reg,offset);
+            continue;
+        }
+        bool keep=true;
+        if ((d.mnemonic==ZYDIS_MNEMONIC_XOR || d.mnemonic==ZYDIS_MNEMONIC_SUB) &&
+            a.type==ZYDIS_OPERAND_TYPE_REGISTER && b.type==ZYDIS_OPERAND_TYPE_REGISTER &&
+            a.reg.value==reg && b.reg.value==reg && a.size==32) continue;
+        for (unsigned i=0;i<d.operand_count;++i) {
+            const auto& op=ins.operands[i];
+            if (op.type==ZYDIS_OPERAND_TYPE_MEMORY && (op.mem.base==reg || op.mem.index==reg)) {
+                if (op.mem.base!=reg || op.mem.index!=ZYDIS_REGISTER_NONE ||
+                    (op.mem.segment!=ZYDIS_REGISTER_DS && op.mem.segment!=ZYDIS_REGISTER_SS) || ins.relocated_displacement) return false;
+                const Word at=offset+static_cast<Word>(op.mem.disp.value);
+                if (d.mnemonic==ZYDIS_MNEMONIC_LEA) {
+                    if (a.type!=ZYDIS_OPERAND_TYPE_REGISTER || a.size!=32) return false;
+                    work.emplace_back(next,a.reg.value,at);
+                } else {
+                    if (!op.size || (op.size%8)) return false;
+                    const ObjectAccess access{pc,at,static_cast<Word>(op.size/8)};
+                    if (op.actions&ZYDIS_OPERAND_ACTION_MASK_READ) uses.reads.push_back(access);
+                    if (op.actions&ZYDIS_OPERAND_ACTION_MASK_WRITE) uses.writes.push_back(access);
+                }
+            }
+            if (op.type!=ZYDIS_OPERAND_TYPE_REGISTER || full(op.reg.value)!=reg) continue;
+            if (op.actions&ZYDIS_OPERAND_ACTION_MASK_READ) {
+                if (d.mnemonic==ZYDIS_MNEMONIC_PUSH && i==0 && op.size==32)
+                    uses.pushes.emplace_back(pc,offset);
+                else if (d.mnemonic==ZYDIS_MNEMONIC_MOV && i==1 && a.type==ZYDIS_OPERAND_TYPE_REGISTER && a.size==32 && op.size==32)
+                    work.emplace_back(next,a.reg.value,offset);
+                else if ((d.mnemonic==ZYDIS_MNEMONIC_ADD || d.mnemonic==ZYDIS_MNEMONIC_SUB) && !i &&
+                         op.size==32 && b.type==ZYDIS_OPERAND_TYPE_IMMEDIATE && !ins.relocated_immediate) {
+                    const Word delta=static_cast<Word>(b.imm.value.u);
+                    work.emplace_back(next,reg,d.mnemonic==ZYDIS_MNEMONIC_ADD ? offset+delta : offset-delta);
+                } else if (d.mnemonic!=ZYDIS_MNEMONIC_TEST && d.mnemonic!=ZYDIS_MNEMONIC_CMP) return false;
+            }
+            if (op.actions&ZYDIS_OPERAND_ACTION_MASK_WRITE) {
+                if (op.size!=32 || op.actions&ZYDIS_OPERAND_ACTION_CONDWRITE) return false;
+                keep=false;
+            }
+        }
+        if (!keep) continue;
+        if (ins.cross_function_branch || ins.cross_function_fallthrough || !ins.external_jump_targets.empty()) return false;
+        if (d.meta.category==ZYDIS_CATEGORY_COND_BR || d.meta.category==ZYDIS_CATEGORY_UNCOND_BR) {
+            if (const auto to=ins.target()) work.emplace_back(*to,reg,offset);
+            else {
+                if (ins.jump_targets.empty()) return false;
+                for (Word to:ins.jump_targets) work.emplace_back(to,reg,offset);
+            }
+            if (d.meta.category==ZYDIS_CATEGORY_UNCOND_BR) continue;
+        }
+        work.emplace_back(next,reg,offset);
+    }
+    return true;
 }
 }
