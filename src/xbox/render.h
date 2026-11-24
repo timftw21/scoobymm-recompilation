@@ -117,6 +117,9 @@ public:
                      std::uint32_t source_x,std::uint32_t source_y,
                      std::uint32_t destination_x,std::uint32_t destination_y,
                      std::uint32_t width,std::uint32_t height);
+    // Store linear guest pixels (R5G6B5, or B,G,R,A bytes) in a color image rectangle.
+    void write_target(std::uint32_t target,std::uint32_t x,std::uint32_t y,
+                      std::uint32_t width,std::uint32_t height,Bytes pixels,std::uint32_t pitch);
     void copy_to_main();
     void resize(std::uint32_t width, std::uint32_t height);
     void attach_window(void* native_window);

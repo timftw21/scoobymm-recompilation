@@ -794,6 +794,56 @@ void Renderer::copy_region(std::uint32_t destination,std::uint32_t source,
     r.copy_image(*output.image,*input.image,sx*s,sy*s,dx*s,dy*s,width*s,height*s);
     auto view=r.rtv.Get();r.context->OMSetRenderTargets(1,&view,r.dsv.Get());
 }
+void Renderer::write_target(std::uint32_t target,std::uint32_t x,std::uint32_t y,
+                            std::uint32_t width,std::uint32_t height,Bytes pixels,std::uint32_t pitch) {
+    auto& r=*impl_;
+    const auto found=r.targets.find(target);
+    if(r.recording || !target || found==r.targets.end())
+        throw std::runtime_error("Write guest pixels to an ended auxiliary target");
+    const auto& output=found->second;
+    const bool packed=output.color_format==SurfaceColor::rgb565;
+    const std::size_t bytes=packed?2:4;
+    if(x>output.width || y>output.height || width>output.width-x || height>output.height-y ||
+       (width && height && (pitch<width*bytes || pixels.size()<std::size_t(height-1)*pitch+width*bytes)))
+        throw std::runtime_error("Guest pixel rectangle exceeds its native image");
+    if(!width || !height) return;
+    // Each guest pixel covers a scale-by-scale block of host pixels.
+    const auto s=r.scale,columns=width*s,rows=height*s;
+    const auto row_bytes=columns*bytes;
+    std::vector<std::byte> host(row_bytes*rows);
+    for(std::uint32_t row=0;row<height;++row) {
+        const auto* source=pixels.data()+std::size_t(row)*pitch;
+        auto* line=host.data()+std::size_t(row)*s*row_bytes;
+        for(std::uint32_t column=0;column<columns;++column) {
+            const auto* texel=source+std::size_t(column/s)*bytes;
+            auto* out=line+column*bytes;
+            if(packed) {out[0]=texel[0];out[1]=texel[1];} // B5G6R5 has the R5G6B5 bit layout.
+            else {out[0]=texel[2];out[1]=texel[1];out[2]=texel[0];out[3]=texel[3];}
+        }
+        for(unsigned copy=1;copy<s;++copy) std::memcpy(line+copy*row_bytes,line,row_bytes);
+    }
+    auto& image=*output.image;
+    r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
+    if(image.samples==1) {
+        const D3D11_BOX region{x*s,y*s,0,x*s+columns,y*s+rows,1};
+        r.context->UpdateSubresource(image.color.Get(),0,&region,host.data(),static_cast<UINT>(row_bytes),0);
+    } else {
+        // Multisampled images cannot be updated directly. Load each pixel through the copy shader.
+        D3D11_TEXTURE2D_DESC upload{};
+        upload.Width=columns;upload.Height=rows;upload.MipLevels=upload.ArraySize=1;upload.Format=image.format;
+        upload.SampleDesc.Count=1;upload.Usage=D3D11_USAGE_IMMUTABLE;upload.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        const D3D11_SUBRESOURCE_DATA initial{host.data(),static_cast<UINT>(row_bytes),0};
+        ComPtr<ID3D11Texture2D> texture;ComPtr<ID3D11ShaderResourceView> view;
+        checked(r.device->CreateTexture2D(&upload,&initial,&texture),"Guest pixel upload");
+        checked(r.device->CreateShaderResourceView(texture.Get(),nullptr,&view),"Guest pixel view");
+        D3D11_TEXTURE2D_DESC whole{};image.color->GetDesc(&whole);
+        r.blit(image.target.Get(),view.Get(),{0,0,float(whole.Width),float(whole.Height),0,1},
+            {LONG(x*s),LONG(y*s),LONG(x*s+columns),LONG(y*s+rows)},
+            {-std::int32_t(x*s),-std::int32_t(y*s),1,0});
+    }
+    image.dirty=true;
+    auto view=r.rtv.Get();r.context->OMSetRenderTargets(1,&view,r.dsv.Get());
+}
 void Renderer::copy_to_main() {
     auto& r=*impl_;
     if(r.recording || !r.current_target) throw std::runtime_error("Copy an ended auxiliary target to the main image");

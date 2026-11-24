@@ -222,11 +222,18 @@ struct Gpu::Impl {
         const bool cube=(format&4)!=0;
         // Sampling a GPU-produced surface must see its current GPU contents,
         // rather than the original RAM allocation used for ordinary textures.
-        if(!cube && depth==1 && mips==1) for(const auto& [key,surface]:targets) {
+        if(!cube && depth==1 && mips==1) for(auto& [key,surface]:targets) {
             const auto surface_format=key[2],surface_color=surface_format&15,surface_type=(surface_format>>8)&15;
             const bool matching_color=surface_color==3?code==5:(code==6 || code==7 || code==0x12 || code==0x1E);
-            if(key[0]==(reg(method)&0x0FFFFFFF) && surface.width==width && surface.height==height && matching_color &&
-                ((surface_type==1)==linear) && (!linear || (key[3]&0xFFFF)==pitch)) {
+            // Guest memory still holds the linear rows below a GPU-written image.
+            const bool rows_below=linear && surface.height<height;
+            if(key[0]==(reg(method)&0x0FFFFFFF) && surface.width==width && (surface.height==height || rows_below) &&
+                matching_color && ((surface_type==1)==linear) && (!linear || (key[3]&0xFFFF)==pitch)) {
+                if(rows_below) {
+                    const auto first=surface.height;
+                    grow_color(key,surface,width,height);
+                    write_rows(surface,key[0],pitch,first,height-first);
+                }
                 if(linear) view.texture_scales[stage]={1.0f/width,1.0f/height,1,1};
                 // The native color surface retains alpha even when the guest samples it as RGBX.
                 alpha_one=texture_format==TextureFormat::xrgb8 || texture_format==TextureFormat::xrgb8_linear;
@@ -433,6 +440,12 @@ struct Gpu::Impl {
         }
         if(++draw_count==draws.size()) flush();
     }
+    // Load rows of a linear color image from guest memory the GPU has not replaced.
+    void write_rows(const Surface& surface,std::uint32_t address,std::uint32_t pitch,std::uint32_t first,std::uint32_t count) {
+        const auto bytes=std::size_t(count)*pitch;
+        const auto* rows=static_cast<const std::byte*>(read_dma(address+first*pitch,bytes));
+        renderer.write_target(surface.identifier,0,first,surface.width,count,Bytes(rows,bytes),pitch);
+    }
     void blit(const std::array<std::uint32_t,2048>& state,std::uint32_t size) {
         const auto handle=state[0x19C/4];
         if(!object_classes.contains(handle) || object_classes.at(handle)!=0x62)
@@ -466,11 +479,16 @@ struct Gpu::Impl {
         auto to=find(destination,destination_pitch);
         flush();
         if(to==targets.end()) {
-            if(dx || dy || width!=destination_pitch/bpp)
-                throw std::runtime_error("Initial image blit must define complete rows from the origin");
+            // The blit replaces one rectangle of linear guest memory. Begin the
+            // native image with the complete rows it reaches, so pixels outside
+            // the rectangle keep their memory values. D3DDevice_CopyRects from
+            // 0x000461C0 copies 639x479 back-buffer pixels into 640-pixel rows.
+            const auto columns=destination_pitch/bpp,rows=dy+height;
             const auto color=bpp==2?SurfaceColor::rgb565:SurfaceColor::rgba8;
             const std::array key{destination,0U,bpp==2?0x123U:0x128U,destination_pitch|(destination_pitch<<16)};
-            to=targets.emplace(key,Surface{renderer.create_target(width,height,color),width,height,&color_clears[destination]}).first;
+            if(!renderer.has_texture_slot()) evict_texture(false);
+            to=targets.emplace(key,Surface{renderer.create_target(columns,rows,color),columns,rows,&color_clears[destination]}).first;
+            write_rows(to->second,destination,destination_pitch,0,rows);
         } else if(dx+width>to->second.width || dy+height>to->second.height)
             grow_color(to->first,to->second,std::max(dx+width,to->second.width),std::max(dy+height,to->second.height));
         renderer.copy_region(to->second.identifier,from->second.identifier,sx,sy,dx,dy,width,height);
