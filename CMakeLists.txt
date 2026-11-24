@@ -164,7 +164,7 @@ if(XBOX_GENERATED_SOURCE)
         src/xbox/settings.cpp src/xbox/settings_menu.cpp
         src/xbox/boot.cpp src/xbox/audio.cpp src/xbox/audio_effects.cpp src/xbox/guest_audio.cpp
         src/xbox/guest_graphics.cpp src/xbox/gpu.cpp src/xbox/render.cpp src/xbox/shaders.cpp
-        src/xbox/vertex_program.cpp src/xbox/play_window.cpp src/xbox/play_diagnostics.cpp)
+        src/xbox/vertex_program.cpp src/xbox/play_window.cpp src/xbox/play_diagnostics.cpp src/xbox/recomp_options.cpp)
     target_compile_features(xbox-runtime PUBLIC cxx_std_23)
     add_dependencies(xbox-runtime scoobymm-dsp)
     target_include_directories(xbox-runtime PRIVATE "${dsp56300_SOURCE_DIR}/crates/emu-ffi/include")
@@ -192,5 +192,8 @@ if(XBOX_GENERATED_SOURCE)
     target_include_directories(scoobymm PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_compile_options(scoobymm PRIVATE /W4)
     target_link_libraries(scoobymm PRIVATE xbox-runtime)
-    set_target_properties(scoobymm PROPERTIES CXX_EXTENSIONS OFF)
+    # A windowed program: players get no console. Command-line runs attach to
+    # their console or keep their redirected output (src/play.cpp).
+    set_target_properties(scoobymm PROPERTIES CXX_EXTENSIONS OFF WIN32_EXECUTABLE ON)
+    target_link_options(scoobymm PRIVATE /ENTRY:wmainCRTStartup)
 endif()

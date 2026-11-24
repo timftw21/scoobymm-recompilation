@@ -30,6 +30,7 @@ PlayWindow::PlayWindow(PlayOptions& options) : options_(options), hidden_(option
     try {
         renderer_ = std::make_unique<Renderer>(640,480);
         renderer_->attach_window(native_handle());
+        renderer_->enhance(options.enhancements);
         menu_ = std::make_unique<SettingsMenu>(window_,*renderer_,options_,options.storage / "settings.cfg");
         menu_->visible = options.launcher;
         menu_->message = options.settings_error;
@@ -119,9 +120,17 @@ std::uint64_t PlayWindow::time() const { return (SDL_GetTicksNS() - origin_) / 1
 
 DiagnosticKeys PlayWindow::take_diagnostic_keys() { return std::exchange(diagnostic_keys_, {}); }
 
-void PlayWindow::diagnostic_title(std::string_view status) {
-    if (status.empty()) SDL_SetWindowTitle(window_, game_title);
-    else SDL_SetWindowTitle(window_, (std::string(game_title) + " | " + std::string(status)).c_str());
+void PlayWindow::settings_changed() {
+    renderer_->enhance(options_.enhancements);
+    const bool fullscreen = (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) != 0;
+    if (!hidden_ && fullscreen != options_.fullscreen && !SDL_SetWindowFullscreen(window_, options_.fullscreen))
+        options_.fullscreen = fullscreen;
+    try { options_.save(options_.storage / "settings.cfg"); }
+    catch (const std::exception& error) { notify(Notice::error, "Settings were not saved", error.what()); }
+}
+
+void PlayWindow::notify(Notice tone, std::string_view title, std::string_view detail) {
+    if (!hidden_) menu_->notify(tone, std::string(title), std::string(detail));
 }
 
 void PlayWindow::refresh_gamepad() {

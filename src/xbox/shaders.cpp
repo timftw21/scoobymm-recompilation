@@ -150,7 +150,9 @@ const char* shader_profile(ShaderKind kind) {
     if(kind==ShaderKind::gui_vertex) return "vs_4_0";
     if(kind==ShaderKind::gui_pixel) return "ps_4_0";
     if(kind==ShaderKind::launch) return "cs_5_0";
+    if(kind==ShaderKind::line_geometry) return "gs_5_0";
     if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::video_overlay ||
+       kind==ShaderKind::blit_pixel || kind==ShaderKind::fxaa_pixel ||
        (kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8) ||
        (kind>=ShaderKind::color && kind<=ShaderKind::modulate3d)) return "ps_5_0";
     return "vs_5_0";
@@ -209,10 +211,94 @@ float4 main(float4 position:SV_Position):SV_Target {
     case ShaderKind::display_pixel:return R"(
 Texture2D image:register(t0);Texture1D gammaRamp:register(t1);SamplerState filter:register(s0);
 float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
-    float4 color=image.Sample(filter,uv);
+    // A window pixel that covers several image texels averages a grid of
+    // bilinear taps across its footprint. Magnified images take one tap.
+    float2 size;image.GetDimensions(size.x,size.y);
+    float2 footprint=float2(abs(ddx(uv.x)),abs(ddy(uv.y)))*size;
+    uint2 taps=uint2(clamp(ceil(footprint-1e-3),1,8));
+    float4 color=0;
+    for(uint y=0;y<taps.y;++y) for(uint x=0;x<taps.x;++x)
+        color+=image.SampleLevel(filter,uv+((float2(x,y)+0.5)/taps-0.5)*footprint/size,0);
+    color/=taps.x*taps.y;
     int3 level=int3(round(saturate(color.rgb)*255));
     return float4(gammaRamp.Load(int2(level.r,0)).r,gammaRamp.Load(int2(level.g,0)).g,
                   gammaRamp.Load(int2(level.b,0)).b,color.a);
+})";
+    case ShaderKind::blit_pixel:return R"(
+Texture2D image:register(t0);SamplerState filter:register(s0);
+// xy: source minus destination pixel; z: 0 resamples the whole image,
+// otherwise each output pixel averages a z-by-z block of source texels.
+cbuffer Blit:register(b0) {int4 parameters;};
+float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
+    int factor=parameters.z;
+    if(factor==0) return image.SampleLevel(filter,uv,0);
+    int2 origin=int2(p.xy)*factor+parameters.xy;
+    float4 sum=0;
+    for(int y=0;y<factor;++y) for(int x=0;x<factor;++x) sum+=image.Load(int3(origin+int2(x,y),0));
+    return sum/(factor*factor);
+})";
+    case ShaderKind::fxaa_pixel:return R"(
+Texture2D image:register(t0);SamplerState filter:register(s0);
+float luma(float2 uv) {return dot(image.SampleLevel(filter,uv,0).rgb,float3(0.299,0.587,0.114));}
+static const float search[12]={1,1,1,1,1,1.5,2,2,2,2,4,8};
+// Fast approximate anti-aliasing: find the local edge, measure its extent
+// along the edge, then sample across it in proportion to the pixel's position.
+float4 main(float4 p:SV_Position):SV_Target {
+    float2 size;image.GetDimensions(size.x,size.y);
+    float2 texel=1/size,uv=p.xy*texel;
+    float4 center=image.SampleLevel(filter,uv,0);
+    float m=dot(center.rgb,float3(0.299,0.587,0.114));
+    float n=luma(uv-float2(0,texel.y)),s=luma(uv+float2(0,texel.y));
+    float w=luma(uv-float2(texel.x,0)),e=luma(uv+float2(texel.x,0));
+    float high=max(m,max(max(n,s),max(w,e))),low=min(m,min(min(n,s),min(w,e))),range=high-low;
+    if(range<max(0.0625,high*0.125)) return center;
+    float nw=luma(uv-texel),se=luma(uv+texel);
+    float ne=luma(uv+float2(texel.x,-texel.y)),sw=luma(uv+float2(-texel.x,texel.y));
+    bool horizontal=abs(nw+ne-2*n)+2*abs(w+e-2*m)+abs(sw+se-2*s)>=
+                    abs(nw+sw-2*w)+2*abs(n+s-2*m)+abs(ne+se-2*e);
+    float negative=horizontal?n:w,positive=horizontal?s:e;
+    float step_length=horizontal?texel.y:texel.x,edge,gradient;
+    if(abs(positive-m)>=abs(negative-m)) {edge=(positive+m)*0.5;gradient=abs(positive-m);}
+    else {step_length=-step_length;edge=(negative+m)*0.5;gradient=abs(negative-m);}
+    float2 along=horizontal?float2(texel.x,0):float2(0,texel.y),edge_uv=uv;
+    if(horizontal) edge_uv.y+=step_length*0.5; else edge_uv.x+=step_length*0.5;
+    float threshold=gradient*0.25;
+    float2 first=edge_uv-along,second=edge_uv+along;
+    float end1=luma(first)-edge,end2=luma(second)-edge;
+    bool done1=abs(end1)>=threshold,done2=abs(end2)>=threshold;
+    [loop] for(uint i=1;i<12 && !(done1 && done2);++i) {
+        if(!done1) {first-=along*search[i];end1=luma(first)-edge;done1=abs(end1)>=threshold;}
+        if(!done2) {second+=along*search[i];end2=luma(second)-edge;done2=abs(end2)>=threshold;}
+    }
+    float distance1=horizontal?uv.x-first.x:uv.y-first.y,distance2=horizontal?second.x-uv.x:second.y-uv.y;
+    bool nearer=distance1<distance2;
+    float offset=((nearer?end1:end2)<0)!=(m<edge)?0.5-min(distance1,distance2)/(distance1+distance2):0;
+    float average=(2*(n+s+w+e)+nw+ne+sw+se)/12,blend=saturate(abs(average-m)/range);
+    blend=(-2*blend+3)*blend*blend;
+    offset=max(offset,blend*blend*0.75);
+    if(horizontal) uv.y+=offset*step_length; else uv.x+=offset*step_length;
+    return float4(image.SampleLevel(filter,uv,0).rgb,center.a);
+})";
+    case ShaderKind::line_geometry:return R"(
+struct P {float4 p:SV_Position;float4 c:COLOR0;float4 s:COLOR1;
+ float4 t0:TEXCOORD0;float4 t1:TEXCOORD1;float4 t2:TEXCOORD2;float4 t3:TEXCOORD3;float fog:TEXCOORD4;};
+cbuffer Surface:register(b0) {float4 pixel;}; // xy: clip-space size of one guest pixel, y down.
+P moved(P v,float2 guest) {v.p.xy+=guest*pixel.xy*v.p.w;return v;}
+// Above 1x a guest line covers whole guest pixels, as the 1x rasterizer
+// draws it: one pixel across its minor axis, from its first pixel up to but
+// excluding its last. Centered geometry gives guest pixel c the host samples
+// [c+0.5, c+1.5), so the covered band starts on the line itself.
+[maxvertexcount(4)]
+void main(line P v[2],inout TriangleStream<P> output) {
+    if(v[0].p.w<=0 || v[1].p.w<=0) return;
+    float2 d=(v[1].p.xy/v[1].p.w-v[0].p.xy/v[0].p.w)/pixel.xy;
+    bool major_x=abs(d.x)>=abs(d.y);
+    float2 across=major_x?float2(0,1):float2(1,0);
+    float2 along=major_x?float2(d.x<0?1:0,0):float2(0,d.y<0?1:0);
+    output.Append(moved(v[0],along));
+    output.Append(moved(v[1],along));
+    output.Append(moved(v[0],along+across));
+    output.Append(moved(v[1],along+across));
 })";
     default:throw std::runtime_error("Shader source requires a vertex program or the pinned GUI backend");
     }

@@ -39,6 +39,13 @@ void PlayerSettings::load(const std::filesystem::path& file) {
         else if (key == "widescreen") next.widescreen = number(0, 1) != 0;
         else if (key == "fullscreen") next.fullscreen = number(0, 1) != 0;
         else if (key == "vsync") next.vsync = number(0, 1) != 0;
+        else if (key == "render_scale") next.enhancements.scale = number(1, 6);
+        else if (key == "fxaa") next.enhancements.fxaa = number(0, 1) != 0;
+        else if (key == "msaa" || key == "anisotropy") {
+            const auto n = number(1, key == "msaa" ? 8 : 16);
+            if (n & (n - 1)) throw std::runtime_error("Invalid settings.cfg value for " + key);
+            (key == "msaa" ? next.enhancements.samples : next.enhancements.anisotropy) = n;
+        }
     }
     if (in.bad()) throw std::runtime_error("Error reading settings.cfg");
     *this = std::move(next);
@@ -54,7 +61,9 @@ void PlayerSettings::save(const std::filesystem::path& file) const {
         out << "xbe=" << path_text(xbe) << "\ndisc=" << path_text(disc)
             << "\nrefresh_rate=" << refresh_rate << "\nvolume=" << volume
             << "\nshow_fps=" << show_fps << "\nmuted=" << muted << "\nmute_unfocused=" << mute_unfocused
-            << "\nwidescreen=" << widescreen << "\nfullscreen=" << fullscreen << "\nvsync=" << vsync << '\n';
+            << "\nwidescreen=" << widescreen << "\nfullscreen=" << fullscreen << "\nvsync=" << vsync
+            << "\nrender_scale=" << enhancements.scale << "\nmsaa=" << enhancements.samples
+            << "\nfxaa=" << enhancements.fxaa << "\nanisotropy=" << enhancements.anisotropy << '\n';
         out.close();
         if (!MoveFileExW(pending.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
             throw std::system_error(GetLastError(), std::system_category(), "Saving settings.cfg");

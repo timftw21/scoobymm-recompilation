@@ -54,7 +54,6 @@ private:
     Result frame_result_, performance_result_;
 
     Path directory(std::string_view prefix, const Path& requested);
-    void title(std::string_view status = {});
     void stop_performance(std::string_view reason);
 };
 }

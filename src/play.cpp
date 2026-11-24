@@ -20,6 +20,31 @@ constexpr std::array<std::wstring_view, 3> face_options{
     L"--confirm-at-scanout", L"--b-at-scanout", L"--x-at-scanout"
 };
 
+// The game is a windowed program, so starting it opens no console. Command-line
+// runs keep their output: redirected handles are inherited, and a run with
+// arguments writes to the console it was started from.
+bool attach_console(bool arguments) {
+    const auto usable = [](DWORD id) {
+        const auto handle = GetStdHandle(id);
+        return handle && handle != INVALID_HANDLE_VALUE && GetFileType(handle) != FILE_TYPE_UNKNOWN;
+    };
+    bool output = usable(STD_OUTPUT_HANDLE), errors = usable(STD_ERROR_HANDLE);
+    if ((!output || !errors) && arguments && AttachConsole(ATTACH_PARENT_PROCESS)) {
+        FILE* stream{};
+        if (!output) output = !freopen_s(&stream, "CONOUT$", "w", stdout);
+        if (!errors) errors = !freopen_s(&stream, "CONOUT$", "w", stderr);
+    }
+    return errors;
+}
+
+// Without a console, a player still learns why the game could not run.
+void report_failure(std::string_view text, bool console, bool hidden) {
+    std::cerr << text << '\n';
+    if (console || hidden) return;
+    const auto wide = std::filesystem::path(std::u8string(text.begin(), text.end())).wstring();
+    MessageBoxW(nullptr, wide.c_str(), L"Scooby-Doo! Mystery Mayhem", MB_OK | MB_ICONERROR);
+}
+
 std::filesystem::path application_root() {
     std::array<wchar_t, 32768> path;
     const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
@@ -59,6 +84,8 @@ void usage() {
 }
 
 int wmain(int argc, wchar_t* argv[]) {
+    const bool console = attach_console(argc > 1);
+    const bool hidden = std::any_of(argv + 1, argv + argc, [](const wchar_t* option) { return std::wstring_view(option) == L"--hidden"; });
     if (argc == 2 && std::wstring_view(argv[1]) == L"--help") { usage(); return 0; }
     try {
         xbox_native::PlayOptions options;
@@ -188,10 +215,11 @@ int wmain(int argc, wchar_t* argv[]) {
         }
         report.flush();
         if (!report) throw std::runtime_error("Cannot write the play session report");
-        if (code) std::cerr << "The game stopped. See the session report for the guest address and reason.\n";
+        if (code) report_failure("The game stopped. See the session report for the guest address and reason:\n" +
+                         xbox_native::path_text(std::filesystem::absolute(report_path)), console, hidden);
         return code;
     } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
+        report_failure(error.what(), console, hidden);
         return 1;
     }
 }

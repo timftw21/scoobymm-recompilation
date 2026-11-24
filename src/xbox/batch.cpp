@@ -159,7 +159,12 @@ struct ModuleObject {
     std::set<Word> functions;
     std::vector<std::pair<Word, Word>> exports;
     std::optional<Word> destructor;
+    // Named code and data of the objects the player extends (see named_symbol_modules).
+    std::vector<std::pair<std::string, Word>> symbols;
 };
+// The player adds Recomp Options to the title and pause menus of these objects
+// (recomp_options.cpp) and finds their callbacks and data by COFF symbol.
+constexpr std::array<std::string_view, 1> named_symbol_modules{"panel"};
 
 Bytes slice(Bytes bytes, std::size_t offset, std::size_t size) {
     if (offset > bytes.size() || size > bytes.size() - offset)
@@ -177,11 +182,18 @@ ModuleObject read_module(Bytes object, std::string_view name) {
     const auto relocs = slice(object, u32(object, 44), std::size_t{10} * u16(object, 52));
     ModuleObject module;
     module.section=section;
+    const bool named=std::ranges::find(named_symbol_modules,name)!=named_symbol_modules.end();
     std::map<Word,bool> data_symbols;
     for (std::size_t offset = 0; offset < symbols.size();) {
         const auto symbol = slice(symbols, offset, 18);
         const auto value = u32(symbol, 8);
         const auto aux = std::to_integer<unsigned>(symbol[17]);
+        if (named && u16(symbol,12)==1) {
+            const auto field=u32(symbol,0)==0 ? slice(strings,u32(symbol,4),strings.size()-u32(symbol,4)) : symbol.first(8);
+            const std::string_view label(reinterpret_cast<const char*>(field.data()),field.size());
+            const auto spelling=label.substr(0,label.find('\0'));
+            if (spelling.starts_with('_') && value<section.size()) module.symbols.emplace_back(spelling,value);
+        }
         if (u16(symbol,12)==1 && u16(symbol,14)==0) {
             const auto field=u32(symbol,0)==0 ? slice(strings,u32(symbol,4),strings.size()-u32(symbol,4)) : symbol.first(8);
             const char first=static_cast<char>(field.front());
@@ -722,7 +734,8 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
             }
         }
     }
-    std::ostringstream declarations, index, destructors, summary, abi_tables, abi_index;
+    std::ostringstream declarations, index, destructors, summary, abi_tables, abi_index, symbol_tables, symbol_index;
+    std::size_t symbol_modules = 0;
     const auto interface_slots=evidence.interface_tables(abi_tables);
     std::size_t conditional_calls=0, passed_arguments=0;
     std::size_t unreferenced_calls=0, descriptor_methods=0, object_interfaces=0;
@@ -1438,6 +1451,12 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
                     << (caller == logic_register_call ? "Register" : "Constructor") << '\t' << hex32(offset) << '\n';
             ++registry_size;
         }
+        if (!module.symbols.empty()) {
+            symbol_tables << "const std::array<ModuleSymbol," << module.symbols.size() << "> symbols_" << symbol_modules << "{{\n";
+            for (const auto& [name, offset] : module.symbols) symbol_tables << "    {\"" << name << "\", " << hex32(offset) << "U},\n";
+            symbol_tables << "}};\n";
+            symbol_index << std::format("    {{&{}_{}, symbols_{}}},\n", ns, module.exports.front().second, symbol_modules++);
+        }
         if (module.destructor) {
             const auto symbol = std::format("{}_{}",ns,module.exports.front().second);
             destructors << std::format("    destructor({}, {}U),\n",symbol,hex32(*module.destructor));
@@ -1527,7 +1546,11 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
         "const std::span<const std::span<const LogicProvider>> compiled_registered_callbacks{{registered_callback_list}};\n}}\n",
         declarations.str(), registry_size, index.str(),destructors.str(),abi_tables.str(),abi_modules,abi_index.str(),evidence.provider_tables(),
         descriptor_callbacks.size(),callback_list,registry_lists,callback_registries.size(),registry_spans);
-    if (emit) write_text(staging / "game.module.cpp", module_index);
+    const auto symbol_index_text = std::format("#include \"xbox/module_symbols.h\"\nnamespace xbox_native {{\nnamespace {{\n{}"
+        "const std::array<ModuleSymbols,{}> symbol_index{{{{\n{}}}}};\n}}\n"
+        "const std::span<const ModuleSymbols> compiled_module_symbols{{symbol_index}};\n}}\n",
+        symbol_tables.str(), symbol_modules, symbol_index.str());
+    if (emit) write_text(staging / "game.module.cpp", module_index + symbol_index_text);
     if (unresolved.is_open()) unresolved.close();
     if (argument_evidence.is_open()) argument_evidence.close();
     if (descriptor_evidence.is_open()) descriptor_evidence.close();

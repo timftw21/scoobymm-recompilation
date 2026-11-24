@@ -54,6 +54,11 @@ std::string processor_name() {
     return {};
 }
 
+std::string enhancement_json(const RenderEnhancements& e, std::array<std::uint32_t, 2> render) {
+    return std::format("\"render_size\":[{},{}],\"render_scale\":{},\"msaa\":{},\"fxaa\":{},\"anisotropy\":{}",
+                       render[0], render[1], e.scale, e.samples, e.fxaa ? "true" : "false", e.anisotropy);
+}
+
 std::string dimensions(std::array<std::uint32_t, 2> size) {
     return std::format("[{},{}]", size[0], size[1]);
 }
@@ -167,7 +172,8 @@ struct PlayDiagnostics::Recording {
     };
 
     Recording(Renderer& renderer, const FrameCounters& counters)
-        : gpu(renderer), native(renderer.scanout_size()), adapter(renderer.adapter()), processor(processor_name()),
+        : gpu(renderer), native(renderer.scanout_size()), enhancements(enhancement_json(renderer.enhancements(), renderer.render_size())),
+          adapter(renderer.adapter()), processor(processor_name()),
           first(counters), last(counters), started(Clock::now()) {
         samples.reserve(4096);
     }
@@ -320,7 +326,7 @@ struct PlayDiagnostics::Recording {
         write_file(directory / "performance.json", [&](std::ostream& out) {
             out << "{\"format\":\"scoobymm-performance-v1\",\"reason\":" << json(reason)
                 << ",\"session_report\":" << json(path_text(options.session_report)) << ",\"processor\":" << json(processor)
-                << ",\"graphics_adapter\":" << json(adapter) << ",\"native_size\":" << dimensions(native)
+                << ",\"graphics_adapter\":" << json(adapter) << ",\"native_size\":" << dimensions(native) << "," << enhancements
                 << ",\"window_size\":" << dimensions(samples.empty() ? std::array<std::uint32_t, 2>{} : samples.back().window)
                 << ",\"vsync\":" << (settings.vsync ? "true" : "false")
                 << ",\"refresh_rate\":" << settings.refresh_rate << ",\"widescreen\":" << (settings.widescreen ? "true" : "false")
@@ -347,6 +353,7 @@ struct PlayDiagnostics::Recording {
 
     GpuIntervals gpu;
     std::array<std::uint32_t, 2> native;
+    std::string enhancements;
     std::string adapter, processor;
     FrameCounters first, last;
     Clock::time_point started, boundary, next_memory_sample{};
@@ -380,15 +387,6 @@ PlayDiagnostics::Path PlayDiagnostics::directory(std::string_view prefix, const 
     }
 }
 
-void PlayDiagnostics::title(std::string_view status) {
-    std::string text(status);
-    if (performance_) {
-        if (!text.empty()) text += " | ";
-        text += "F9 recording";
-    }
-    window_.diagnostic_title(text);
-}
-
 bool PlayDiagnostics::recording_expired() const {
     return performance_ && !(performance_scripted_ && options_.performance_frames) &&
            Clock::now() - performance_->started >= recording_limit;
@@ -398,7 +396,6 @@ void PlayDiagnostics::poll() {
     const auto keys = window_.take_diagnostic_keys();
     if (keys.capture && !frame_requested_ && !capturing()) {
         frame_requested_ = true;
-        title("F8 capture queued");
     }
     if (keys.toggle_performance) {
         if (performance_) stop_performance("hotkey");
@@ -443,6 +440,7 @@ void PlayDiagnostics::capture_frame(Renderer& renderer, Gpu& gpu, const FrameCou
             out << "{\"format\":\"scoobymm-frame-v1\",\"scanout\":" << counters.scanout
                 << ",\"session_report\":" << json(path_text(options_.session_report))
                 << ",\"graphics_adapter\":" << json(renderer.adapter()) << ",\"native_size\":" << dimensions(renderer.scanout_size())
+                << "," << enhancement_json(renderer.enhancements(), renderer.render_size())
                 << ",\"window_size\":" << dimensions(displayed ? renderer.display_size() : std::array<std::uint32_t, 2>{})
                 << ",\"vsync\":" << (window_.settings().vsync ? "true" : "false")
                 << ",\"widescreen\":" << (window_.settings().widescreen ? "true" : "false")
@@ -453,11 +451,11 @@ void PlayDiagnostics::capture_frame(Renderer& renderer, Gpu& gpu, const FrameCou
         });
         if (frame_scripted_) frame_completed_ = true;
         std::cout << "Frame capture " << path_text(dir) << '\n';
-        title("F8 saved to " + path_text(dir.filename()));
+        window_.notify(Notice::success, "Frame captured", path_text(dir.filename()));
     } catch (const std::exception& error) {
         frame_result_.error = error.what();
         std::cerr << "Frame capture failed: " << error.what() << '\n';
-        title("F8 capture failed");
+        window_.notify(Notice::error, "Frame capture failed", error.what());
     }
     frame_scripted_ = false;
 }
@@ -488,13 +486,13 @@ void PlayDiagnostics::scanout(Renderer& renderer, Gpu& gpu, FrameCounters counte
                 performance_result_ = {};
                 performance_ = std::make_unique<Recording>(renderer, counters);
                 performance_->sample_memory();
-                title();
+                window_.notify(Notice::recording, "Recording performance", "Press F9 again to stop");
                 performance_->restart(counters);
             } catch (const std::exception& error) {
                 performance_result_.error = error.what();
                 performance_.reset();
                 std::cerr << "Performance recording failed: " << error.what() << '\n';
-                title("F9 recording failed");
+                window_.notify(Notice::error, "Performance recording failed", error.what());
             }
         }
     }
@@ -506,7 +504,6 @@ void PlayDiagnostics::scanout(Renderer& renderer, Gpu& gpu, FrameCounters counte
         trace_ = std::make_unique<std::ostringstream>();
         initial_draws_ = gpu.stats().draws;
         gpu.trace_draws(trace_.get());
-        title("F8 capturing next frame");
     }
 }
 
@@ -522,11 +519,11 @@ void PlayDiagnostics::stop_performance(std::string_view reason) {
             if (!performance_completed_) performance_result_.error = "Recording stopped before the requested scanout count";
         }
         std::cout << "Performance capture " << path_text(performance_result_.directory) << '\n';
-        title("F9 saved to " + path_text(performance_result_.directory.filename()));
+        window_.notify(Notice::success, "Performance recorded", path_text(performance_result_.directory.filename()));
     } catch (const std::exception& error) {
         performance_result_.error = error.what();
         std::cerr << "Performance capture failed: " << error.what() << '\n';
-        title("F9 capture failed");
+        window_.notify(Notice::error, "Performance capture failed", error.what());
     }
     performance_scripted_ = false;
 }

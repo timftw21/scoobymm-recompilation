@@ -9,6 +9,7 @@
 #include "kernel_imports.h"
 #include "play_diagnostics.h"
 #include "play_window.h"
+#include "recomp_options.h"
 #include "sha1.h"
 #include "shaders.h"
 #include "unwind.h"
@@ -126,6 +127,7 @@ struct OpenFile {
     std::vector<DirectoryItem> listing{};
     std::size_t listing_position{};
     bool listing_loaded{};
+    std::shared_ptr<const std::vector<std::byte>> overlay{}; // Host contents for a disc file.
 };
 struct IoTrace {
     Word site, ordinal, status, detail, information;
@@ -187,6 +189,8 @@ public:
                 return std::bit_cast<Word>(std::bit_cast<float>(authored) * (30.f * dt));
             };
             audio_.output_gain(window->gain());
+            recomp_options_ = std::make_unique<RecompOptions>(RecompOptions::Host{window->edit_settings(),
+                [window] { window->settings_changed(); }, [window] { return window->renderer().max_samples(); }});
         }
         memory_.map(kernel_base, kernel_);
         memory_.guard_primary_pages(blocked_pages_);
@@ -418,6 +422,7 @@ private:
     GuestGraphics graphics_;
     std::unique_ptr<PlayDiagnostics> diagnostics_;
     PlayWindow* window_;
+    std::unique_ptr<RecompOptions> recomp_options_;
     Word frame_limit_;
     bool quit_{};
     InputScript input_;
@@ -1182,8 +1187,12 @@ NativeFunction OfflineBoot::resolve_module(Cpu& cpu, Word caller) {
                 }
             }
         }
-        if (const auto* target=instance_at(address); target && memory_.load<Word>(target->owner+text_field)==target->base)
-            return active(*target);
+        if (const auto* target=instance_at(address); target && memory_.load<Word>(target->owner+text_field)==target->base) {
+            const auto fn=active(*target);
+            if (fn && recomp_options_ && !instance_at(caller))
+                if (const auto host=recomp_options_->intercept(*target->module,target->base,address-target->base,fn)) return host;
+            return fn;
+        }
         return nullptr;
     }
     if (owner < guest_base || owner >= ram_end - text_field - 4 || memory_.load<Word>(owner+field) != address)
@@ -1291,6 +1300,16 @@ Word OfflineBoot::open_file(Cpu& cpu, bool create) {
         file.disc_entry = disc_->lookup(relative);
         if (!file.disc_entry) return name_missing;
         file.directory = file.disc_entry->directory;
+        if (recomp_options_ && !file.directory && file.disc_entry->size <= 4 * 1024 * 1024 && recomp_options_->extends(relative)) {
+            const auto font_entry = disc_->lookup(RecompOptions::font_path(relative));
+            if (font_entry && !font_entry->directory && font_entry->size <= 1024 * 1024) {
+                std::vector<std::byte> original(file.disc_entry->size), font(font_entry->size);
+                disc_->read(*file.disc_entry, 0, original);
+                disc_->read(*font_entry, 0, font);
+                if (auto extended = recomp_options_->text_table(original, font, relative))
+                    file.overlay = std::make_shared<const std::vector<std::byte>>(std::move(*extended));
+            }
+        }
     } else if (path.starts_with(disk_prefix) && path.size() == disk_prefix.size() + 1 &&
                !path.ends_with('1') && scratch_files_.contains(path)) {
         file.raw = true;
@@ -1782,7 +1801,7 @@ void OfflineBoot::service(unsigned ordinal, Cpu& cpu) {
             const auto out = arg(2);
             auto& opened = file->second;
             const auto bytes = opened.directory ? std::uint64_t{0} :
-                opened.disc_entry ? opened.disc_entry->size : scratch_files_.at(opened.path).size();
+                opened.overlay ? opened.overlay->size() : opened.disc_entry ? opened.disc_entry->size : scratch_files_.at(opened.path).size();
             const std::uint64_t allocated = opened.disc_entry ? (bytes + 2047) & ~2047ULL :
                 allocated_size(opened.path, static_cast<Word>(bytes));
             std::memset(memory_.access(out, length), 0, length);
@@ -1891,13 +1910,14 @@ void OfflineBoot::service(unsigned ordinal, Cpu& cpu) {
             auto& opened = file->second;
             const auto offset = arg(7) ? memory_.load<std::uint64_t>(arg(7)) : opened.offset;
             file_offset = offset;
-            const auto size = opened.disc_entry ? opened.disc_entry->size : scratch_files_.at(opened.path).size();
+            const auto size = opened.overlay ? opened.overlay->size() : opened.disc_entry ? opened.disc_entry->size : scratch_files_.at(opened.path).size();
             last_io_path_ = opened.path;
             if (offset >= size && arg(6)) result = end_of_file;
             else if (arg(6)) {
                 bytes = static_cast<Word>(std::min<std::uint64_t>(arg(6), size - offset));
                 auto output = std::span(static_cast<std::byte*>(memory_.access(arg(5), bytes)), bytes);
-                if (opened.disc_entry) disc_->read(*opened.disc_entry, offset, output);
+                if (opened.overlay) std::memcpy(output.data(), opened.overlay->data() + offset, bytes);
+                else if (opened.disc_entry) disc_->read(*opened.disc_entry, offset, output);
                 else std::memcpy(output.data(), scratch_files_.at(opened.path).data() + offset, bytes);
                 opened.offset = offset + bytes;
             }

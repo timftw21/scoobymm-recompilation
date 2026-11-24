@@ -14,6 +14,7 @@
 #include <map>
 #include <optional>
 #include <stdexcept>
+#include <tuple>
 
 using Microsoft::WRL::ComPtr;
 namespace xbox_native {
@@ -242,7 +243,6 @@ struct Renderer::Impl {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     std::array<ComPtr<ID3D11PixelShader>,4> simple_combiners;
-    ComPtr<ID3D11Texture2D> target, depth, staging;
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11DepthStencilView> dsv;
     ComPtr<ID3D11VertexShader> vs;
@@ -262,18 +262,40 @@ struct Renderer::Impl {
     unsigned timing_index=8;
     std::uint64_t frame_id=0,latest_timing=0;
     ComPtr<ID3D11InfoQueue> info;
+    // Surfaces hold scale-by-scale host pixels for each guest pixel. Sampling,
+    // copies and readback use the single-sampled resolved image.
+    struct ColorImage {
+        ComPtr<ID3D11Texture2D> color,resolved; // The same texture when single-sampled.
+        ComPtr<ID3D11RenderTargetView> target;
+        ComPtr<ID3D11ShaderResourceView> view;
+        DXGI_FORMAT format{};
+        UINT samples=1;
+        bool dirty=false;
+    };
     struct FrameTarget {
-        std::uint32_t width,height;
+        std::uint32_t width,height; // Guest pixels.
         SurfaceColor color_format=SurfaceColor::rgba8;
         SurfaceDepth depth_format=SurfaceDepth::z24s8;
-        ComPtr<ID3D11Texture2D> color,depth,staging;
-        ComPtr<ID3D11RenderTargetView> color_view;
+        std::shared_ptr<ColorImage> image; // Shared by surfaces that alias one color buffer.
+        ComPtr<ID3D11Texture2D> depth;
         ComPtr<ID3D11DepthStencilView> depth_view;
-        ComPtr<ID3D11ShaderResourceView> texture_view;
     };
     std::map<std::uint32_t,FrameTarget> targets;
+    std::vector<ColorImage*> target_images{nullptr}; // Indexed by texture id.
     std::uint32_t current_target=0;
+    ColorImage* current_image=nullptr;
     std::size_t target_bytes=0;
+    UINT scale=1,samples=1,samples565=1,sample_limit=1,sample_limit565=1,anisotropy=1;
+    bool fxaa=false;
+    RenderEnhancements requested,last_request;
+    std::string enhancement_error;
+    ComPtr<ID3D11Texture2D> readback_staging;
+    ComPtr<ID3D11PixelShader> blit_ps,fxaa_ps;
+    ComPtr<ID3D11Buffer> blit_constants;
+    ComPtr<ID3D11GeometryShader> line_gs;
+    ComPtr<ID3D11Buffer> line_constants;
+    std::array<std::uint32_t,2> line_surface{};
+    bool geometry_bound=false;
     HWND window=nullptr;
     ComPtr<IDXGISwapChain1> swapchain;
     UINT swapchain_flags{};
@@ -287,8 +309,10 @@ struct Renderer::Impl {
         ComPtr<ID3D11ShaderResourceView> view;
         ComPtr<ID3D11RenderTargetView> target;
         UINT width{}, height{};
-        void resize(ID3D11Device* device, UINT w, UINT h, DXGI_FORMAT format, bool renderable) {
-            if (width == w && height == h) return;
+        DXGI_FORMAT format{};
+        void resize(ID3D11Device* device, UINT w, UINT h, DXGI_FORMAT image_format, bool renderable) {
+            if (width == w && height == h && format == image_format) return;
+            format = image_format;
             D3D11_TEXTURE2D_DESC desc{};
             desc.Width=w; desc.Height=h; desc.MipLevels=1; desc.ArraySize=1;
             desc.Format=format; desc.SampleDesc.Count=1;
@@ -298,7 +322,7 @@ struct Renderer::Impl {
             if (renderable) checked(device->CreateRenderTargetView(texture.Get(),nullptr,target.ReleaseAndGetAddressOf()),"Video composition target");
             width=w; height=h;
         }
-    } video_pairs, video_composite;
+    } video_pairs, video_composite, native_copy, fxaa_image;
     ComPtr<ID3D11PixelShader> video_ps;
     ComPtr<ID3D11Buffer> video_constants;
     ComPtr<ID3D11SamplerState> display_sampler;
@@ -317,6 +341,7 @@ struct Renderer::Impl {
         ComPtr<ID3D11DepthStencilState> depth;
         ComPtr<ID3D11RasterizerState> raster;
         std::array<ComPtr<ID3D11SamplerState>, 4> samplers;
+        std::array<D3D11_SAMPLER_DESC, 4> filters{}; // As the game configured them.
     };
     std::map<PipelineKey, Pipeline> pipelines;
     struct DrawBindings {
@@ -328,6 +353,7 @@ struct Renderer::Impl {
         D3D11_PRIMITIVE_TOPOLOGY topology{};
         std::array<ID3D11ShaderResourceView*,12> textures{};
         UINT stencil_reference{};
+        ID3D11GeometryShader* geometry{};
     } bound;
     struct Program {
         bool launch;
@@ -362,16 +388,18 @@ struct Renderer::Impl {
     std::size_t texture_bytes = 0;
     std::map<unsigned,std::size_t> uploaded_bytes;
     std::vector<unsigned> free_textures;
-    unsigned store_texture(ComPtr<ID3D11ShaderResourceView> view, unsigned dimension) {
+    unsigned store_texture(ComPtr<ID3D11ShaderResourceView> view, unsigned dimension, ColorImage* image = nullptr) {
         if (free_textures.empty()) {
             textures.push_back(std::move(view));
             texture_dimensions.push_back(dimension);
+            target_images.push_back(image);
             return static_cast<unsigned>(textures.size() - 1);
         }
         const auto id = free_textures.back();
         free_textures.pop_back();
         textures[id] = std::move(view);
         texture_dimensions[id] = dimension;
+        target_images[id] = image;
         return id;
     }
     bool recording = false, ended = false;
@@ -409,6 +437,19 @@ struct Renderer::Impl {
         checked(gpu->GetDesc(&description), "Adapter description");
         adapter = path_text(description.Description);
         if (debug) checked(device.As(&info), "D3D11 debug queue");
+        const auto supported = [&](std::initializer_list<DXGI_FORMAT> formats) {
+            UINT best = 1;
+            for (UINT count = 2; count <= 8; count *= 2) {
+                for (const auto format : formats) {
+                    UINT quality = 0;
+                    if (FAILED(device->CheckMultisampleQualityLevels(format, count, &quality)) || !quality) return best;
+                }
+                best = count;
+            }
+            return best;
+        };
+        sample_limit = supported({DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D16_UNORM});
+        sample_limit565 = std::min(sample_limit, supported({DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D16_UNORM}));
         resize(w,h);
         const auto code = shader(ShaderKind::passthrough);
         checked(device->CreateVertexShader(code.data(),code.size(),nullptr,&vs), "Vertex shader");
@@ -483,7 +524,90 @@ struct Renderer::Impl {
         D3D11_RASTERIZER_DESC clear_desc{};clear_desc.FillMode=D3D11_FILL_SOLID;clear_desc.CullMode=D3D11_CULL_NONE;
         clear_desc.DepthClipEnable=clear_desc.ScissorEnable=TRUE;
         checked(device->CreateRasterizerState(&clear_desc,&clear_raster),"Clear rectangle state");
+        const auto display_vertex=shader(ShaderKind::display_vertex),blit=shader(ShaderKind::blit_pixel),fxaa_pixel=shader(ShaderKind::fxaa_pixel);
+        checked(device->CreateVertexShader(display_vertex.data(),display_vertex.size(),nullptr,&display_vs),"Display vertex shader");
+        checked(device->CreatePixelShader(blit.data(),blit.size(),nullptr,&blit_ps),"Image copy shader");
+        checked(device->CreatePixelShader(fxaa_pixel.data(),fxaa_pixel.size(),nullptr,&fxaa_ps),"FXAA shader");
+        D3D11_BUFFER_DESC parameters{};parameters.ByteWidth=16;parameters.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+        checked(device->CreateBuffer(&parameters,nullptr,&blit_constants),"Image copy parameters");
+        checked(device->CreateBuffer(&parameters,nullptr,&line_constants),"Line width parameters");
+        const auto line=shader(ShaderKind::line_geometry);
+        checked(device->CreateGeometryShader(line.data(),line.size(),nullptr,&line_gs),"Line geometry shader");
+        D3D11_SAMPLER_DESC sampler{};sampler.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sampler.MaxLOD=D3D11_FLOAT32_MAX;
+        sampler.ComparisonFunc=D3D11_COMPARISON_ALWAYS;
+        checked(device->CreateSamplerState(&sampler,&display_sampler),"Display sampler");
     }
+    // Draw a single-sampled image into a color target independently of the
+    // game's pipeline state. Later draws rebind everything they need.
+    void blit(ID3D11RenderTargetView* output,ID3D11ShaderResourceView* input,const D3D11_VIEWPORT& viewport,
+              const D3D11_RECT& scissor,std::array<std::int32_t,4> parameters={},ID3D11PixelShader* pixel=nullptr) {
+        unbind_textures();
+        context->OMSetRenderTargets(1,&output,nullptr);
+        context->RSSetViewports(1,&viewport);context->RSSetScissorRects(1,&scissor);context->RSSetState(clear_raster.Get());
+        context->OMSetBlendState(clear_blends[15].Get(),nullptr,UINT_MAX);
+        context->OMSetDepthStencilState(clear_depths[0].Get(),0);
+        context->IASetInputLayout(nullptr);context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(display_vs.Get(),nullptr,0);context->PSSetShader(pixel?pixel:blit_ps.Get(),nullptr,0);
+        context->UpdateSubresource(blit_constants.Get(),0,nullptr,parameters.data(),0,0);
+        auto constants=blit_constants.Get();auto sampler=display_sampler.Get();
+        context->PSSetConstantBuffers(0,1,&constants);context->PSSetSamplers(0,1,&sampler);
+        context->PSSetShaderResources(0,1,&input);
+        context->Draw(3,0);
+        unbind_textures();context->OMSetRenderTargets(0,nullptr,nullptr);
+    }
+    void resolve(ColorImage& image) {
+        if(image.dirty && image.samples>1) context->ResolveSubresource(image.resolved.Get(),0,image.color.Get(),0,image.format);
+        image.dirty=false;
+    }
+    // Copy host pixels between color images of one format.
+    // Xbox screen-space geometry places edges on guest pixel centers, where
+    // the fill rule decides coverage. Shift geometry so the first host pixel
+    // of each scale-by-scale block samples the guest center: every block is
+    // then covered exactly when the guest pixel is covered at 1x.
+    float center_offset() const {return float(scale-1)/float(2*scale);}
+    void copy_image(ColorImage& output,ColorImage& input,UINT sx,UINT sy,UINT dx,UINT dy,UINT w,UINT h) {
+        if(output.samples==1 && input.samples==1) {
+            const D3D11_BOX region{sx,sy,0,sx+w,sy+h,1};
+            if(&input==&output) {
+                D3D11_TEXTURE2D_DESC description{};input.color->GetDesc(&description);
+                description.Width=w;description.Height=h;description.BindFlags=0;
+                ComPtr<ID3D11Texture2D> temporary;
+                checked(device->CreateTexture2D(&description,nullptr,&temporary),"Overlapping image copy");
+                context->CopySubresourceRegion(temporary.Get(),0,0,0,0,input.color.Get(),0,&region);
+                context->CopySubresourceRegion(output.color.Get(),0,dx,dy,0,temporary.Get(),0,nullptr);
+            } else context->CopySubresourceRegion(output.color.Get(),0,dx,dy,0,input.color.Get(),0,&region);
+        } else {
+            // Partial multisampled copies are not available. Draw the resolved
+            // source; an overlapping copy reads the resolve, not the target.
+            resolve(input);
+            D3D11_TEXTURE2D_DESC description{};output.color->GetDesc(&description);
+            blit(output.target.Get(),input.view.Get(),{0,0,float(description.Width),float(description.Height),0,1},
+                {LONG(dx),LONG(dy),LONG(dx+w),LONG(dy+h)},{std::int32_t(sx)-std::int32_t(dx),std::int32_t(sy)-std::int32_t(dy),1,0});
+        }
+        output.dirty=true;
+    }
+    // A single-sampled image of a target at guest resolution.
+    std::pair<ID3D11Texture2D*,ID3D11ShaderResourceView*> native_image(const FrameTarget& target) {
+        auto& image=*target.image;
+        resolve(image);
+        if(scale==1) return {image.resolved.Get(),image.view.Get()};
+        native_copy.resize(device.Get(),target.width,target.height,image.format,true);
+        blit(native_copy.target.Get(),image.view.Get(),{0,0,float(target.width),float(target.height),0,1},
+            {0,0,LONG(target.width),LONG(target.height)},{0,0,std::int32_t(scale),0});
+        return {native_copy.texture.Get(),native_copy.view.Get()};
+    }
+    D3D11_SAMPLER_DESC enhanced(D3D11_SAMPLER_DESC sampler) const {
+        // Raise anisotropy only where the game filters both minified and
+        // magnified texels; point-sampled images keep their exact texels.
+        if(anisotropy>1 && D3D11_DECODE_MIN_FILTER(sampler.Filter)==D3D11_FILTER_TYPE_LINEAR &&
+           D3D11_DECODE_MAG_FILTER(sampler.Filter)==D3D11_FILTER_TYPE_LINEAR) {
+            sampler.Filter=D3D11_FILTER_ANISOTROPIC;
+            sampler.MaxAnisotropy=std::max<UINT>(sampler.MaxAnisotropy,anisotropy);
+        }
+        return sampler;
+    }
+    void apply_enhancements();
     void collect_timings() {
         for(auto& timing:timings) if(timing.pending) {
             D3D11_QUERY_DATA_TIMESTAMP_DISJOINT result{};UINT64 start=0,finish=0;
@@ -503,36 +627,48 @@ struct Renderer::Impl {
     void draw(const RenderState&, Bytes, std::size_t, std::span<const std::uint32_t>,
               const Program* = nullptr, ProgramUniforms* = nullptr,const StreamDraw* = nullptr);
     FrameTarget make_target(std::uint32_t w,std::uint32_t h,SurfaceColor color_format=SurfaceColor::rgba8,
-                           SurfaceDepth depth_format=SurfaceDepth::z24s8,const FrameTarget* shared=nullptr) {
+                           SurfaceDepth depth_format=SurfaceDepth::z24s8,const FrameTarget* shared=nullptr,bool presentation=false) {
         extent(w,h);
+        if(std::max(w,h)*scale>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+            throw std::runtime_error("The internal resolution exceeds the graphics adapter's surface limit");
         FrameTarget output{};
         output.width = w;
         output.height = h;
         output.color_format = color_format;
         output.depth_format = depth_format;
         const auto native_color=color_format==SurfaceColor::rgb565?DXGI_FORMAT_B5G6R5_UNORM:DXGI_FORMAT_R8G8B8A8_UNORM;
+        // Only scene-sized surfaces are multisampled. Smaller render-to-texture
+        // surfaces (the shadow masks) are data whose edges lie on guest pixel
+        // centers; sample positions around a center would split their coverage.
+        const bool scene=presentation || (targets.contains(0) && w==targets.at(0).width && h==targets.at(0).height);
+        const auto count=shared?shared->image->samples:!scene?1U:color_format==SurfaceColor::rgb565?samples565:samples;
         D3D11_TEXTURE2D_DESC texture{};
-        texture.Width=w; texture.Height=h; texture.MipLevels=texture.ArraySize=1;
-        texture.Format=native_color; texture.SampleDesc.Count=1;
-        texture.BindFlags=D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        texture.Width=w*scale; texture.Height=h*scale; texture.MipLevels=texture.ArraySize=1;
+        texture.Format=native_color; texture.SampleDesc.Count=count;
+        texture.BindFlags=D3D11_BIND_RENDER_TARGET | (count==1?D3D11_BIND_SHADER_RESOURCE:0);
         if(shared) {
             if(shared->width!=w || shared->height!=h || shared->color_format!=color_format)
                 throw std::runtime_error("Shared color image dimensions or format differ");
-            output.color=shared->color;output.color_view=shared->color_view;output.texture_view=shared->texture_view;
+            output.image=shared->image;
         } else {
-            checked(device->CreateTexture2D(&texture,nullptr,&output.color), "Offscreen target");
-            checked(device->CreateRenderTargetView(output.color.Get(),nullptr,&output.color_view), "Offscreen view");
-            checked(device->CreateShaderResourceView(output.color.Get(),nullptr,&output.texture_view),"Target texture view");
+            auto image=std::make_shared<ColorImage>();
+            image->format=native_color;image->samples=count;
+            checked(device->CreateTexture2D(&texture,nullptr,&image->color), "Offscreen target");
+            checked(device->CreateRenderTargetView(image->color.Get(),nullptr,&image->target), "Offscreen view");
+            if(count>1) {
+                auto resolved=texture;resolved.SampleDesc.Count=1;resolved.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+                checked(device->CreateTexture2D(&resolved,nullptr,&image->resolved),"Resolved target");
+            } else image->resolved=image->color;
+            checked(device->CreateShaderResourceView(image->resolved.Get(),nullptr,&image->view),"Target texture view");
+            output.image=std::move(image);
         }
         texture.Format=depth_format==SurfaceDepth::z16?DXGI_FORMAT_D16_UNORM:DXGI_FORMAT_D24_UNORM_S8_UINT; texture.BindFlags=D3D11_BIND_DEPTH_STENCIL;
         checked(device->CreateTexture2D(&texture,nullptr,&output.depth), "Depth target");
         checked(device->CreateDepthStencilView(output.depth.Get(),nullptr,&output.depth_view), "Depth view");
-        texture.Format=native_color; texture.BindFlags=0;
-        texture.Usage=D3D11_USAGE_STAGING; texture.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
-        checked(device->CreateTexture2D(&texture,nullptr,&output.staging), "Readback target");
         return output;
     }
     void unbind_textures() {
+        if(std::exchange(geometry_bound,false)) context->GSSetShader(nullptr,nullptr,0);
         bound = {};
         std::array<ID3D11ShaderResourceView*,12> empty{};
         context->PSSetShaderResources(0,static_cast<UINT>(empty.size()),empty.data());
@@ -543,19 +679,19 @@ struct Renderer::Impl {
         unbind_textures();context->OMSetRenderTargets(0,nullptr,nullptr);
         const auto& output=found->second;
         width=output.width;height=output.height;current_target=id;
-        target=output.color;depth=output.depth;staging=output.staging;rtv=output.color_view;dsv=output.depth_view;
+        current_image=output.image.get();rtv=current_image->target;dsv=output.depth_view;
         auto color=rtv.Get();context->OMSetRenderTargets(1,&color,dsv.Get());
-        const D3D11_VIEWPORT viewport{0,0,float(width),float(height),0,1};
+        const D3D11_VIEWPORT viewport{0,0,float(width*scale),float(height*scale),0,1};
         context->RSSetViewports(1,&viewport);
     }
     void resize(std::uint32_t w, std::uint32_t h) {
         extent(w,h);
         if (recording || current_target) throw std::runtime_error("Resize the main target outside frame submission");
-        if (target && width==w && height==h) return;
+        if (current_image && width==w && height==h) return;
         const auto required=std::size_t(w)*h*12;
-        const auto prior=target?std::size_t(width)*height*12:0;
+        const auto prior=current_image?std::size_t(width)*height*12:0;
         if(required>256*1024*1024-(target_bytes-prior)) throw std::runtime_error("Render targets exceed 256 MiB");
-        auto output=make_target(w,h);
+        auto output=make_target(w,h,SurfaceColor::rgba8,SurfaceDepth::z24s8,nullptr,true);
         targets.insert_or_assign(0,std::move(output));target_bytes=target_bytes-prior+required;
         select_target(0);ended=false;
     }
@@ -576,7 +712,7 @@ std::uint32_t Renderer::create_target(std::uint32_t width,std::uint32_t height,S
     if(shared_color!=UINT32_MAX && (!shared_color || shared==r.targets.end()))
         throw std::runtime_error("Share the color image of an existing auxiliary target");
     auto output=r.make_target(width,height,color,depth,shared==r.targets.end()?nullptr:&shared->second);
-    const auto id=r.store_texture(output.texture_view,1);
+    const auto id=r.store_texture(output.image->view,1,output.image.get());
     r.targets.emplace(id,std::move(output));r.target_bytes+=required;
     if(color==SurfaceColor::rgb565) {
         RenderState conversion;conversion.texture_modes[0]=1;conversion.textures[0]=id;conversion.final_inputs={0x00000008,0x00001800};
@@ -593,7 +729,7 @@ void Renderer::grow_target(std::uint32_t target,std::uint32_t width,std::uint32_
     if(width<original.width || height<original.height) throw std::runtime_error("Target growth cannot shrink either dimension");
     if(width==original.width && height==original.height) return;
     std::vector<std::uint32_t> aliases{target};
-    for(const auto& [id,image]:r.targets) if(id!=target && image.color==original.color) aliases.push_back(id);
+    for(const auto& [id,image]:r.targets) if(id!=target && image.image==original.image) aliases.push_back(id);
     const auto previous=std::size_t(original.width)*original.height*12*aliases.size();
     const auto required=std::size_t(width)*height*12*aliases.size();
     if(required>256*1024*1024-(r.target_bytes-previous)) throw std::runtime_error("Render targets exceed 256 MiB");
@@ -604,24 +740,28 @@ void Renderer::grow_target(std::uint32_t target,std::uint32_t width,std::uint32_
         identifier==target?nullptr:&r.targets.at(target));
     constexpr float black[4]{};
     if(identifier==target) {
-        r.context->ClearRenderTargetView(output.color_view.Get(),black);
-        r.context->CopySubresourceRegion(output.color.Get(),0,0,0,0,prior.color.Get(),0,nullptr);
+        r.context->ClearRenderTargetView(output.image->target.Get(),black);
+        r.copy_image(*output.image,*prior.image,0,0,0,0,prior.width*r.scale,prior.height*r.scale);
     }
     r.context->ClearDepthStencilView(output.depth_view.Get(),D3D11_CLEAR_DEPTH|(prior.depth_format==SurfaceDepth::z16?0:D3D11_CLEAR_STENCIL),1,0);
     // Depth/stencil resources require whole copies with matching dimensions.
     // Migrate their packed bits through ordinary typeless textures, then copy
     // the complete enlarged image back into its depth/stencil resource.
-    D3D11_TEXTURE2D_DESC packed{};packed.Width=prior.width;packed.Height=prior.height;
+    // Multisampled depth has no partial copy and restarts cleared.
+    if(output.image->samples==1 && prior.image->samples==1) {
+    D3D11_TEXTURE2D_DESC packed{};packed.Width=prior.width*r.scale;packed.Height=prior.height*r.scale;
     packed.MipLevels=packed.ArraySize=1;packed.Format=prior.depth_format==SurfaceDepth::z16?DXGI_FORMAT_R16_TYPELESS:DXGI_FORMAT_R24G8_TYPELESS;packed.SampleDesc.Count=1;
     ComPtr<ID3D11Texture2D> previous_depth,grown_depth;
     checked(r.device->CreateTexture2D(&packed,nullptr,&previous_depth),"Previous depth transfer");
-    packed.Width=width;packed.Height=height;
+    packed.Width=width*r.scale;packed.Height=height*r.scale;
     checked(r.device->CreateTexture2D(&packed,nullptr,&grown_depth),"Grown depth transfer");
     r.context->CopyResource(previous_depth.Get(),prior.depth.Get());
     r.context->CopyResource(grown_depth.Get(),output.depth.Get());
     r.context->CopySubresourceRegion(grown_depth.Get(),0,0,0,0,previous_depth.Get(),0,nullptr);
     r.context->CopyResource(output.depth.Get(),grown_depth.Get());
-    r.targets.at(identifier)=std::move(output);r.textures[identifier]=r.targets.at(identifier).texture_view;
+    }
+    auto& placed=r.targets.at(identifier);placed=std::move(output);
+    r.textures[identifier]=placed.image->view;r.target_images[identifier]=placed.image.get();
     }
     r.target_bytes=r.target_bytes-previous+required;r.select_target(r.current_target);
 }
@@ -632,7 +772,8 @@ void Renderer::copy_target(std::uint32_t destination) {
         found->second.color_format!=r.targets.at(r.current_target).color_format)
         throw std::runtime_error("Target copy requires a distinct target with matching dimensions");
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
-    r.context->CopyResource(found->second.color.Get(),r.target.Get());
+    r.context->CopyResource(found->second.image->color.Get(),r.current_image->color.Get());
+    found->second.image->dirty=true;
     auto view=r.rtv.Get();r.context->OMSetRenderTargets(1,&view,r.dsv.Get());
 }
 void Renderer::copy_region(std::uint32_t destination,std::uint32_t source,
@@ -647,23 +788,16 @@ void Renderer::copy_region(std::uint32_t destination,std::uint32_t source,
        width>input.width-sx || height>input.height-sy || dx>output.width || dy>output.height ||
        width>output.width-dx || height>output.height-dy)
         throw std::runtime_error("Image copy rectangle or format differs from its surfaces");
-    if(!width || !height || (input.color==output.color && sx==dx && sy==dy)) return;
+    if(!width || !height || (input.image==output.image && sx==dx && sy==dy)) return;
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
-    const D3D11_BOX region{sx,sy,0,sx+width,sy+height,1};
-    if(input.color==output.color) {
-        D3D11_TEXTURE2D_DESC description{};input.color->GetDesc(&description);
-        description.Width=width;description.Height=height;description.BindFlags=0;
-        ComPtr<ID3D11Texture2D> temporary;
-        checked(r.device->CreateTexture2D(&description,nullptr,&temporary),"Overlapping image copy");
-        r.context->CopySubresourceRegion(temporary.Get(),0,0,0,0,input.color.Get(),0,&region);
-        r.context->CopySubresourceRegion(output.color.Get(),0,dx,dy,0,temporary.Get(),0,nullptr);
-    } else r.context->CopySubresourceRegion(output.color.Get(),0,dx,dy,0,input.color.Get(),0,&region);
+    const auto s=r.scale;
+    r.copy_image(*output.image,*input.image,sx*s,sy*s,dx*s,dy*s,width*s,height*s);
     auto view=r.rtv.Get();r.context->OMSetRenderTargets(1,&view,r.dsv.Get());
 }
 void Renderer::copy_to_main() {
     auto& r=*impl_;
     if(r.recording || !r.current_target) throw std::runtime_error("Copy an ended auxiliary target to the main image");
-    const auto source=r.target;
+    const auto source=r.current_image;
     const auto identifier=r.current_target;
     const auto format=r.targets.at(identifier).color_format;
     const auto width=r.width,height=r.height;
@@ -679,7 +813,8 @@ void Renderer::copy_to_main() {
         constexpr std::array<std::uint32_t,6> indices{0,1,2,0,2,3};draw(state,vertices,indices);end();return;
     }
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
-    r.context->CopyResource(r.target.Get(),source.Get());
+    r.context->CopyResource(r.current_image->color.Get(),source->color.Get());
+    r.current_image->dirty=true;
     r.ended=true;
 }
 ID3D11Device* Renderer::native_device() const {return impl_->device.Get();}
@@ -704,13 +839,8 @@ void Renderer::attach_window(void* native_window) {
     description.Flags=r.swapchain_flags;
     checked(factory->CreateSwapChainForHwnd(r.device.Get(),window,&description,nullptr,nullptr,&r.swapchain),"Window swapchain");
     checked(factory->MakeWindowAssociation(window,DXGI_MWA_NO_ALT_ENTER),"Window association");
-    const auto vs=r.shader(ShaderKind::display_vertex),ps=r.shader(ShaderKind::display_pixel);
-    checked(r.device->CreateVertexShader(vs.data(),vs.size(),nullptr,&r.display_vs),"Display vertex shader");
+    const auto ps=r.shader(ShaderKind::display_pixel);
     checked(r.device->CreatePixelShader(ps.data(),ps.size(),nullptr,&r.display_ps),"Display pixel shader");
-    D3D11_SAMPLER_DESC sampler{};sampler.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sampler.MaxLOD=D3D11_FLOAT32_MAX;
-    sampler.ComparisonFunc=D3D11_COMPARISON_ALWAYS;
-    checked(r.device->CreateSamplerState(&sampler,&r.display_sampler),"Display sampler");
     D3D11_RASTERIZER_DESC raster{};raster.FillMode=D3D11_FILL_SOLID;raster.CullMode=D3D11_CULL_NONE;raster.DepthClipEnable=true;
     checked(r.device->CreateRasterizerState(&raster,&r.display_raster),"Display rasterizer");
     D3D11_DEPTH_STENCIL_DESC depth{};
@@ -743,12 +873,27 @@ void Renderer::display_gamma(std::span<const std::array<std::byte, 3>, 256> gamm
 bool Renderer::display(const VideoOverlay* video, bool widescreen) {
     auto& r=*impl_;
     if(!r.window || !r.ended || r.recording) throw std::runtime_error("Display the completed main target on its attached window");
-    const auto& main = r.targets.at(0);
     RECT rectangle{};if(!GetClientRect(r.window,&rectangle)) throw std::runtime_error("Cannot read window dimensions");
     const auto width=static_cast<std::uint32_t>(rectangle.right),height=static_cast<std::uint32_t>(rectangle.bottom);
     if(!width || !height) return false;
     extent(width,height);
+    r.apply_enhancements();
+    const auto& main = r.targets.at(0);
     r.unbind_textures();r.context->OMSetRenderTargets(0,nullptr,nullptr);
+    // Movies compose over the guest-resolution image exactly as at 1x. The
+    // game image is anti-aliased at its internal resolution.
+    ID3D11ShaderResourceView* texture=nullptr;
+    if(video) texture=r.native_image(main).second;
+    else {
+        r.resolve(*main.image);
+        texture=main.image->view.Get();
+        if(r.fxaa) {
+            const auto w=main.width*r.scale,h=main.height*r.scale;
+            r.fxaa_image.resize(r.device.Get(),w,h,main.image->format,true);
+            r.blit(r.fxaa_image.target.Get(),texture,{0,0,float(w),float(h),0,1},{0,0,LONG(w),LONG(h)},{},r.fxaa_ps.Get());
+            texture=r.fxaa_image.view.Get();
+        }
+    }
     if(!r.window_view || r.window_width!=width || r.window_height!=height) {
         r.window_view.Reset();checked(r.swapchain->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,r.swapchain_flags),"Window resize");
         ComPtr<ID3D11Texture2D> buffer;checked(r.swapchain->GetBuffer(0,IID_PPV_ARGS(&buffer)),"Window buffer");
@@ -763,7 +908,7 @@ bool Renderer::display(const VideoOverlay* video, bool widescreen) {
     r.context->OMSetBlendState(nullptr,nullptr,UINT_MAX);
     r.context->IASetInputLayout(nullptr);r.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     r.context->VSSetShader(r.display_vs.Get(),nullptr,0);r.context->PSSetShader(r.display_ps.Get(),nullptr,0);
-    auto texture=main.texture_view.Get();auto sampler=r.display_sampler.Get();
+    auto sampler=r.display_sampler.Get();
     if (video) {
         const auto& geo=video->geometry;
         const auto pairs=(geo.width+1)/2;
@@ -995,7 +1140,9 @@ void Renderer::prepare(const RenderState& state) {
         sampler.MaxAnisotropy = 1U << ((control >> 4) & 3);
         if (sampler.MaxAnisotropy > 1) sampler.Filter = D3D11_FILTER_ANISOTROPIC;
         sampler.ComparisonFunc = D3D11_COMPARISON_NEVER;
-        checked(r.device->CreateSamplerState(&sampler, &pipeline.samplers[i]), "Sampler state");
+        pipeline.filters[i] = sampler;
+        const auto native = r.enhanced(sampler);
+        checked(r.device->CreateSamplerState(&native, &pipeline.samplers[i]), "Sampler state");
     }
     r.pipelines.emplace(key, std::move(pipeline));
 }
@@ -1141,7 +1288,9 @@ void Renderer::clear(std::uint32_t argb, float depth) {
 void Renderer::clear_color(std::uint32_t target,std::uint32_t argb) {
     auto& r=*impl_;
     const auto rgba=color(argb);
-    r.context->ClearRenderTargetView(r.targets.at(target).color_view.Get(),rgba.data());
+    auto& image=*r.targets.at(target).image;
+    r.context->ClearRenderTargetView(image.target.Get(),rgba.data());
+    image.dirty=true;
 }
 void Renderer::clear_buffers(std::uint32_t flags,std::uint32_t argb,float depth,std::uint8_t stencil,
                              std::span<const std::int32_t> rectangle) {
@@ -1163,8 +1312,11 @@ void Renderer::clear_buffers(std::uint32_t flags,std::uint32_t argb,float depth,
         checked(r.context->Map(r.clear_constants.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&mapped),"Clear constants");
         std::memcpy(mapped.pData,constants.data(),sizeof(constants));r.context->Unmap(r.clear_constants.Get(),0);
         r.unbind_textures();auto target=r.rtv.Get();r.context->OMSetRenderTargets(1,&target,r.dsv.Get());
-        const D3D11_VIEWPORT viewport{0,0,float(r.width),float(r.height),0,1};
-        r.context->RSSetViewports(1,&viewport);r.context->RSSetScissorRects(1,&bounds);r.context->RSSetState(r.clear_raster.Get());
+        const auto s=LONG(r.scale);
+        const D3D11_VIEWPORT viewport{0,0,float(r.width*r.scale),float(r.height*r.scale),0,1};
+        const D3D11_RECT pixels{bounds.left*s,bounds.top*s,bounds.right*s,bounds.bottom*s};
+        r.current_image->dirty=true;
+        r.context->RSSetViewports(1,&viewport);r.context->RSSetScissorRects(1,&pixels);r.context->RSSetState(r.clear_raster.Get());
         r.context->OMSetBlendState(r.clear_blends[(flags>>4)&15].Get(),nullptr,UINT_MAX);
         r.context->OMSetDepthStencilState(r.clear_depths[flags&3].Get(),stencil);
         r.context->IASetInputLayout(nullptr);r.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1188,10 +1340,11 @@ void Renderer::begin(std::uint32_t argb, float depth, bool clear_target) {
         r.context->Begin(timing.timer.Get());r.context->End(timing.start.Get());break;
     }
     r.recording = true; r.ended = false;
+    if (std::exchange(r.geometry_bound, false)) r.context->GSSetShader(nullptr, nullptr, 0);
     r.bound = {};
     auto target = r.rtv.Get();
     r.context->OMSetRenderTargets(1, &target, r.dsv.Get());
-    const D3D11_VIEWPORT viewport{0, 0, float(r.width), float(r.height), 0, 1};
+    const D3D11_VIEWPORT viewport{0, 0, float(r.width * r.scale), float(r.height * r.scale), 0, 1};
     r.context->RSSetViewports(1, &viewport);
 }
 void Renderer::clear_stencil(std::uint8_t value) {
@@ -1214,7 +1367,7 @@ void Renderer::draw_program(const RenderState& state,std::uint32_t program,const
     default:throw std::runtime_error(std::format("Unsupported NV2A fog mode 0x{:X}",state.fog_mode));
     }
     const bool absolute=state.fog_mode==0x0802 || state.fog_mode==0x0803 || state.fog_mode==0x0804;
-    ProgramUniforms uniforms{constants,{2.0f/r.width,2.0f/r.height,1/view.depth_scale,view.subpixel_bias},
+    ProgramUniforms uniforms{constants,{2.0f/r.width,2.0f/r.height,1/view.depth_scale,view.subpixel_bias+r.center_offset()},
         {state.fog_parameters[0],state.fog_parameters[1],float(mode),state.fog_enable?(absolute?2.0f:1.0f):0.0f},view.texture_scales};
     uniforms.horizontal_scale = view.horizontal_scale;
     uniforms.horizontal_offset = view.horizontal_offset;
@@ -1233,7 +1386,7 @@ void Renderer::draw_streams(const RenderState& state,std::uint32_t layout,const 
     default:throw std::runtime_error(std::format("Unsupported NV2A fog mode 0x{:X}",state.fog_mode));
     }
     const bool absolute=state.fog_mode==0x0802 || state.fog_mode==0x0803 || state.fog_mode==0x0804;
-    ProgramUniforms uniforms{constants,{2.0f/r.width,2.0f/r.height,1/view.depth_scale,view.subpixel_bias},
+    ProgramUniforms uniforms{constants,{2.0f/r.width,2.0f/r.height,1/view.depth_scale,view.subpixel_bias+r.center_offset()},
         {state.fog_parameters[0],state.fog_parameters[1],float(mode),state.fog_enable?(absolute?2.0f:1.0f):0.0f},view.texture_scales};
     uniforms.horizontal_scale = view.horizontal_scale;
     uniforms.horizontal_offset = view.horizontal_offset;
@@ -1316,7 +1469,11 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
             throw std::runtime_error("Copy the active render target before sampling its contents");
         if(sampled && r.texture_dimensions[state.textures[i]]!=(mode==3?3U:mode==2?2U:1U))
             throw std::runtime_error("Texture resource dimension does not match its shader mode");
-        if(sampled) views[i+(mode==3?4:mode==2?8:0)] = r.textures[state.textures[i]].Get();
+        if(sampled) {
+            // A multisampled surface is read through its resolve.
+            if(auto* image=r.target_images[state.textures[i]]; image && image->dirty) r.resolve(*image);
+            views[i+(mode==3?4:mode==2?8:0)] = r.textures[state.textures[i]].Get();
+        }
         const auto sample_flags=std::uint32_t(state.alpha_kill[i]) | (std::uint32_t(state.texture_alpha_one[i])<<1);
         constants.stages[i]={mode,state.texture_sources[i],state.texture_clip[i],sample_flags};
         samplers[i] = pipeline.samplers[i].Get();
@@ -1396,6 +1553,19 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     if (std::exchange(bound.tokens,tokens)!=tokens) r.context->VSSetConstantBuffers(2,1,&tokens);
     if (std::exchange(bound.layout,layout)!=layout) r.context->IASetInputLayout(layout);
     if (std::exchange(bound.topology,topology)!=topology) r.context->IASetPrimitiveTopology(topology);
+    // Above 1x, lines keep the width of one guest pixel.
+    const bool wide=r.scale>1 && (topology==D3D11_PRIMITIVE_TOPOLOGY_LINELIST || topology==D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP);
+    if (wide && r.line_surface!=std::array{r.width,r.height}) {
+        const std::array<float,4> pixel{2.0f/r.width,-2.0f/r.height,0,0};
+        r.context->UpdateSubresource(r.line_constants.Get(),0,nullptr,pixel.data(),0,0);
+        r.line_surface={r.width,r.height};
+    }
+    const auto geometry=wide?r.line_gs.Get():nullptr;
+    if (std::exchange(bound.geometry,geometry)!=geometry) {
+        r.context->GSSetShader(geometry,nullptr,0);
+        if (geometry) {auto constants=r.line_constants.Get();r.context->GSSetConstantBuffers(0,1,&constants);}
+        r.geometry_bound=geometry!=nullptr;
+    }
     if (std::exchange(bound.vertex,vertex)!=vertex) r.context->VSSetShader(vertex,nullptr,0);
     if (std::exchange(bound.pixel,pixel)!=pixel) r.context->PSSetShader(pixel,nullptr,0);
     if (!bound.pipeline || bound.textures!=views) {
@@ -1413,10 +1583,12 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         bound.pipeline=&pipeline;
     }
     if(state.scissor_test) {
-        const D3D11_RECT rect{state.scissor[0],state.scissor[1],state.scissor[2],state.scissor[3]};
+        const auto s=LONG(r.scale);
+        const D3D11_RECT rect{state.scissor[0]*s,state.scissor[1]*s,state.scissor[2]*s,state.scissor[3]*s};
         if(rect.right<rect.left || rect.bottom<rect.top) throw std::runtime_error("Invalid scissor rectangle");
         r.context->RSSetScissorRects(1,&rect);
     }
+    r.current_image->dirty=true;
     if (indices.empty()) r.context->Draw(static_cast<UINT>(vertex_count), 0);
     else {
         UINT index_offset;
@@ -1441,9 +1613,22 @@ Image Renderer::readback(bool main_target) {
     if (!r.ended || r.recording) throw std::runtime_error("End a frame before reading back");
     const auto& target = r.targets.at(main_target ? 0 : r.current_target);
     Image image{target.width, target.height, std::vector<std::byte>(std::size_t(target.width) * target.height * 4)};
-    r.context->CopyResource(target.staging.Get(), target.color.Get());
+    // Captures keep guest resolution at every internal resolution.
+    const auto source = r.native_image(target).first;
+    D3D11_TEXTURE2D_DESC description{};
+    if (r.readback_staging) r.readback_staging->GetDesc(&description);
+    if (!r.readback_staging || description.Width != target.width || description.Height != target.height ||
+        description.Format != target.image->format) {
+        description = {};
+        description.Width = target.width; description.Height = target.height;
+        description.MipLevels = description.ArraySize = 1; description.Format = target.image->format;
+        description.SampleDesc.Count = 1; description.Usage = D3D11_USAGE_STAGING; description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        checked(r.device->CreateTexture2D(&description, nullptr, r.readback_staging.ReleaseAndGetAddressOf()), "Readback target");
+    }
+    const auto staging = r.readback_staging.Get();
+    r.context->CopyResource(staging, source);
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    checked(r.context->Map(target.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped), "Frame readback");
+    checked(r.context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped), "Frame readback");
     const bool rgb565=target.color_format==SurfaceColor::rgb565;
     for(unsigned y=0;y<target.height;++y) {
         const auto* row=static_cast<const std::byte*>(mapped.pData)+std::size_t(y)*mapped.RowPitch;
@@ -1456,7 +1641,8 @@ Image Renderer::readback(bool main_target) {
             pixels[x*4+2]=std::byte(((value&31)*255+15)/31);pixels[x*4+3]=std::byte{255};
         }
     }
-    r.context->Unmap(target.staging.Get(), 0);
+    r.context->Unmap(staging, 0);
+    if (r.scale > 1) { auto view = r.rtv.Get(); r.context->OMSetRenderTargets(1, &view, r.dsv.Get()); }
     r.collect_timings();
     return image;
 }
@@ -1481,7 +1667,81 @@ std::array<std::uint32_t, 2> Renderer::scanout_size() const {
     const auto& main = impl_->targets.at(0);
     return {main.width, main.height};
 }
+std::array<std::uint32_t, 2> Renderer::render_size() const {
+    const auto& main = impl_->targets.at(0);
+    return {main.width * impl_->scale, main.height * impl_->scale};
+}
 std::array<std::uint32_t, 2> Renderer::display_size() const { return {impl_->window_width, impl_->window_height}; }
+void Renderer::enhance(const RenderEnhancements& request) { impl_->requested = request; }
+RenderEnhancements Renderer::enhancements() const {
+    const auto& r = *impl_;
+    return {int(r.scale), int(r.samples), int(r.anisotropy), r.fxaa};
+}
+int Renderer::max_samples() const { return int(impl_->sample_limit); }
+std::string Renderer::enhancement_error() const { return impl_->enhancement_error; }
+void Renderer::Impl::apply_enhancements() {
+    if (requested == last_request) return;
+    last_request = requested;
+    const auto power = [](int value, int limit) { return std::bit_floor(static_cast<UINT>(std::clamp(value, 1, limit))); };
+    auto next_scale = static_cast<UINT>(std::clamp(requested.scale, 1, 6));
+    const auto next_samples = power(requested.samples, int(sample_limit));
+    const auto next_samples565 = std::min(next_samples, sample_limit565);
+    std::uint32_t largest = 1;
+    for (const auto& [id, surface] : targets) largest = std::max({largest, surface.width, surface.height});
+    while (next_scale > 1 && largest * next_scale > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) --next_scale;
+    enhancement_error.clear();
+    if (next_scale < static_cast<UINT>(requested.scale))
+        enhancement_error = std::format("Internal resolution is limited to {}x by the graphics adapter.", next_scale);
+    else if (next_samples < static_cast<UINT>(requested.samples))
+        enhancement_error = sample_limit > 1 ? std::format("The graphics adapter supports up to {}x MSAA.", sample_limit)
+                                             : std::string("The graphics adapter does not support MSAA.");
+    fxaa = requested.fxaa;
+    if (next_scale != scale || next_samples != samples || next_samples565 != samples565) {
+        // Build every surface before releasing the current ones, so a failure
+        // keeps the game running at its previous internal resolution.
+        const auto previous = std::array{scale, samples, samples565};
+        scale = next_scale; samples = next_samples; samples565 = next_samples565;
+        std::map<std::uint32_t, FrameTarget> rebuilt;
+        std::map<ColorImage*, FrameTarget*> images;
+        try {
+            for (const auto& [id, surface] : targets) {
+                const auto alias = images.find(surface.image.get());
+                auto output = make_target(surface.width, surface.height, surface.color_format, surface.depth_format,
+                                          alias == images.end() ? nullptr : alias->second, id == 0);
+                auto& placed = rebuilt.emplace(id, std::move(output)).first->second;
+                if (alias == images.end()) images.emplace(surface.image.get(), &placed);
+            }
+        } catch (const std::exception& error) {
+            std::tie(scale, samples, samples565) = std::tuple{previous[0], previous[1], previous[2]};
+            enhancement_error = std::string("Could not change the internal resolution: ") + error.what();
+            return;
+        }
+        // Carry color across; depth and stencil restart cleared, as after a
+        // frame. Surfaces the game keeps between frames hold only color.
+        for (const auto& [old, surface] : images) {
+            resolve(*old);
+            const auto w = surface->width * scale, h = surface->height * scale;
+            blit(surface->image->target.Get(), old->view.Get(), {0, 0, float(w), float(h), 0, 1}, {0, 0, LONG(w), LONG(h)});
+            surface->image->dirty = true;
+        }
+        for (const auto& [id, surface] : rebuilt)
+            context->ClearDepthStencilView(surface.depth_view.Get(),
+                D3D11_CLEAR_DEPTH | (surface.depth_format == SurfaceDepth::z16 ? 0 : D3D11_CLEAR_STENCIL), 1, 0);
+        targets = std::move(rebuilt);
+        for (const auto& [id, surface] : targets) if (id) { textures[id] = surface.image->view; target_images[id] = surface.image.get(); }
+        native_copy = {}; fxaa_image = {}; readback_staging.Reset();
+        select_target(current_target);
+    }
+    const auto next_anisotropy = power(requested.anisotropy, 16);
+    if (next_anisotropy != anisotropy) {
+        anisotropy = next_anisotropy;
+        for (auto& [key, pipeline] : pipelines) for (unsigned i = 0; i < pipeline.samplers.size(); ++i) {
+            const auto sampler = enhanced(pipeline.filters[i]);
+            checked(device->CreateSamplerState(&sampler, pipeline.samplers[i].ReleaseAndGetAddressOf()), "Sampler state");
+        }
+        unbind_textures();
+    }
+}
 std::vector<std::string> Renderer::errors() const {
     std::vector<std::string> messages;
     const auto& queue = impl_->info;

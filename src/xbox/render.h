@@ -1,5 +1,6 @@
 #pragma once
 #include "file.h"
+#include "settings.h"
 #include "vertex_program.h"
 #include <array>
 #include <memory>
@@ -121,6 +122,12 @@ public:
     void attach_window(void* native_window);
     void display_gamma(std::span<const std::array<std::byte, 3>, 256> gamma);
     bool display(const VideoOverlay* video = nullptr, bool widescreen = false); // Scale the completed scanout to the window.
+    // Window renderers apply a request when they next display a frame. Applied
+    // values are limited to what the adapter supports.
+    void enhance(const RenderEnhancements&);
+    RenderEnhancements enhancements() const;
+    int max_samples() const;
+    std::string enhancement_error() const;
     void present(bool vsync);
     ID3D11Device* native_device() const;
     ID3D11DeviceContext* native_context() const;
@@ -146,7 +153,8 @@ public:
     Image read_display();
     RenderStats stats() const;
     std::string adapter() const;
-    std::array<std::uint32_t, 2> scanout_size() const;
+    std::array<std::uint32_t, 2> scanout_size() const; // Guest pixels.
+    std::array<std::uint32_t, 2> render_size() const; // Host pixels at the internal resolution.
     std::array<std::uint32_t, 2> display_size() const;
     std::vector<std::string> errors() const;
 private:

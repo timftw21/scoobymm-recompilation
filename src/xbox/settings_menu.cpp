@@ -9,12 +9,13 @@
 #include <algorithm>
 #include <array>
 #include <format>
+#include <span>
 #include <Windows.h>
 #include <commdlg.h>
 
 namespace xbox_native {
 SettingsMenu::SettingsMenu(SDL_Window* window, Renderer& renderer, PlayerSettings& settings, std::filesystem::path file)
-    : window_(window), settings_(settings), file_(std::move(file)), custom_rate_(settings.refresh_rate) {
+    : window_(window), renderer_(renderer), settings_(settings), file_(std::move(file)), custom_rate_(settings.refresh_rate) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     auto& io = ImGui::GetIO();
@@ -78,9 +79,50 @@ bool SettingsMenu::browse(std::filesystem::path& selected, bool disc) {
     return true;
 }
 
+void SettingsMenu::notify(Notice, std::string title, std::string detail) {
+    notice_ = detail.empty() ? std::move(title) : title + ": " + detail;
+    notice_until_ = SDL_GetTicksNS() + 4'000'000'000ULL;
+}
+
+bool SettingsMenu::enhancements_page() {
+    auto& e = settings_.enhancements;
+    bool changed = false;
+    const auto choice = [&](const char* id, int& value, std::span<const int> values, auto&& name, int limit) {
+        if (!ImGui::BeginCombo(id, name(value).c_str())) return;
+        for (const int option : values) {
+            ImGui::BeginDisabled(option > limit);
+            if (ImGui::Selectable(name(option).c_str(), value == option) && value != option) { value = option; changed = true; }
+            ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
+    };
+    const auto [width, height] = renderer_.scanout_size();
+    ImGui::TextUnformatted("Internal resolution");
+    constexpr std::array scales{1,2,3,4,5,6};
+    choice("##Internal resolution", e.scale, scales, [&](int n) {
+        return std::format("{}x{} ({}x{})", n, n == 1 ? " native" : "", width * n, height * n);
+    }, 6);
+    ImGui::TextUnformatted("Anti-aliasing");
+    constexpr std::array samples{1,2,4,8};
+    choice("##MSAA", e.samples, samples, [](int n) {
+        return n == 1 ? std::string("MSAA off") : std::format("{}x MSAA", n);
+    }, renderer_.max_samples());
+    changed |= ImGui::Checkbox("FXAA", &e.fxaa);
+    ImGui::TextUnformatted("Anisotropic filtering");
+    constexpr std::array levels{1,2,4,8,16};
+    choice("##Anisotropic filtering", e.anisotropy, levels, [](int n) {
+        return n == 1 ? std::string("Game default") : std::format("{}x", n);
+    }, 16);
+    ImGui::Spacing();
+    ImGui::TextDisabled("The defaults reproduce the original Xbox image.");
+    if (const auto error = renderer_.enhancement_error(); !error.empty()) ImGui::TextWrapped("%s", error.c_str());
+    return changed;
+}
+
 bool SettingsMenu::draw(bool playing, DiagnosticKeys& keys, bool measuring) {
     auto& s = settings_;
-    if (!visible && !s.show_fps) return false;
+    const bool noticing = !notice_.empty() && SDL_GetTicksNS() < notice_until_;
+    if (!visible && !s.show_fps && !noticing) return false;
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
@@ -98,7 +140,7 @@ bool SettingsMenu::draw(bool playing, DiagnosticKeys& keys, bool measuring) {
         ImGui::SameLine();
         ImGui::TextDisabled("Settings");
         ImGui::Separator();
-        constexpr std::array pages{"Game Files","General","Audio","Graphics","Diagnostics"};
+        constexpr std::array pages{"Game Files","General","Audio","Graphics","Enhancements","Diagnostics"};
         const float body = std::max(40.f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() - 4);
         constexpr auto child_flags = ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened;
         ImGui::BeginChild("Navigation",{std::min(140.f,width * .28f),body}, child_flags);
@@ -171,6 +213,9 @@ bool SettingsMenu::draw(bool playing, DiagnosticKeys& keys, bool measuring) {
                 break;
             }
             case 4:
+                changed |= enhancements_page();
+                break;
+            case 5:
                 ImGui::BeginDisabled(!playing);
                 if (ImGui::Button("Capture frame (F8)")) keys.capture = true;
                 if (ImGui::Button(measuring ? "Stop recording (F9)" : "Record performance (F9)")) keys.toggle_performance = true;
@@ -205,6 +250,7 @@ bool SettingsMenu::draw(bool playing, DiagnosticKeys& keys, bool measuring) {
         }
         ImGui::End();
         if (changed) {
+            renderer_.enhance(s.enhancements);
             try { s.save(file_); }
             catch (const std::exception& error) { message = error.what(); }
         }
@@ -215,6 +261,14 @@ bool SettingsMenu::draw(bool playing, DiagnosticKeys& keys, bool measuring) {
         ImGui::Begin("Frame rate",nullptr,ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
         ImGui::Text("%.0f FPS",ImGui::GetIO().Framerate);
+        ImGui::End();
+    }
+    if (noticing) {
+        ImGui::SetNextWindowPos({area.x-8,area.y-8},ImGuiCond_Always,{1,1});
+        ImGui::SetNextWindowBgAlpha(.75f);
+        ImGui::Begin("Notice",nullptr,ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                    ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::TextUnformatted(notice_.c_str());
         ImGui::End();
     }
     ImGui::Render();

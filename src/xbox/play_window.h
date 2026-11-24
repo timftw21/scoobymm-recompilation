@@ -12,6 +12,9 @@ struct SDL_Gamepad;
 namespace xbox_native {
 class Renderer;
 class SettingsMenu;
+// On-screen notices for diagnostics, shown by the settings overlay.
+enum class Notice : int { info, success, error, recording };
+
 struct DiagnosticKeys {
     bool capture{}, toggle_performance{};
 };
@@ -33,6 +36,8 @@ public:
     float gain() const;
     Renderer& renderer() const { return *renderer_; }
     const PlayerSettings& settings() const { return options_; }
+    PlayerSettings& edit_settings() { return options_; }
+    void settings_changed(); // Applies and saves settings changed in the game's menus.
     ~PlayWindow();
     PlayWindow(const PlayWindow&) = delete;
     PlayWindow& operator=(const PlayWindow&) = delete;
@@ -41,7 +46,7 @@ public:
     void begin();
     bool poll();
     DiagnosticKeys take_diagnostic_keys();
-    void diagnostic_title(std::string_view status);
+    void notify(Notice, std::string_view title, std::string_view detail = {});
     const GamepadState& input() const { return state_; }
     std::uint32_t rumble(std::uint16_t low, std::uint16_t high);
 private:

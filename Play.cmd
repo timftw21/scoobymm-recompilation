@@ -8,7 +8,10 @@ if not exist "%game%" (
     if "%~1"=="" pause
     exit /b 1
 )
+rem Without options, start the windowed game on its own so this console closes.
+if "%~1"=="" (
+    start "" "%game%"
+    exit /b 0
+)
 "%game%" %*
-set "result=%ERRORLEVEL%"
-if not "%result%"=="0" if "%~1"=="" pause
-exit /b %result%
+exit /b %ERRORLEVEL%
