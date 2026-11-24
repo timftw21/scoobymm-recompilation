@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(native_recompiler LANGUAGES C CXX)
+project(native_recompiler VERSION 0.1.0 LANGUAGES C CXX)
 
 include(FetchContent)
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
@@ -196,4 +196,33 @@ if(XBOX_GENERATED_SOURCE)
     # their console or keep their redirected output (src/play.cpp).
     set_target_properties(scoobymm PROPERTIES CXX_EXTENSIONS OFF WIN32_EXECUTABLE ON)
     target_link_options(scoobymm PRIVATE /ENTRY:wmainCRTStartup)
+    # The Runtime component is the release payload (tools/Package.ps1): no disc
+    # media, extracted executables, settings, saves, reports or generated source.
+    install(TARGETS scoobymm RUNTIME DESTINATION . COMPONENT Runtime)
+    install(FILES knowledge/supported_target.json DESTINATION knowledge COMPONENT Runtime)
+    install(FILES THIRD_PARTY_NOTICES.txt DESTINATION . COMPONENT Runtime)
+    install(FILES resources/dsp56300-notices.txt DESTINATION resources COMPONENT Runtime)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION .)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT Runtime)
+    include(InstallRequiredSystemLibraries)
+endif()
+
+set(SCOOBYMM_INSTALLER_PAYLOAD "" CACHE FILEPATH "Release payload cabinet built by tools/Package.ps1")
+set(SCOOBYMM_INSTALLER_MANIFEST "" CACHE FILEPATH "Release payload manifest built by tools/Package.ps1")
+if(WIN32 AND SCOOBYMM_INSTALLER_PAYLOAD AND SCOOBYMM_INSTALLER_MANIFEST)
+    enable_language(RC)
+    configure_file(resources/installer.rc.in generated/installer.rc @ONLY)
+    add_executable(scoobymm-setup WIN32 src/installer.cpp src/xbox/disc.cpp src/xbox/file.cpp
+        resources/installer.manifest "${CMAKE_CURRENT_BINARY_DIR}/generated/installer.rc")
+    # Setup runs before the Visual C++ runtime it installs beside the game.
+    set_property(TARGET scoobymm-setup PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_features(scoobymm-setup PRIVATE cxx_std_23)
+    set_target_properties(scoobymm-setup PROPERTIES CXX_EXTENSIONS OFF)
+    target_include_directories(scoobymm-setup PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    target_compile_definitions(scoobymm-setup PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE SCOOBYMM_VERSION="${PROJECT_VERSION}")
+    target_compile_options(scoobymm-setup PRIVATE /W4 /utf-8)
+    target_link_options(scoobymm-setup PRIVATE /ENTRY:wmainCRTStartup)
+    target_link_libraries(scoobymm-setup PRIVATE bcrypt cabinet shell32 ole32 comctl32 comdlg32 gdi32 user32 advapi32 uuid uxtheme)
+    set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/installer.rc" APPEND PROPERTY
+        OBJECT_DEPENDS "${SCOOBYMM_INSTALLER_PAYLOAD}" "${SCOOBYMM_INSTALLER_MANIFEST}" "${CMAKE_CURRENT_SOURCE_DIR}/resources/scoobymm.ico")
 endif()

@@ -10,6 +10,8 @@ offline boot, kernel service patterns, Xbox SHA1 and SDL audio mixer from
 Source: https://github.com/timftw21/smbd-recompilation
 Native NV2A packet bridge and D3D11 renderer from
 b9b49bf15d78b80b88e72fe779cb3f2a586a2a30.
+Windows setup, payload packaging and uninstaller from
+92618e2264d69b89498e1916fb968baf3adc0557.
 
 Burnout 2 MIT License
 
