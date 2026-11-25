@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(native_recompiler VERSION 0.1.0 LANGUAGES C CXX)
+project(native_recompiler VERSION 0.2.0 LANGUAGES C CXX)
 
 include(FetchContent)
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)

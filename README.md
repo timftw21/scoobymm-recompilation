@@ -10,7 +10,7 @@
 
 An unofficial native version of the original Xbox game for Windows x64, built around accurate gameplay, original presentation, and enhancements. This fan project is independent of THQ and Warner Bros. You must provide your own Xbox game disc image. Original game files are not distributed here.
 
-**0.1.0 is the first public development release.** Bugs, slowdowns, and stops in untested parts of the game are still possible. Linux and macOS remain planned targets.
+**0.2.0 is a development release.** Bugs, slowdowns, and stops in untested parts of the game are still possible. Linux and macOS remain planned targets.
 
 ## AI disclosure
 
@@ -26,12 +26,15 @@ AI coding assistants, including Anthropic Claude, have assisted with development
 
 ## Current status
 
-### Changes in 0.1.0
+### Changes in 0.2.0
 
-- First public release, with a Windows installer that verifies your disc image and prepares the game files. See [Windows x64](#windows-x64).
-- **Recomp Options** in the title and pause menus change display, enhancement, and audio settings with the game's own menus.
-- Internal resolution, antialiasing, FXAA, and anisotropic filtering, with shadows that stay correct under MSAA.
-- Fixed the stop reported in Episode 2, Level 1A, where the game copies the screen into a texture.
+- **Upscaled HUD** in Recomp Options sharpens HUD, menu, and title artwork with the Real-ESRGAN AI upscaler at 2× internal resolution and above. Results are cached on disk, so artwork seen before is sharp from its first frame.
+- **Skip intro movies** in Recomp Options goes straight to the title screen.
+- Rebind every Xbox control to a key and a controller input on the new **Controls** page of the settings window.
+- **Esc** or the controller **Guide** button now opens the settings window during play, which gains **Restart game** and **Exit game**. Settings that Recomp Options already covers were removed from it, and the Game Files page was redesigned.
+- The mouse pointer hides after three seconds without mouse activity during play.
+
+Changes in earlier releases are in the [release notes](https://github.com/timftw21/scoobymm-recompilation/releases).
 
 ### Known issues
 
@@ -65,7 +68,7 @@ AI coding assistants, including Anthropic Claude, have assisted with development
 
 You need a Direct3D 11-capable graphics card and an XISO image of the **Xbox release of Scooby-Doo! Mystery Mayhem (USA, Europe) (En,Fr,De)**. A full raw-disc dump must first be converted to XISO, for example with extract-xiso. The executable is checked against [the supported-target registry](knowledge/supported_target.json).
 
-**[Download the 0.1.0 Windows installer](https://github.com/timftw21/scoobymm-recompilation/releases/download/v0.1.0/scoobymm-0.1.0-windows-x64-setup.exe)** · [Release notes and SHA-256 checksum](https://github.com/timftw21/scoobymm-recompilation/releases/tag/v0.1.0)
+**[Download the 0.2.0 Windows installer](https://github.com/timftw21/scoobymm-recompilation/releases/download/v0.2.0/scoobymm-0.2.0-windows-x64-setup.exe)** · [Release notes and SHA-256 checksum](https://github.com/timftw21/scoobymm-recompilation/releases/tag/v0.2.0)
 
 1. Run the installer and select your Xbox XISO image.
 2. Choose an installation folder. You can keep a copy of the image with the game and create a desktop shortcut.
