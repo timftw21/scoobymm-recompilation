@@ -53,7 +53,8 @@ private:
     SDL_Window* window_{};
     SDL_Gamepad* gamepad_{};
     PlayOptions& options_;
-    bool hidden_, playing_{}, focused_{};
+    RenderEnhancements enhanced_;
+    bool hidden_, playing_{}, focused_{}, cursor_hidden_{};
     int pacing_rate_ = -1;
     std::uint64_t deadline_{};
     unsigned skip_{};
@@ -63,7 +64,7 @@ private:
     GamepadState state_, menu_input_;
     bool menu_was_open_{};
     DiagnosticKeys diagnostic_keys_;
-    std::uint64_t origin_{}, updated_{}, next_rumble_{};
+    std::uint64_t origin_{}, updated_{}, next_rumble_{}, mouse_moved_{};
     std::uint16_t low_{}, high_{};
     void refresh_gamepad();
 };

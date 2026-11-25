@@ -1,5 +1,7 @@
 #include "render.h"
+#include "interface_upscaler.h"
 #include "shaders.h"
+#include "upscaler_model.h"
 #include <Windows.h>
 #include <d3d11.h>
 #include <d3d11sdklayers.h>
@@ -8,6 +10,7 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -388,11 +391,47 @@ struct Renderer::Impl {
     std::size_t texture_bytes = 0;
     std::map<unsigned,std::size_t> uploaded_bytes;
     std::vector<unsigned> free_textures;
+    // Upscaled HUD. Marked textures name their content; finished enlargements
+    // are kept by content, so artwork reloaded into new allocations reuses
+    // them, and replace the texture's view when drawn. hud_factor is 0 when off.
+    std::unique_ptr<InterfaceUpscaler> upscaler;
+    UINT hud_factor = 0;
+    struct Enlargement { ComPtr<ID3D11ShaderResourceView> view; std::size_t bytes; std::uint64_t used; };
+    std::map<std::uint64_t, Enlargement> enlargements;
+    std::size_t enlarged_bytes = 0;
+    static constexpr std::size_t enlarged_capacity = 256 * 1024 * 1024;
+    std::vector<std::uint64_t> texture_content = std::vector<std::uint64_t>(1); // Indexed by texture id.
+    std::vector<std::array<std::uint32_t,2>> texture_sizes = std::vector<std::array<std::uint32_t,2>>(1); // Uploaded 2D textures.
+    std::uint64_t presented = 0;
+    std::chrono::steady_clock::time_point last_present{};
+    double present_interval_ms = 1000.0 / 60;
+    // Bounded disk cache of finished enlargements by content and factor, so
+    // artwork seen in an earlier session is enlarged on its first frame. Each
+    // file holds level 0 (RGBA8) after a header; mips are regenerated on load.
+    // Writes copy to a staging texture and complete without waiting.
+    std::filesystem::path hud_disk;
+    static constexpr std::uintmax_t hud_disk_limit = 512ULL * 1024 * 1024;
+    std::uintmax_t hud_disk_bytes = 0;
+    struct HudDiskHeader {
+        char magic[8]; std::uint32_t version, factor, width, height, network; std::uint8_t model[32];
+    };
+    static_assert(sizeof(HudDiskHeader) == 60);
+    struct HudSave { ComPtr<ID3D11Texture2D> staging; std::filesystem::path path; HudDiskHeader header; };
+    std::vector<HudSave> hud_saves;
+    void add_enlargement(std::uint64_t content, ComPtr<ID3D11ShaderResourceView> view, std::size_t bytes);
+    std::filesystem::path hud_disk_path(std::uint64_t content) const;
+    HudDiskHeader hud_disk_header(unsigned width, unsigned height, bool network) const;
+    bool load_enlargement(std::uint64_t content, unsigned width, unsigned height);
+    void save_enlargement(std::uint64_t content, const InterfaceUpscaler::Result&);
+    void write_hud_saves(bool wait);
+    void prune_hud_disk(std::uintmax_t target);
     unsigned store_texture(ComPtr<ID3D11ShaderResourceView> view, unsigned dimension, ColorImage* image = nullptr) {
         if (free_textures.empty()) {
             textures.push_back(std::move(view));
             texture_dimensions.push_back(dimension);
             target_images.push_back(image);
+            texture_content.push_back(0);
+            texture_sizes.push_back({});
             return static_cast<unsigned>(textures.size() - 1);
         }
         const auto id = free_textures.back();
@@ -400,8 +439,19 @@ struct Renderer::Impl {
         textures[id] = std::move(view);
         texture_dimensions[id] = dimension;
         target_images[id] = image;
+        texture_content[id] = 0;
+        texture_sizes[id] = {};
         return id;
     }
+    ID3D11ShaderResourceView* sampled_view(unsigned id) {
+        if (hud_factor && texture_content[id]) {
+            const auto found = enlargements.find(texture_content[id]);
+            if (found != enlargements.end()) { found->second.used = presented; return found->second.view.Get(); }
+        }
+        return textures[id].Get();
+    }
+    void configure_hud();
+    void finish_enlargements(double target_ms);
     bool recording = false, ended = false;
     static constexpr UINT max_vertices = 32768, max_indices = max_vertices * 6;
     static constexpr UINT vertex_capacity = max_vertices * sizeof(ProgramVertex);
@@ -700,7 +750,10 @@ Renderer::Renderer(std::uint32_t width, std::uint32_t height, bool warp, bool de
     : impl_(std::make_unique<Impl>(width, height, warp, debug)) {
     for(const auto& shader:static_vertex_shaders()) prepare_program(shader.program);
 }
-Renderer::~Renderer() = default;
+Renderer::~Renderer() {
+    // Finish writing HUD enlargements copied for the disk cache.
+    try { if (!impl_->hud_saves.empty()) impl_->write_hud_saves(true); } catch (...) {}
+}
 void Renderer::resize(std::uint32_t width, std::uint32_t height) { impl_->resize(width,height); }
 std::uint32_t Renderer::create_target(std::uint32_t width,std::uint32_t height,SurfaceColor color,SurfaceDepth depth,std::uint32_t shared_color) {
     auto& r=*impl_;extent(width,height);
@@ -995,6 +1048,169 @@ void Renderer::present(bool vsync) {
     if(!r.displaying) throw std::runtime_error("Display a frame before presenting");
     const UINT flags = !vsync && (r.swapchain_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ? DXGI_PRESENT_ALLOW_TEARING : 0;
     checked(r.swapchain->Present(vsync?1:0,flags),"Window presentation");r.displaying=false;
+    // Enlarge queued HUD artwork after the frame, for 12% of the measured
+    // presentation interval (0.25 to 2 ms of GPU time).
+    const auto now=std::chrono::steady_clock::now();
+    if(r.presented++) {
+        const auto interval=std::chrono::duration<double,std::milli>(now-r.last_present).count();
+        r.present_interval_ms=0.9*r.present_interval_ms+0.1*std::min(interval,250.0);
+    }
+    r.last_present=now;
+    if(r.upscaler && r.upscaler->queued()) r.finish_enlargements(std::clamp(0.12*r.present_interval_ms,0.25,2.0));
+    if(!r.hud_saves.empty()) r.write_hud_saves(false);
+}
+void Renderer::Impl::finish_enlargements(double target_ms) {
+    for(auto& [content,result]:upscaler->step(false,target_ms)) {
+        ++(result.network?stats.hud_network:stats.hud_filtered);
+        save_enlargement(content,result);
+        add_enlargement(content,std::move(result.view),result.bytes);
+    }
+}
+void Renderer::Impl::add_enlargement(std::uint64_t content,ComPtr<ID3D11ShaderResourceView> view,std::size_t bytes) {
+    if(const auto found=enlargements.find(content);found!=enlargements.end()) enlarged_bytes-=found->second.bytes;
+    enlarged_bytes+=bytes;
+    enlargements.insert_or_assign(content,Enlargement{std::move(view),bytes,presented});
+    // Keep enlargements within their budget, least recently drawn first.
+    while(enlarged_bytes>enlarged_capacity && enlargements.size()>1) {
+        const auto oldest=std::ranges::min_element(enlargements,{},[](const auto& item){return item.second.used;});
+        enlarged_bytes-=oldest->second.bytes;
+        enlargements.erase(oldest);
+    }
+}
+std::filesystem::path Renderer::Impl::hud_disk_path(std::uint64_t content) const {
+    return hud_disk/std::format("{:016X}-{}.hud",content,hud_factor);
+}
+Renderer::Impl::HudDiskHeader Renderer::Impl::hud_disk_header(unsigned w,unsigned h,bool network) const {
+    HudDiskHeader header{{'S','C','M','M','H','U','D','1'},1,hud_factor,w,h,network,{}};
+    for(unsigned i=0;i<32;++i)
+        header.model[i]=static_cast<std::uint8_t>(std::stoul(std::string(upscaler_model_sha256.substr(i*2,2)),nullptr,16));
+    return header;
+}
+bool Renderer::Impl::load_enlargement(std::uint64_t content,unsigned width,unsigned height) {
+    if(hud_disk.empty()) return false;
+    const auto w=width*hud_factor,h=height*hud_factor;
+    const auto path=hud_disk_path(content);
+    std::ifstream file(path,std::ios::binary);
+    if(!file) return false;
+    HudDiskHeader header{},expected=hud_disk_header(w,h,false);
+    if(!file.read(reinterpret_cast<char*>(&header),sizeof(header))) return false;
+    expected.network=header.network;
+    if(std::memcmp(&header,&expected,sizeof(header))) return false;
+    std::vector<std::byte> pixels(std::size_t(w)*h*4);
+    if(!file.read(reinterpret_cast<char*>(pixels.data()),static_cast<std::streamsize>(pixels.size())) ||
+       file.peek()!=std::char_traits<char>::eof()) return false;
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width=w;desc.Height=h;desc.MipLevels=0;desc.ArraySize=1;
+    desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;desc.SampleDesc.Count=1;
+    desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;desc.MiscFlags=D3D11_RESOURCE_MISC_GENERATE_MIPS;
+    ComPtr<ID3D11Texture2D> texture;ComPtr<ID3D11ShaderResourceView> view;
+    if(FAILED(device->CreateTexture2D(&desc,nullptr,&texture)) || FAILED(device->CreateShaderResourceView(texture.Get(),nullptr,&view)))
+        return false;
+    context->UpdateSubresource(texture.Get(),0,nullptr,pixels.data(),w*4,0);
+    context->GenerateMips(view.Get());
+    std::size_t bytes=0;
+    for(unsigned mw=w,mh=h;;mw=std::max(1U,mw/2),mh=std::max(1U,mh/2)) {bytes+=std::size_t(mw)*mh*4;if(mw==1 && mh==1) break;}
+    add_enlargement(content,std::move(view),bytes);
+    ++stats.hud_disk_loads;
+    // Pruning removes the least recently written files; a load counts as a use.
+    std::error_code error;
+    std::filesystem::last_write_time(path,std::filesystem::file_time_type::clock::now(),error);
+    return true;
+}
+void Renderer::Impl::save_enlargement(std::uint64_t content,const InterfaceUpscaler::Result& result) {
+    if(hud_disk.empty() || hud_saves.size()>=32) return;
+    const auto path=hud_disk_path(content);
+    std::error_code error;
+    if(std::filesystem::exists(path,error)) return;
+    ComPtr<ID3D11Resource> resource;result.view->GetResource(&resource);
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width=result.width;desc.Height=result.height;desc.MipLevels=desc.ArraySize=1;
+    desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;desc.SampleDesc.Count=1;
+    desc.Usage=D3D11_USAGE_STAGING;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+    HudSave save{nullptr,path,hud_disk_header(result.width,result.height,result.network)};
+    if(FAILED(device->CreateTexture2D(&desc,nullptr,&save.staging))) return;
+    context->CopySubresourceRegion(save.staging.Get(),0,0,0,0,resource.Get(),0,nullptr);
+    hud_saves.push_back(std::move(save));
+}
+void Renderer::Impl::write_hud_saves(bool wait) {
+    for(auto save=hud_saves.begin();save!=hud_saves.end();) {
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if(context->Map(save->staging.Get(),0,D3D11_MAP_READ,wait?0:D3D11_MAP_FLAG_DO_NOT_WAIT,&mapped)!=S_OK) {++save;continue;}
+        const auto& header=save->header;
+        auto temporary=save->path;temporary+=".tmp";
+        std::error_code error;
+        std::filesystem::create_directories(hud_disk,error);
+        bool written=false;
+        if(!error) {
+            std::ofstream file(temporary,std::ios::binary|std::ios::trunc);
+            file.write(reinterpret_cast<const char*>(&header),sizeof(header));
+            for(unsigned y=0;y<header.height;++y)
+                file.write(static_cast<const char*>(mapped.pData)+std::size_t(y)*mapped.RowPitch,static_cast<std::streamsize>(header.width)*4);
+            written=static_cast<bool>(file);
+        }
+        context->Unmap(save->staging.Get(),0);
+        if(written) std::filesystem::rename(temporary,save->path,error);
+        if(!written || error) std::filesystem::remove(temporary,error);
+        else {
+            hud_disk_bytes+=sizeof(header)+std::uintmax_t(header.width)*header.height*4;
+            ++stats.hud_disk_saves;
+            if(hud_disk_bytes>hud_disk_limit) prune_hud_disk(hud_disk_limit*3/4);
+        }
+        save=hud_saves.erase(save);
+    }
+}
+// Removes the least recently written cache files until the rest fit target.
+void Renderer::Impl::prune_hud_disk(std::uintmax_t target) {
+    std::vector<std::pair<std::filesystem::file_time_type,std::filesystem::path>> files;
+    std::error_code error;
+    hud_disk_bytes=0;
+    for(const auto& item:std::filesystem::directory_iterator(hud_disk,error)) {
+        if(!item.is_regular_file(error) || item.path().extension()!=".hud") continue;
+        hud_disk_bytes+=item.file_size(error);
+        files.emplace_back(item.last_write_time(error),item.path());
+    }
+    std::ranges::sort(files);
+    for(const auto& [time,path]:files) {
+        if(hud_disk_bytes<=target) break;
+        const auto size=std::filesystem::file_size(path,error);
+        if(!error && std::filesystem::remove(path,error)) hud_disk_bytes-=std::min(size,hud_disk_bytes);
+    }
+}
+void Renderer::hud_cache(const std::filesystem::path& directory) {
+    auto& r=*impl_;
+    r.hud_saves.clear();r.hud_disk=directory;r.hud_disk_bytes=0;
+    std::error_code error;
+    if(!directory.empty() && std::filesystem::is_directory(directory,error)) r.prune_hud_disk(Impl::hud_disk_limit);
+}
+void Renderer::Impl::configure_hud() {
+    // The enlargement factor follows the internal resolution, up to the
+    // network's x4. Changing it or turning the option off restores every original.
+    const UINT factor=requested.upscaled_hud && scale>=2?std::min<UINT>(scale,4):0;
+    if(factor==hud_factor) return;
+    if(upscaler) upscaler->clear();
+    enlargements.clear();enlarged_bytes=0;
+    std::ranges::fill(texture_content,0);
+    unbind_textures();
+    hud_factor=0;
+    if(!factor) return;
+    try {
+        if(!upscaler) upscaler=std::make_unique<InterfaceUpscaler>(device.Get(),context.Get());
+        hud_factor=factor;
+    } catch(const std::exception& error) {
+        enhancement_error=std::string("Upscaled HUD is unavailable: ")+error.what();
+    }
+}
+void Renderer::interface_texture(std::uint32_t id,std::uint64_t content) {
+    auto& r=*impl_;
+    // Only uploaded 2D images up to 1024 texels a side; rendered surfaces and
+    // cube or volume textures keep their originals.
+    if(!r.hud_factor || !content || id>=r.textures.size() || r.texture_dimensions[id]!=1 || r.target_images[id]) return;
+    const auto [width,height]=r.texture_sizes[id];
+    if(!width || !height || std::max(width,height)>1024) return;
+    r.texture_content[id]=content;
+    if(r.enlargements.contains(content) || r.upscaler->queued(content) || r.load_enlargement(content,width,height)) return;
+    r.upscaler->request(content,r.textures[id],width,height,r.hud_factor);
+    ++r.stats.hud_requests;
 }
 
 static std::size_t resident_size(const TextureData& texture) {
@@ -1012,6 +1228,7 @@ void Renderer::release_texture(std::uint32_t id) {
     r.texture_bytes -= r.uploaded_bytes.at(id);
     r.uploaded_bytes.erase(id);
     r.textures[id].Reset();
+    r.texture_content[id] = 0;
     r.free_textures.push_back(id);
 }
 std::uint32_t Renderer::upload(const TextureData& texture) {
@@ -1123,6 +1340,7 @@ std::uint32_t Renderer::upload(const TextureData& texture) {
         checked(r.device->CreateShaderResourceView(resource.Get(), nullptr, &view), "Texture view");
     }
     const auto id = r.store_texture(std::move(view),texture.cubemap?3U:texture.depth>1?2U:1U);
+    if (!texture.cubemap && texture.depth == 1) r.texture_sizes[id] = {texture.width, texture.height};
     r.uploaded_bytes.emplace(id,resident_size(texture));
     r.texture_bytes += resident_size(texture);
     return id;
@@ -1522,7 +1740,7 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
         if(sampled) {
             // A multisampled surface is read through its resolve.
             if(auto* image=r.target_images[state.textures[i]]; image && image->dirty) r.resolve(*image);
-            views[i+(mode==3?4:mode==2?8:0)] = r.textures[state.textures[i]].Get();
+            views[i+(mode==3?4:mode==2?8:0)] = r.sampled_view(state.textures[i]);
         }
         const auto sample_flags=std::uint32_t(state.alpha_kill[i]) | (std::uint32_t(state.texture_alpha_one[i])<<1);
         constants.stages[i]={mode,state.texture_sources[i],state.texture_clip[i],sample_flags};
@@ -1711,7 +1929,12 @@ Image Renderer::read_display() {
         static_cast<const std::byte*>(mapped.pData)+std::size_t(y)*mapped.RowPitch,std::size_t(image.width)*4);
     r.context->Unmap(staging.Get(),0);return image;
 }
-RenderStats Renderer::stats() const { return impl_->stats; }
+RenderStats Renderer::stats() const {
+    auto stats = impl_->stats;
+    stats.hud_queued = impl_->upscaler ? impl_->upscaler->queued() : 0;
+    stats.hud_bytes = impl_->enlarged_bytes;
+    return stats;
+}
 std::string Renderer::adapter() const { return impl_->adapter; }
 std::array<std::uint32_t, 2> Renderer::scanout_size() const {
     const auto& main = impl_->targets.at(0);
@@ -1725,7 +1948,7 @@ std::array<std::uint32_t, 2> Renderer::display_size() const { return {impl_->win
 void Renderer::enhance(const RenderEnhancements& request) { impl_->requested = request; }
 RenderEnhancements Renderer::enhancements() const {
     const auto& r = *impl_;
-    return {int(r.scale), int(r.samples), int(r.anisotropy), r.fxaa};
+    return {int(r.scale), int(r.samples), int(r.anisotropy), r.fxaa, r.hud_factor != 0};
 }
 int Renderer::max_samples() const { return int(impl_->sample_limit); }
 std::string Renderer::enhancement_error() const { return impl_->enhancement_error; }
@@ -1764,6 +1987,7 @@ void Renderer::Impl::apply_enhancements() {
         } catch (const std::exception& error) {
             std::tie(scale, samples, samples565) = std::tuple{previous[0], previous[1], previous[2]};
             enhancement_error = std::string("Could not change the internal resolution: ") + error.what();
+            configure_hud();
             return;
         }
         // Carry color across; depth and stencil restart cleared, as after a
@@ -1791,6 +2015,7 @@ void Renderer::Impl::apply_enhancements() {
         }
         unbind_textures();
     }
+    configure_hud();
 }
 std::vector<std::string> Renderer::errors() const {
     std::vector<std::string> messages;

@@ -1,4 +1,5 @@
 #include "shaders.h"
+#include "upscaler_model.h"
 #include <Windows.h>
 #include <algorithm>
 #include <cstring>
@@ -63,4 +64,12 @@ ShaderBinary shader_binary(ShaderKind kind, const VertexProgram* program) {
 
 // Only offline diagnostics and baking use a writable compiler cache.
 void use_shader_cache(std::filesystem::path) {}
+
+Bytes upscaler_checkpoint() {
+    const auto resource = FindResourceW(nullptr, L"SCOOBYMM_UPSCALER", MAKEINTRESOURCEW(10));
+    if (!resource) throw std::runtime_error("Missing embedded HUD upscaler model");
+    const auto* data = static_cast<const std::byte*>(LockResource(LoadResource(nullptr, resource)));
+    if (!data) throw std::runtime_error("Invalid embedded HUD upscaler model");
+    return {data, SizeofResource(nullptr, resource)};
+}
 }

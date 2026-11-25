@@ -38,6 +38,7 @@ struct Gpu::Impl {
     bool ordered_notifications = false, fifo_reads_notifications = false;
     std::array<std::uint32_t,3> widescreen_buffers{};
     int hud_side{};
+    bool interface_draws = false; // Between HUD widget draw markers.
     std::array<std::array<std::uint32_t,2048>,8> registers{};
     std::array<std::uint32_t,8> objects{};
     std::array<std::uint32_t,8> classes{};
@@ -72,7 +73,18 @@ struct Gpu::Impl {
         std::uint32_t id;
         std::uint64_t last_draw, verified_at;
         std::vector<std::byte> texels, palette;
+        std::uint64_t content = 0; // Hash of the format and bytes, once a HUD draw samples it.
     };
+    // FNV-1a over a texture's key words, texels and palette: the identity
+    // under which its HUD enlargement is cached.
+    static std::uint64_t content_hash(const std::array<std::uint32_t,5>& key,const CachedTexture& texture) {
+        std::uint64_t hash=0xCBF29CE484222325ULL;
+        const auto feed=[&](std::span<const std::byte> bytes) {
+            for(const auto byte:bytes) hash=(hash^std::to_integer<std::uint64_t>(byte))*0x100000001B3ULL;
+        };
+        feed(std::as_bytes(std::span(key)));feed(texture.texels);feed(texture.palette);
+        return hash?hash:1;
+    }
     std::map<std::array<std::uint32_t,5>,CachedTexture> textures;
     std::uint64_t texture_draw = 0, memory_epoch = 0;
     struct Fence {ComPtr<ID3D11Query> query;std::uint32_t address=0,value=0;};
@@ -244,10 +256,18 @@ struct Gpu::Impl {
         const auto palette_register=reg(method+0x20);
         const std::array key{address,format,image,pitch,palette_register};
         if(linear) view.texture_scales[stage]={1.0f/width,1.0f/height,1.0f/depth,1};
+        const auto hud=[&](auto found) {
+            auto& entry=found->second;
+            if(interface_draws) {
+                if(!entry.content) entry.content=content_hash(found->first,entry);
+                renderer.interface_texture(entry.id,entry.content);
+            }
+            return entry.id;
+        };
         auto found=textures.find(key);
         if(found!=textures.end() && found->second.verified_at==memory_epoch) {
             found->second.last_draw=texture_draw;
-            return found->second.id;
+            return hud(found);
         }
         unsigned bpp=0,block=0;
         switch(code) {case 0xB:bpp=1;break;case 4:case 5:case 0x1A:bpp=2;break;case 6:case 7:case 0x12:case 0x1E:bpp=4;break;
@@ -282,7 +302,7 @@ struct Gpu::Impl {
         }
         found->second.last_draw = texture_draw;
         found->second.verified_at = memory_epoch;
-        return found->second.id;
+        return hud(found);
     }
     RenderState state(ProgramView& view) {
         ++texture_draw;
@@ -773,6 +793,7 @@ void Gpu::submit(std::uint32_t begin,std::uint32_t end,std::span<const HudAnchor
         if (anchors.empty()) break;
         g.emit_arrays();
         g.hud_side = anchors.front().side;
+        g.interface_draws = anchors.front().hud_art;
         anchors = anchors.subspan(1);
     }
     g.fence(0,0);g.dispatch_fences();g.submission_fenced = true;g.poll(false);

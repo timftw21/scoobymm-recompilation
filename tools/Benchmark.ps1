@@ -9,7 +9,8 @@ param(
     [ValidateRange(1,6)][int]$RenderScale = 1,
     [ValidateSet(1,2,4,8)][int]$Msaa = 1,
     [switch]$Fxaa,
-    [ValidateSet(1,2,4,8,16)][int]$Anisotropy = 1
+    [ValidateSet(1,2,4,8,16)][int]$Anisotropy = 1,
+    [switch]$UpscaledHud
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path "$PSScriptRoot/..").Path
@@ -21,7 +22,8 @@ if (!$Output) { $Output = Join-Path $root ("build/bench-{0}-{1:yyyyMMdd-HHmmss-f
 $run = (New-Item -ItemType Directory -Path $Output).FullName
 New-Item -ItemType Directory -Path "$run/profile" | Out-Null
 Set-Content -LiteralPath "$run/profile/settings.cfg" -Encoding ascii -Value @(
-    "render_scale=$RenderScale", "msaa=$Msaa", "fxaa=$([int][bool]$Fxaa)", "anisotropy=$Anisotropy")
+    "render_scale=$RenderScale", "msaa=$Msaa", "fxaa=$([int][bool]$Fxaa)", "anisotropy=$Anisotropy",
+    "upscaled_hud=$([int][bool]$UpscaledHud)")
 # Navigate at the original cadence so the same input reaches the same scene at every cap.
 $options = @('--hidden','--mute','--no-vsync','--widescreen','--refresh-rate','30',
              '--storage',"$run/profile",'--report',"$run/session.json")

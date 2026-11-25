@@ -164,7 +164,8 @@ if(XBOX_GENERATED_SOURCE)
         src/xbox/settings.cpp src/xbox/settings_menu.cpp
         src/xbox/boot.cpp src/xbox/audio.cpp src/xbox/audio_effects.cpp src/xbox/guest_audio.cpp
         src/xbox/guest_graphics.cpp src/xbox/gpu.cpp src/xbox/render.cpp src/xbox/shaders.cpp
-        src/xbox/vertex_program.cpp src/xbox/play_window.cpp src/xbox/play_diagnostics.cpp src/xbox/recomp_options.cpp)
+        src/xbox/vertex_program.cpp src/xbox/play_window.cpp src/xbox/play_diagnostics.cpp src/xbox/recomp_options.cpp
+        src/xbox/interface_upscaler.cpp src/xbox/upscaler_model.cpp)
     target_compile_features(xbox-runtime PUBLIC cxx_std_23)
     add_dependencies(xbox-runtime scoobymm-dsp)
     target_include_directories(xbox-runtime PRIVATE "${dsp56300_SOURCE_DIR}/crates/emu-ffi/include")
@@ -175,6 +176,10 @@ if(XBOX_GENERATED_SOURCE)
     target_link_libraries(xbox-runtime PRIVATE xbox-media xbox-recompiled SDL3::SDL3 scoobymm-imgui d3d11 dxgi windowscodecs ole32 advapi32 comdlg32)
     target_compile_definitions(native-recompiler PRIVATE XBOX_OFFLINE_BOOT=1)
     target_sources(native-recompiler PRIVATE src/xbox/stream_check.cpp src/xbox/shader_compiler.cpp)
+    # The verified HUD upscaler checkpoint (resources/upscaler): the game embeds
+    # it as a resource and the tool reads it from the source tree.
+    set(upscaler_model "${CMAKE_CURRENT_SOURCE_DIR}/resources/upscaler/realesr-animevideov3.pth")
+    target_compile_definitions(native-recompiler PRIVATE SCOOBYMM_UPSCALER_MODEL="${upscaler_model}")
     target_link_libraries(native-recompiler PRIVATE xbox-runtime d3dcompiler)
     enable_language(RC)
     set(XBOX_EXECUTABLE "${CMAKE_CURRENT_SOURCE_DIR}/data/local/default.xbe" CACHE FILEPATH "Verified Xbox executable for material shader generation")
@@ -188,7 +193,7 @@ if(XBOX_GENERATED_SOURCE)
     add_executable(scoobymm src/play.cpp src/xbox/shader_bank.cpp resources/scoobymm.rc)
     add_dependencies(scoobymm scoobymm-shaders)
     set_source_files_properties(resources/scoobymm.rc PROPERTIES
-        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/scoobymm.ico;${shader_bank}")
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/scoobymm.ico;${shader_bank};${upscaler_model}")
     target_include_directories(scoobymm PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_compile_options(scoobymm PRIVATE /W4)
     target_link_libraries(scoobymm PRIVATE xbox-runtime)

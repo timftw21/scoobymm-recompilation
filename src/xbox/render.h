@@ -94,6 +94,10 @@ struct RenderStats {
     std::uint64_t draws = 0, vertices = 0, shader_compilations = 0, general_programs = 0, vertex_bytes = 0;
     double gpu_ms = 0;
     bool gpu_timing_valid = false;
+    // Upscaled HUD: textures requested, enlargements finished (by the network
+    // or the filter), queued, and resident enlargement bytes.
+    std::uint64_t hud_requests = 0, hud_network = 0, hud_filtered = 0, hud_queued = 0, hud_bytes = 0;
+    std::uint64_t hud_disk_loads = 0, hud_disk_saves = 0; // Enlargements read from or written to the disk cache.
 };
 
 class Renderer {
@@ -107,6 +111,13 @@ public:
     bool can_upload(const TextureData&) const;
     bool has_texture_slot() const;
     void release_texture(std::uint32_t id);
+    // Upscaled HUD: a texture that HUD widget draws sample, identified by a
+    // hash of its guest bytes and format. Once enlarged, draws sample the
+    // enlargement in its place.
+    void interface_texture(std::uint32_t id, std::uint64_t content);
+    // Keeps finished HUD enlargements in this folder (bounded to 512 MiB) for
+    // later sessions. Empty disables the disk cache.
+    void hud_cache(const std::filesystem::path& directory);
     std::uint32_t create_target(std::uint32_t width,std::uint32_t height,
                                 SurfaceColor=SurfaceColor::rgba8,SurfaceDepth=SurfaceDepth::z24s8,
                                 std::uint32_t shared_color=UINT32_MAX);

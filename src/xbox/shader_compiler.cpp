@@ -1,4 +1,5 @@
 #include "shaders.h"
+#include "upscaler_model.h"
 #include <Windows.h>
 #include <bcrypt.h>
 #include <d3dcompiler.h>
@@ -109,4 +110,14 @@ void bake_shaders(const std::filesystem::path& output, std::span<const VertexPro
     }
 }
 std::span<const StaticVertex> static_vertex_shaders() { return {}; }
+}
+namespace xbox_native {
+// The tool reads the checkpoint the game embeds from the source tree.
+Bytes upscaler_checkpoint() {
+    static const auto bytes = [] {
+        File file(SCOOBYMM_UPSCALER_MODEL);
+        return file.read(0, static_cast<std::size_t>(file.size()));
+    }();
+    return bytes;
+}
 }

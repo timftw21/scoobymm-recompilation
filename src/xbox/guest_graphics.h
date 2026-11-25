@@ -46,6 +46,7 @@ private:
     std::uint32_t pause_menu_handle_ = UINT32_MAX;
     std::vector<Gpu::HudAnchor> hud_markers_;
     int hud_side_{};
+    bool hud_art_{};
     bool presentation_wide_{}, last_widescreen_{};
     std::uint32_t widget_from_handle(std::uint32_t hud, std::uint32_t handle) const;
     bool pause_menu_visible() const;

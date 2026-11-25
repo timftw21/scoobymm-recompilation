@@ -30,5 +30,6 @@ std::string json(std::string_view text);
 std::string hex32(std::uint32_t value);
 std::string hex_bytes(Bytes bytes);
 std::string sha256(File& file, std::uint64_t offset, std::uint64_t size);
+std::string sha256(Bytes bytes);
 void write_text(const std::filesystem::path& output, std::string_view text);
 }

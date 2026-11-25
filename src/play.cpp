@@ -9,7 +9,9 @@
 #include <iostream>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <system_error>
 #include <Windows.h>
 
 namespace {
@@ -58,10 +60,66 @@ std::filesystem::path application_root() {
     }
 }
 
+// Appends one argument with the quoting CommandLineToArgvW reverses.
+void append_argument(std::wstring& line, std::wstring_view argument) {
+    if (!line.empty()) line += L' ';
+    line += L'"';
+    std::size_t slashes = 0;
+    for (const wchar_t ch : argument) {
+        if (ch == L'\\') { ++slashes; continue; }
+        line.append(ch == L'"' ? slashes * 2 + 1 : slashes, L'\\');
+        slashes = 0;
+        line += ch;
+    }
+    line.append(slashes * 2, L'\\');
+    line += L'"';
+}
+
+// Restart game starts a new copy straight into play, keeping the media paths
+// and player options from this command line and leaving out one-shot
+// diagnostics, scripted input, reports and the launcher.
+void restart(int argc, wchar_t* argv[]) {
+    std::array<wchar_t, 32768> path;
+    const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (!length || length == path.size()) throw std::runtime_error("Cannot locate the game executable to restart it");
+    std::wstring line;
+    append_argument(line, std::wstring_view(path.data(), length));
+    int i = 1;
+    if (argc > 2 && !std::wstring_view(argv[1]).starts_with(L"--")) {
+        append_argument(line, argv[1]);
+        append_argument(line, argv[2]);
+        i = 3;
+    }
+    constexpr std::array<std::wstring_view, 4> switches{L"--fullscreen", L"--mute", L"--no-vsync", L"--widescreen"};
+    constexpr std::array<std::wstring_view, 4> valued{L"--refresh-rate", L"--storage", L"--language", L"--shader-cache"};
+    for (; i < argc; ++i) {
+        const std::wstring_view option = argv[i];
+        if (std::ranges::find(switches, option) != switches.end()) append_argument(line, option);
+        else if (std::ranges::find(valued, option) != valued.end() && i + 1 < argc) {
+            append_argument(line, option);
+            append_argument(line, argv[++i]);
+        }
+    }
+    append_argument(line, L"--play");
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(path.data(), line.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &startup, &process))
+        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "Restarting the game");
+    // This window is already gone, so Windows would open the new one behind
+    // the foreground app, without keyboard focus. The player's click on
+    // Restart lets this process pass its foreground right on.
+    AllowSetForegroundWindow(process.dwProcessId);
+    ResumeThread(process.hThread);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+}
+
 void usage() {
     std::cout << "scoobymm [DEFAULT.xbe DISC.xiso] [--fullscreen] [--mute] [--no-vsync]\n"
                  "  Omit both media paths to use this project's verified Xbox files.\n"
                  "  --settings           Open settings before play (default with no arguments)\n"
+                 "  --play               Start playing without opening settings first\n"
                  "  --refresh-rate HZ    Rendering cap, or 0 for unlimited\n"
                  "  --refresh-at-scanout N HZ   Change the cap at a repeatable benchmark boundary\n"
                  "  --widescreen         Use the Xbox widescreen display setting\n"
@@ -78,8 +136,8 @@ void usage() {
                  "  --up-at-scanout N, --down-at-scanout N, --left-at-scanout N, --right-at-scanout N   Script D-pad input\n"
                  "  --stick-at-scanout N FRAMES X Y   Hold the left stick at signed Xbox coordinates\n"
                  "Keyboard: Enter to start, Space to confirm, Left Shift to go back,\n"
-                 "arrows for the D-pad, W/A/S/D for the left stick, Escape to quit.\n"
-                 "F1 or the controller Guide button opens settings. F8 captures a frame. F9 starts or stops performance recording (60 seconds maximum).\n";
+                 "arrows for the D-pad, W/A/S/D for the left stick.\n"
+                 "Escape or the controller Guide button opens settings, where Exit game quits. F8 captures a frame. F9 starts or stops performance recording (60 seconds maximum).\n";
 }
 }
 
@@ -143,6 +201,7 @@ int wmain(int argc, wchar_t* argv[]) {
             else if (option == L"--no-vsync") set_no_vsync = true;
             else if (option == L"--widescreen") set_wide = true;
             else if (option == L"--settings") options.launcher = true;
+            else if (option == L"--play") {} // Any option already skips the launcher.
             else if (option == L"--refresh-rate") refresh = rate();
             else if (option == L"--refresh-at-scanout") {
                 options.refresh_at = nonzero();
@@ -217,6 +276,7 @@ int wmain(int argc, wchar_t* argv[]) {
         if (!report) throw std::runtime_error("Cannot write the play session report");
         if (code) report_failure("The game stopped. See the session report for the guest address and reason:\n" +
                          xbox_native::path_text(std::filesystem::absolute(report_path)), console, hidden);
+        else if (options.restart) restart(argc, argv);
         return code;
     } catch (const std::exception& error) {
         report_failure(error.what(), console, hidden);

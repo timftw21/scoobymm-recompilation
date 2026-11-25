@@ -71,6 +71,10 @@ std::vector<Category> categories() {
                 [](PlayerSettings& s, int v) { s.enhancements.fxaa = v != 0; }},
             {"texture filtering", multiples({1, 2, 4, 8, 16}, "normal"),
                 [](const PlayerSettings& s) { return s.enhancements.anisotropy; }, [](PlayerSettings& s, int v) { s.enhancements.anisotropy = v; }},
+            {"upscaled hud", switch_choices(), [](const PlayerSettings& s) { return int(s.enhancements.upscaled_hud); },
+                [](PlayerSettings& s, int v) { s.enhancements.upscaled_hud = v != 0; }},
+            {"skip intro movies", switch_choices(), [](const PlayerSettings& s) { return int(s.skip_intro); },
+                [](PlayerSettings& s, int v) { s.skip_intro = v != 0; }},
         }},
         {"audio", "AUDIO", {
             {"master volume", levels, [](const PlayerSettings& s) { return s.volume; }, [](PlayerSettings& s, int v) { s.volume = v; }},

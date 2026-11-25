@@ -57,6 +57,18 @@ constexpr Word cache_partitions = 3, cache_capacity = 128 * 1024 * 1024;
 constexpr Word file_limit = 8 * 1024 * 1024;
 constexpr Word disk_cluster = 16384;
 constexpr std::string_view legacy_save_magic = "SMMSAVE1", save_magic = "SMMSAVE2";
+// The boot sequence's movies on the disc: MOVIES\{LEGAL,WBPH,THQPH,A2MPH,
+// OPENING}.xmv, with French and German OPENING in MOVIES\FR and MOVIES\DE.
+// Episode, demo, trailer and extra movies are elsewhere or named otherwise.
+bool boot_movie(std::string_view relative) {
+    for (const auto folder : {"MOVIES\\", "MOVIES\\FR\\", "MOVIES\\DE\\"}) {
+        if (!relative.starts_with(folder)) continue;
+        const auto name = relative.substr(std::string_view(folder).size());
+        for (const auto movie : {"LEGAL.XMV", "WBPH.XMV", "THQPH.XMV", "A2MPH.XMV", "OPENING.XMV"})
+            if (name == movie) return true;
+    }
+    return false;
+}
 
 std::uint64_t file_time(FILETIME value) {
     return (std::uint64_t{value.dwHighDateTime} << 32) | value.dwLowDateTime;
@@ -416,6 +428,7 @@ private:
     std::optional<Word> stop_address_;
     std::optional<DeviceStop> device_stop_;
     std::string last_io_path_;
+    std::set<std::string, std::less<>> skipped_movies_;
     std::deque<IoTrace> io_;
     Word last_service_site_ = 0, last_service_return_ = 0, next_handle_ = 4;
     GuestAudio audio_;
@@ -1299,6 +1312,13 @@ Word OfflineBoot::open_file(Cpu& cpu, bool create) {
         const auto relative = path == cdrom ? std::string_view{} : std::string_view(path).substr(cdrom.size() + 1);
         file.disc_entry = disc_->lookup(relative);
         if (!file.disc_entry) return name_missing;
+        // Skip intro movies: the movie object's play method (0x00050270) runs
+        // the player at 0x0004FE40, which opens the file at 0x0001BCC0 and
+        // returns at once when it cannot. The first request for each boot
+        // movie is answered as missing, so the game goes on as if the disc
+        // lacked it. Later requests for the same movie play it.
+        if (window_ && window_->settings().skip_intro && !file.disc_entry->directory && boot_movie(relative) &&
+            skipped_movies_.emplace(relative).second) return name_missing;
         file.directory = file.disc_entry->directory;
         if (recomp_options_ && !file.directory && file.disc_entry->size <= 4 * 1024 * 1024 && recomp_options_->extends(relative)) {
             const auto font_entry = disc_->lookup(RecompOptions::font_path(relative));
@@ -2219,7 +2239,10 @@ void OfflineBoot::report(std::ostream& output, std::string_view status, std::str
         << ",\"flips\":" << graphics.flips << ",\"clears\":" << graphics.clears
         << ",\"blits\":" << graphics.blits << ",\"overlay_frames\":" << graphics_.overlay_frames()
         << ",\"scanouts\":" << graphics_.scanouts() << ",\"presentations\":" << graphics_.presentations()
-        << ",\"captured\":" << (graphics_.captured() ? "true" : "false") << '}'
+        << ",\"captured\":" << (graphics_.captured() ? "true" : "false")
+        << ",\"hud\":{\"requests\":" << render.hud_requests << ",\"network\":" << render.hud_network
+        << ",\"filtered\":" << render.hud_filtered << ",\"queued\":" << render.hud_queued << ",\"bytes\":" << render.hud_bytes
+        << ",\"disk_loads\":" << render.hud_disk_loads << ",\"disk_saves\":" << render.hud_disk_saves << "}}"
         << ",\"last_kernel_site\":" << json(hex32(last_service_site_))
         << ",\"last_kernel_return\":" << json(hex32(last_service_return_)) << ",\"registers\":[";
     for (unsigned i = 0; i < cpu.registers.size(); ++i) {

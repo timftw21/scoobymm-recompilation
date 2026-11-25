@@ -368,15 +368,20 @@ void GuestGraphics::draw_widget(Word widget) {
         if (slot < widget_anchors_.size() && widget_anchors_[slot].handle == handle)
             side = widget_anchors_[slot].side;
     }
-    if (side == hud_side_) return;
+    // 0x4A70D..0x4A730 draws the HUD tree through 0x77090, whose 0x770CA call
+    // precedes each visible widget's draws; the 0x4A733 call (no widget)
+    // follows the last. The textures sampled in between are HUD and menu art.
+    const bool hud_art = widget && window_ && window_->settings().enhancements.upscaled_hud;
+    if (side == hud_side_ && hud_art == hud_art_) return;
     hud_side_ = side;
+    hud_art_ = hud_art;
     // The SDK queues draw packets. Record their FIFO position so that a kickoff
     // midway through a widget or a ring wrap preserves the anchor.
     const auto flags = memory_.load<Word>(device+8);
     const auto address = memory_.load<Word>(device + ((flags & 4) ? 0x358 : 0));
     if (!hud_markers_.empty() && hud_markers_.back().address == address)
-        hud_markers_.back().side = side;
-    else hud_markers_.push_back({address,side});
+        hud_markers_.back() = {address,side,hud_art};
+    else hud_markers_.push_back({address,side,hud_art});
 }
 
 void GuestGraphics::submit() {

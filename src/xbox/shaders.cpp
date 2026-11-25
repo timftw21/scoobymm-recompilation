@@ -24,6 +24,26 @@ public:
     void* STDMETHODCALLTYPE GetBufferPointer() override {return const_cast<std::byte*>(bytes_.data());}
     SIZE_T STDMETHODCALLTYPE GetBufferSize() override {return bytes_.size();}
 };
+// Shared by the HUD upscaler's compute passes; mirrored by JobConstants in
+// interface_upscaler.cpp.
+constexpr std::string_view interface_job_source=R"(
+cbuffer Job:register(b0) {
+ int2 image;int2 origin;int2 extent;int2 halo;int2 interior;int2 slots;uint mode;uint factor;int2 target;
+};
+)";
+// One layer and group of 16 output channels: weights[(tap*inputs+input)*4+k]
+// holds outputs k*4..k*4+3; the final linear layer stores unit slopes. Each
+// batch slot (one tile's colour or alpha pass) owns 16 consecutive slices.
+constexpr std::string_view interface_layer_source=R"(
+cbuffer Layer:register(b1) {float4 weights[2304];float4 bias[4];float4 slope[4];uint4 layer;};
+RWTexture2DArray<float4> features_out:register(u0);
+float4 prelu(float4 a,float4 s) {return max(a,0)+min(a,0)*s;}
+void store(int2 q,uint slot,float4 a0,float4 a1,float4 a2,float4 a3) {
+ uint s=slot*16+layer.x;
+ features_out[uint3(q,s)]=prelu(a0,slope[0]);features_out[uint3(q,s+1)]=prelu(a1,slope[1]);
+ features_out[uint3(q,s+2)]=prelu(a2,slope[2]);features_out[uint3(q,s+3)]=prelu(a3,slope[3]);
+}
+)";
 constexpr std::string_view combiner_source=R"(
 struct P {float4 p:SV_Position;float4 c:COLOR0;float4 s:COLOR1;
  float4 t0:TEXCOORD0;float4 t1:TEXCOORD1;float4 t2:TEXCOORD2;float4 t3:TEXCOORD3;float fog:TEXCOORD4;};
@@ -149,7 +169,7 @@ ID3DBlob* shader_blob(ShaderKind kind) {return new ShaderBlob(shader_binary(kind
 const char* shader_profile(ShaderKind kind) {
     if(kind==ShaderKind::gui_vertex) return "vs_4_0";
     if(kind==ShaderKind::gui_pixel) return "ps_4_0";
-    if(kind==ShaderKind::launch) return "cs_5_0";
+    if(kind==ShaderKind::launch || (kind>=ShaderKind::interface_classify && kind<=ShaderKind::interface_filter)) return "cs_5_0";
     if(kind==ShaderKind::line_geometry) return "gs_5_0";
     if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::video_overlay ||
        kind==ShaderKind::blit_pixel || kind==ShaderKind::fxaa_pixel ||
@@ -299,6 +319,149 @@ void main(line P v[2],inout TriangleStream<P> output) {
     output.Append(moved(v[1],along));
     output.Append(moved(v[0],along+across));
     output.Append(moved(v[1],along+across));
+})";
+    // HUD/menu texture enlargement (Real-ESRGAN realesr-animevideov3, see
+    // upscaler_model.h). Each texture runs once, in bounded steps between
+    // frames. Convolutions cover a tile plus a 12-texel halo; positions outside
+    // the halo read zero like PyTorch's padding, and halo texels beyond the
+    // texture repeat its edge. Halo 12 changes tile interiors by at most 2/255.
+    case ShaderKind::interface_classify:return std::string(interface_job_source)+R"(
+Texture2D<float4> source:register(t0);
+RWBuffer<uint> statistics:register(u0);
+groupshared uint group_edge,group_alpha;
+float4 premultiplied(int2 p) {float4 v=source.Load(int3(p,0));return float4(v.rgb*v.a,v.a);}
+[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID,uint index:SV_GroupIndex) {
+ if(!index) {group_edge=0;group_alpha=0;}
+ GroupMemoryBarrierWithGroupSync();
+ int2 p=int2(id.xy);
+ if(all(p<image)) {
+  // The largest premultiplied step between neighbours separates outlined
+  // artwork from glows and gradients, which keep the filter's softness.
+  float4 v=premultiplied(p);float step=0;
+  if(p.x+1<image.x) {float4 e=abs(premultiplied(p+int2(1,0))-v);step=max(step,max(max(e.r,e.g),max(e.b,e.a)));}
+  if(p.y+1<image.y) {float4 e=abs(premultiplied(p+int2(0,1))-v);step=max(step,max(max(e.r,e.g),max(e.b,e.a)));}
+  uint ignored;
+  InterlockedMax(group_edge,uint(round(saturate(step)*65535)),ignored);
+  if(v.a<254.5/255) InterlockedMax(group_alpha,1u,ignored);
+ }
+ GroupMemoryBarrierWithGroupSync();
+ if(!index) {InterlockedMax(statistics[0],group_edge);InterlockedMax(statistics[1],group_alpha);}
+})";
+    case ShaderKind::interface_bleed:return std::string(interface_job_source)+R"(
+Texture2D<float4> previous:register(t0);
+RWTexture2D<float4> next:register(u0);
+// Spread visible colours into fully transparent texels, so the network sees
+// the artwork's own colour at alpha edges instead of arbitrary hidden RGB.
+[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
+ int2 p=int2(id.xy);if(any(p>=image)) return;
+ float4 v=previous.Load(int3(p,0));
+ if(v.a>0) {next[p]=float4(v.rgb,1);return;}
+ float3 sum=0;float count=0;
+ [unroll] for(int y=-1;y<=1;++y) [unroll] for(int x=-1;x<=1;++x) {
+  int2 q=p+int2(x,y);
+  if(all(q>=0) && all(q<image)) {float4 n=previous.Load(int3(q,0));if(n.a>0) {sum+=n.rgb;count+=1;}}
+ }
+ next[p]=count>0?float4(sum/count,1):float4(0,0,0,0);
+})";
+    case ShaderKind::interface_conv_first:return std::string(interface_job_source)+std::string(interface_layer_source)+R"(
+Texture2D<float4> image_in:register(t0);
+float3 input_texel(int2 p) {
+ if(any(p<0) || any(p>=extent)) return 0;
+ float4 v=image_in.Load(int3(clamp(origin+p,int2(0,0),image-1),0));
+ return mode?v.aaa:v.rgb;
+}
+[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
+ int2 q=int2(id.xy);if(any(q>=extent)) return;
+ float4 a0=bias[0],a1=bias[1],a2=bias[2],a3=bias[3];
+ [unroll] for(int t=0;t<9;++t) {
+  float3 x=input_texel(q+int2(t%3-1,t/3-1));
+  [unroll] for(int c=0;c<3;++c) {
+   a0+=x[c]*weights[(t*3+c)*4];a1+=x[c]*weights[(t*3+c)*4+1];a2+=x[c]*weights[(t*3+c)*4+2];a3+=x[c]*weights[(t*3+c)*4+3];
+  }
+ }
+ store(q,uint(slots.x),a0,a1,a2,a3);
+})";
+    case ShaderKind::interface_conv:return std::string(interface_job_source)+std::string(interface_layer_source)+R"(
+Texture2DArray<float4> features:register(t0);
+cbuffer Batch:register(b2) {int4 extents[8];};
+// Z selects the batch slot; every slot shares this layer's weights.
+[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
+ uint slot=id.z;int2 bound=extents[slot].xy;
+ int2 q=int2(id.xy);if(any(q>=bound)) return;
+ float4 a0=bias[0],a1=bias[1],a2=bias[2],a3=bias[3];
+ [unroll] for(int t=0;t<9;++t) {
+  int2 p=q+int2(t%3-1,t/3-1);
+  float inside=all(p>=0) && all(p<bound)?1:0;
+  [unroll] for(int s=0;s<16;++s) {
+   float4 x=features.Load(int4(p,slot*16+s,0))*inside;
+   [unroll] for(int k=0;k<4;++k) {
+    const int w=(t*64+s*4+k)*4;
+    a0+=x[k]*weights[w];a1+=x[k]*weights[w+1];a2+=x[k]*weights[w+2];a3+=x[k]*weights[w+3];
+   }
+  }
+ }
+ store(q,slot,a0,a1,a2,a3);
+})";
+    case ShaderKind::interface_compose:return std::string(interface_job_source)+R"(
+Texture2D<float4> colour_in:register(t0);
+Texture2D<float4> source:register(t1);
+Texture2DArray<float4> net:register(t2);
+RWTexture2D<unorm float4> output:register(u0);
+// One x4 network sample: pixel shuffle channel c*16+i*4+j is slice c*4+i of
+// the colour (slots.x) or alpha (slots.y) pass, component j, added to the
+// nearest-upsampled input and clamped to [0,1].
+float4 network(int2 s) {
+ int2 e=(s>>2)+halo;int i=s.y&3,j=s.x&3;
+ int2 texel=clamp(origin+e,int2(0,0),image-1);
+ float3 base=colour_in.Load(int3(texel,0)).rgb;float alpha=source.Load(int3(texel,0)).a;
+ float4 result;
+ [unroll] for(int c=0;c<3;++c) result[c]=saturate(net.Load(int4(e,slots.x*16+c*4+i,0))[j]+base[c]);
+ if(mode) {
+  float a=0;
+  [unroll] for(int c=0;c<3;++c) a+=saturate(net.Load(int4(e,slots.y*16+c*4+i,0))[j]+alpha);
+  result.a=a/3;
+ } else result.a=alpha;
+ return result;
+}
+[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
+ int2 o=int2(id.xy);if(any(o>=interior*int(factor))) return;
+ float4 result;
+ if(factor==4) result=network(o);
+ else {
+  // Average the x4 samples covering this output texel's area, weighting
+  // colour by coverage so transparent texels cannot darken visible edges.
+  float2 low=float2(o)*4/factor,high=float2(o+1)*4/factor;
+  float4 sum=0;float3 plain=0;float total=0;
+  for(int y=int(floor(low.y));y<int(ceil(high.y));++y) {
+   float wy=min(high.y,y+1)-max(low.y,y);
+   for(int x=int(floor(low.x));x<int(ceil(high.x));++x) {
+    float w=wy*(min(high.x,x+1)-max(low.x,x));float4 v=network(int2(x,y));
+    sum+=float4(v.rgb*v.a,v.a)*w;plain+=v.rgb*w;total+=w;
+   }
+  }
+  result=sum/total;result.rgb=result.a>1.0/1024?result.rgb/result.a:plain/total;
+ }
+ output[target+o]=saturate(result);
+})";
+    case ShaderKind::interface_filter:return std::string(interface_job_source)+R"(
+Texture2D<float4> source:register(t0);
+RWTexture2D<unorm float4> output:register(u0);
+float4 texel(int2 p) {float4 v=source.Load(int3(clamp(p,int2(0,0),image-1),0));return float4(v.rgb*v.a,v.a);}
+float catmull_rom(float x) {x=abs(x);return x<1?(1.5*x-2.5)*x*x+1:x<2?((-0.5*x+2.5)*x-4)*x+2:0;}
+// Fallback for soft or tiny textures: premultiplied Catmull-Rom, clamped to
+// the four nearest texels so it cannot ring or invent detail.
+[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
+ int2 o=int2(id.xy);if(any(o>=image*int(factor))) return;
+ float2 u=(float2(o)+0.5)/factor-0.5,cell=floor(u),f=u-cell;int2 b=int2(cell);
+ float4 sum=0;float total=0;
+ [unroll] for(int y=-1;y<=2;++y) [unroll] for(int x=-1;x<=2;++x) {
+  float w=catmull_rom(f.x-x)*catmull_rom(f.y-y);sum+=texel(b+int2(x,y))*w;total+=w;
+ }
+ float4 n0=texel(b),n1=texel(b+int2(1,0)),n2=texel(b+int2(0,1)),n3=texel(b+int2(1,1));
+ float4 result=clamp(sum/total,min(min(n0,n1),min(n2,n3)),max(max(n0,n1),max(n2,n3)));
+ if(result.a>1.0/1024) result.rgb/=result.a;
+ else {float4 v=source.Load(int3(clamp(int2(round(u)),int2(0,0),image-1),0));result=float4(v.rgb,0);}
+ output[o]=saturate(result);
 })";
     default:throw std::runtime_error("Shader source requires a vertex program or the pinned GUI backend");
     }

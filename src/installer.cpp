@@ -511,6 +511,16 @@ void uninstall(const std::filesystem::path& chosen) {
         const auto status=RegGetValueW(key,nullptr,L"InstallLocation",RRF_RT_REG_SZ,nullptr,location.data(),&size);RegCloseKey(key);
         if(status==ERROR_SUCCESS && same_path(location.data(),root)) RegDeleteTreeW(HKEY_CURRENT_USER,registry);
     }
+    // The Upscaled HUD cache beside the preferences is derived data the game
+    // rebuilds on demand. Remove its files, never anything else in data\user.
+    if(const auto cache=root/"data/user/hud-cache";std::filesystem::is_directory(cache) && !linked(cache)) {
+        std::error_code error;
+        for(const auto& item:std::filesystem::directory_iterator(cache,error)) {
+            const auto extension=item.path().extension();
+            if(item.is_regular_file(error) && (extension==".hud" || extension==".tmp")) std::filesystem::remove(item.path(),error);
+        }
+        RemoveDirectoryW(cache.c_str());
+    }
     // Remove now-empty application folders, deepest first; saves keep data\user in place.
     std::set<std::filesystem::path,std::greater<>> folders;
     for(const auto& file:files) for(auto parent=file.parent_path();!parent.empty();parent=parent.parent_path()) folders.insert(parent);

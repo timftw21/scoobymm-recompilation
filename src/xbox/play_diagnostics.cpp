@@ -55,8 +55,9 @@ std::string processor_name() {
 }
 
 std::string enhancement_json(const RenderEnhancements& e, std::array<std::uint32_t, 2> render) {
-    return std::format("\"render_size\":[{},{}],\"render_scale\":{},\"msaa\":{},\"fxaa\":{},\"anisotropy\":{}",
-                       render[0], render[1], e.scale, e.samples, e.fxaa ? "true" : "false", e.anisotropy);
+    return std::format("\"render_size\":[{},{}],\"render_scale\":{},\"msaa\":{},\"fxaa\":{},\"anisotropy\":{},\"upscaled_hud\":{}",
+                       render[0], render[1], e.scale, e.samples, e.fxaa ? "true" : "false", e.anisotropy,
+                       e.upscaled_hud ? "true" : "false");
 }
 
 std::string dimensions(std::array<std::uint32_t, 2> size) {

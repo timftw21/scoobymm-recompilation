@@ -34,6 +34,7 @@ struct PlayOptions : PlayerSettings {
     std::uint32_t refresh_at = 0;
     int scripted_rate = 0;
     bool hidden = false, launcher = false;
+    bool restart = false; // Set when the player chose Restart game.
     InputScript input;
     DiagnosticOptions diagnostics;
 };

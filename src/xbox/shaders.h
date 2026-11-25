@@ -7,7 +7,8 @@ enum class ShaderKind : unsigned {
     passthrough,clear_vertex,clear_pixel,display_vertex,display_pixel,gui_vertex,gui_pixel,
     combiner0,combiner1,combiner2,combiner3,combiner4,combiner5,combiner6,combiner7,combiner8,
     fixed0,fixed1,fixed2,fixed3,fixed4,fixed5,fixed6,vertex,launch,
-    color,modulate2d,modulate_cube,modulate3d,video_overlay,blit_pixel,fxaa_pixel,line_geometry,count
+    color,modulate2d,modulate_cube,modulate3d,video_overlay,blit_pixel,fxaa_pixel,line_geometry,
+    interface_classify,interface_bleed,interface_conv_first,interface_conv,interface_compose,interface_filter,count
 };
 struct ShaderBinary {Bytes bytes;bool compiled=false;bool uses_tokens=false;};
 struct StaticVertex {VertexProgram program;Bytes bytes;};

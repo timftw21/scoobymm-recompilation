@@ -105,11 +105,9 @@ struct Hash {
 };
 #endif
 constexpr std::size_t chunk_size = 256 * 1024;
-}
 
-std::string sha256(File& file, std::uint64_t offset, std::uint64_t length) {
-    file.check(offset, length);
-    const auto end = offset + length;
+// SHA-256 of the chunks that feed passes to its update callback.
+template <class Feed> std::string sha256_of(Feed&& feed) {
 #ifdef _WIN32
     Algorithm algorithm;
     crypto_check(BCryptOpenAlgorithmProvider(&algorithm.handle, BCRYPT_SHA256_ALGORITHM, nullptr, 0));
@@ -126,18 +124,14 @@ std::string sha256(File& file, std::uint64_t offset, std::uint64_t length) {
     if (!hash.handle) throw std::runtime_error("Cannot allocate native hash");
     check(EVP_DigestInit_ex(hash.handle, EVP_sha256(), nullptr));
 #endif
-    std::vector<std::byte> buffer(chunk_size);
-    while (offset < end) {
-        const auto size = static_cast<std::size_t>(std::min<std::uint64_t>(end - offset, buffer.size()));
-        file.read(offset, std::span(buffer).first(size));
+    feed([&](Bytes chunk) {
 #ifdef _WIN32
-        crypto_check(BCryptHashData(hash.handle, reinterpret_cast<PUCHAR>(buffer.data()),
-                                    static_cast<ULONG>(size), 0));
+        crypto_check(BCryptHashData(hash.handle, reinterpret_cast<PUCHAR>(const_cast<std::byte*>(chunk.data())),
+                                    static_cast<ULONG>(chunk.size()), 0));
 #else
-        check(EVP_DigestUpdate(hash.handle, buffer.data(), size));
+        check(EVP_DigestUpdate(hash.handle, chunk.data(), chunk.size()));
 #endif
-        offset += size;
-    }
+    });
     std::array<std::byte, 32> digest{};
 #ifdef _WIN32
     crypto_check(BCryptFinishHash(hash.handle, reinterpret_cast<PUCHAR>(digest.data()), digest.size(), 0));
@@ -147,6 +141,23 @@ std::string sha256(File& file, std::uint64_t offset, std::uint64_t length) {
     if (written != digest.size()) throw std::runtime_error("Invalid native hash size");
 #endif
     return hex_bytes(digest);
+}
+}
+
+std::string sha256(File& file, std::uint64_t offset, std::uint64_t length) {
+    file.check(offset, length);
+    return sha256_of([&](auto&& update) {
+        std::vector<std::byte> buffer(chunk_size);
+        for (const auto end = offset + length; offset < end;) {
+            const auto size = static_cast<std::size_t>(std::min<std::uint64_t>(end - offset, buffer.size()));
+            file.read(offset, std::span(buffer).first(size));
+            update(Bytes(buffer).first(size));
+            offset += size;
+        }
+    });
+}
+std::string sha256(Bytes bytes) {
+    return sha256_of([&](auto&& update) { update(bytes); });
 }
 
 void write_text(const std::filesystem::path& output, std::string_view text) {

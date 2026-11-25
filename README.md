@@ -47,7 +47,8 @@ AI coding assistants, including Anthropic Claude, have assisted with development
 - Keyboard and gamepad input with rumble, pause/resume, and native audio playback, including the Xbox's environmental audio effects.
 - Creating and reopening game saves.
 - Saved display, refresh-rate, audio, and game-file settings.
-- Original 4:3 and widescreen 16:9 options; 1×–6× internal resolution, MSAA up to 8×, FXAA, and anisotropic filtering up to 16×.
+- Keyboard and controller remapping.
+- Original 4:3 and widescreen 16:9 options; 1×–6× internal resolution, MSAA up to 8×, FXAA, anisotropic filtering up to 16×, and AI-upscaled HUD and menu artwork.
 - Refresh limits above the original 30 Hz, including custom rates and Unlimited, with the game clock following real time.
 - Frame captures and CPU/GPU performance reports.
 
@@ -55,7 +56,6 @@ AI coding assistants, including Anthropic Claude, have assisted with development
 
 - Testing every episode, Tome of Doom capture, minigame, cutscene, and language mode.
 - Wider visual, audio, and gameplay comparisons against the original Xbox release.
-- Controller and keyboard remapping.
 - Sustained 360 Hz performance. Selecting a refresh rate does not guarantee the hardware can reach it.
 - Linux and macOS ports.
 
@@ -99,24 +99,28 @@ Replace the example disc path with your own. Generation verifies the executable 
 
 ## Game settings
 
-Press **F1** or the controller **Guide** button to open settings. Preferences save automatically.
+Display, enhancement, and audio settings are in **Recomp Options** on the game's title and pause menus:
+
+- **Display:** Fullscreen, widescreen 16:9, V-sync, and a frame-rate limit up to 480 Hz or unlimited.
+- **Enhancements:** 1×–6× internal resolution, supported MSAA levels, FXAA, and anisotropic filtering up to 16×. **Upscaled HUD** sharpens HUD, menu and title artwork with the Real-ESRGAN AI upscaler on your GPU at 2× internal resolution and above. New artwork sharpens moments after it first appears, and artwork from earlier sessions is sharp immediately. **Skip intro movies** starts the next session at the title screen. The defaults reproduce the original Xbox game.
+- **Audio:** Master volume, mute, and mute when the window loses focus.
+
+Press **Esc** or the controller **Guide** button to open or close the recompilation's settings window. Preferences save automatically.
 
 - **Game Files:** Select and validate the XISO and executable.
-- **General:** Choose a refresh limit, a custom rate, or Unlimited, and toggle the frame-rate display.
-- **Audio:** Adjust master volume, mute, or mute when the window loses focus.
-- **Graphics:** Set aspect ratio, V-sync, and fullscreen.
-- **Enhancements:** Choose 1×–6× internal resolution, supported MSAA levels, FXAA, and anisotropic filtering up to 16×. The defaults reproduce the original Xbox image.
+- **General:** Set a custom frame-rate limit up to 1000 Hz, and toggle the frame-rate display.
+- **Controls:** Rebind each Xbox control to a key and a controller input.
 - **Diagnostics:** Capture a frame or record performance. Both are saved in `build/captures`.
 
-Use **Restore defaults** to reset everything except the game files. The same display, enhancement, and audio choices are also in **Recomp Options** on the game's title and pause menus.
+Use **Restore defaults** to reset everything except the game files. During play, **Restart game** starts the game again from its opening and **Exit game** closes it; both ask first, because progress since your last save is lost.
 
 Higher refresh limits draw and update the game more often. The game's clock follows real time, so gameplay speed stays the same.
 
 ## Controls
 
-Connected gamepads map directly to the Xbox controller. The **Black** and **White** buttons are on the right and left bumpers.
+Connected gamepads map directly to the Xbox controller by default. The **Black** and **White** buttons are on the right and left bumpers. To change a binding, open **Controls** in the settings window, select a keyboard or controller cell, and press the new input. A binding already in use swaps places. **Esc** cancels, and **Delete** or right-click clears a binding. **Reset controls** restores the defaults below.
 
-| Xbox control | Keyboard |
+| Xbox control | Default keyboard |
 | --- | --- |
 | Left stick | W / A / S / D |
 | D-pad | Arrow keys |
@@ -126,16 +130,15 @@ Connected gamepads map directly to the Xbox controller. The **Black** and **Whit
 | Start | Enter |
 | Back | Backspace |
 | Left / right stick click | Left Ctrl / Right Ctrl |
-| Open settings | F1 |
-| Close settings, or quit the game | Esc |
+| Open or close settings | Esc |
 | Capture a frame | F8 |
 | Start / save performance recording | F9 |
 
-Game input is held neutral while settings are open.
+Game input is held neutral while settings are open. **F8**, **F9**, **Esc**, and **Guide** are reserved. To quit, choose **Exit game** in settings. The mouse pointer hides after three seconds without mouse activity during play.
 
 ## Saves and updates
 
-Game saves, preferences, and the local storage identity are in `data/user` inside your installation or source folder. **Back up that entire folder, including `storage.key`.**
+Game saves, preferences, and the local storage identity are in `data/user` inside your installation or source folder. **Back up that entire folder, including `storage.key`.** `data/user/hud-cache` keeps up to 512 MB of Upscaled HUD artwork so it is sharp from the first frame in later sessions. You can delete it at any time, and uninstalling removes it.
 
 For installed builds, close the game and run the newer installer using the same installation folder. Updates preserve saves and preferences. Uninstall through Windows **Installed apps**. Saved games, preferences, session reports, and your original disc image are kept. An image copied into the installation folder is removed during uninstall.
 
