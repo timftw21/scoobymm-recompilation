@@ -27,6 +27,7 @@ struct Instruction {
     bool missing_fallthrough{};
     bool cross_function_fallthrough{};
     bool relocated_displacement{}, relocated_immediate{}, call_next_instruction{};
+    bool frame_step_operand{}; // A verified x87 input authored per 30 Hz update.
     bool saves_jump{}, resumes_jump{};
     std::optional<std::uint32_t> target() const;
 };

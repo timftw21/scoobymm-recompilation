@@ -173,7 +173,7 @@ public:
             memory_.store<Word>(0x0015E6FC, 0);
             services_.camera_extent = [](void* context, Word camera, unsigned field, Word value) {
                 const auto& boot = *static_cast<OfflineBoot*>(context);
-                if (field != 0x68 || !boot.window_->settings().widescreen) return value;
+                if (field != 0x68 || !boot.window_->settings().widescreen()) return value;
                 const auto scene = boot.memory_.load<Word>(0x01EED360);
                 if (!scene || boot.memory_.load<Word>(camera + 0x14) != 1) return value;
                 // RenderWare and both game-object frusta share the display projection.
@@ -181,7 +181,7 @@ public:
                 for (const auto slot : {4U, 8U}) {
                     const auto object = boot.memory_.load<Word>(scene + slot);
                     if (object && boot.memory_.load<Word>(object + 0x30) == camera)
-                        return std::bit_cast<Word>(std::bit_cast<float>(value) * (4.f / 3.f));
+                        return std::bit_cast<Word>(std::bit_cast<float>(value) * aspect_widening(boot.window_->settings().aspect));
                 }
                 return value;
             };
@@ -195,8 +195,8 @@ public:
                 const auto& boot = *static_cast<OfflineBoot*>(context);
                 const auto engine = boot.memory_.load<Word>(0x01EED350);
                 if (!engine || boot.window_->settings().refresh_rate == 30) return authored;
-                // 0x1855F stores the smoothed seconds elapsed this update. Preserve
-                // the authored 0.033 seconds per 30 Hz frame, including its rounding.
+                // 0x1855F stores elapsed seconds per update. Express it in original
+                // 30 Hz frames for authored timer, rotation and hover increments.
                 const auto dt = std::bit_cast<float>(boot.memory_.load<Word>(engine + 0x290));
                 return std::bit_cast<Word>(std::bit_cast<float>(authored) * (30.f * dt));
             };
@@ -1370,6 +1370,8 @@ Word OfflineBoot::open_file(Cpu& cpu, bool create) {
     } else return name_missing;
     if (file.directory && (options & 0x40)) return 0xC00000BA;
     if (!file.directory && (options & 1)) return 0xC0000103;
+    if (file.disc_entry && !file.directory && path.ends_with(".XMV"))
+        graphics_.movie_opened(std::string_view(path).substr(cdrom.size()+1));
     const auto handle = new_handle();
     files_.emplace(handle, std::move(file));
     memory_.store(arg(0), handle);
@@ -1406,7 +1408,7 @@ void OfflineBoot::service(unsigned ordinal, Cpu& cpu) {
     switch (ordinal) {
     case 2: {
         const auto option = arg(1), parameter = arg(2);
-        if (option == 6) memory_.store<Word>(arg(3), 0x00400101 | (window_ && window_->settings().widescreen ? 0x10000 : 0)); // NTSC-M at 60 Hz.
+        if (option == 6) memory_.store<Word>(arg(3), 0x00400101 | (window_ && window_->settings().widescreen() ? 0x10000 : 0)); // NTSC-M at 60 Hz.
         else if (option == 11 && parameter <= 5) flicker_filter_ = parameter;
         else if (option == 14) luma_filter_ = parameter != 0;
         else break;
@@ -1565,7 +1567,7 @@ void OfflineBoot::service(unsigned ordinal, Cpu& cpu) {
         switch (arg(0)) {
         case 7: value = language_; break;
         case 0x104: value = 1; break;
-        case 8: value = window_ && window_->settings().widescreen ? 0x10000 : 0; break;
+        case 8: value = window_ && window_->settings().widescreen() ? 0x10000 : 0; break;
         case 9: case 10: case 17: value = 0; break;
         case 0x103: value = 0x00400100; break;
         }

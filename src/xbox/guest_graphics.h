@@ -2,6 +2,7 @@
 #include "cpu.h"
 #include "gpu.h"
 #include "guest_allocator.h"
+#include "settings.h"
 
 namespace xbox_native {
 enum class PlatformApi : std::uint32_t;
@@ -22,6 +23,7 @@ public:
     RenderStats render_stats() const { return renderer_ ? renderer_->stats() : RenderStats{}; }
     GpuStats stats() const { return gpu_ ? gpu_->stats() : GpuStats{}; }
     void advance_display(std::uint64_t now);
+    void movie_opened(std::string_view disc_path);
     void name_widget(std::uint32_t handle,std::uint32_t name);
     void draw_widget(std::uint32_t widget);
     std::uint64_t next_vblank() const;
@@ -41,13 +43,13 @@ private:
     std::unique_ptr<Gpu> gpu_;
     std::uint32_t cursor_{};
     // The HUD registry at 0x49DF0 has 512 slots and generation-tagged handles.
-    struct WidgetAnchor { std::uint32_t handle = UINT32_MAX; int side{}; bool gameplay_root{}; };
+    struct WidgetAnchor { std::uint32_t handle = UINT32_MAX; int side{}; bool gameplay_root{}, title_backdrop{}; };
     std::array<WidgetAnchor,512> widget_anchors_{};
     std::uint32_t pause_menu_handle_ = UINT32_MAX;
     std::vector<Gpu::HudAnchor> hud_markers_;
     int hud_side_{};
-    bool hud_art_{};
-    bool presentation_wide_{}, last_widescreen_{};
+    bool hud_art_{}, title_backdrop_{};
+    AspectRatio presentation_aspect_{}, last_aspect_{};
     std::uint32_t widget_from_handle(std::uint32_t hud, std::uint32_t handle) const;
     bool pause_menu_visible() const;
     std::array<std::array<std::byte, 3>, 256> gamma_{};
@@ -60,6 +62,8 @@ private:
     std::uint64_t vblanks_{};
     std::uint32_t scanouts_{}, overlay_frames_{}, presentations_{};
     bool overlay_pending_{}, submitting_{};
+    unsigned movie_matte_rows_{};
+    unsigned movie_id_{};
 
     std::uint32_t initialize(Cpu& cpu, std::uint32_t parameters);
     std::uint32_t sdk_call(Cpu& cpu, std::uint32_t address, std::span<const std::uint32_t> args = {},
@@ -68,7 +72,7 @@ private:
     std::uint32_t read_register(std::uint32_t offset, unsigned width) const;
     void write_register(std::uint32_t offset, unsigned width, std::uint32_t value);
     void scanout();
-    VideoOverlay video_overlay() const;
+    VideoOverlay video_overlay();
     static void composite_video(Image&, const VideoOverlay&);
     void finish(Cpu& cpu, unsigned arguments);
 };

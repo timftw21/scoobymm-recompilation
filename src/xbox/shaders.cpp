@@ -28,12 +28,29 @@ public:
 // interface_upscaler.cpp.
 constexpr std::string_view interface_job_source=R"(
 cbuffer Job:register(b0) {
- int2 image;int2 origin;int2 extent;int2 halo;int2 interior;int2 slots;uint mode;uint factor;int2 target;
+ int2 image;int2 origin;int2 extent;int2 halo;int2 interior;uint tile_slot;uint factor;int2 target;
 };
+)";
+constexpr std::string_view interface_resample_source=R"(
+float4 texel(int2 p) {float4 v=source.Load(int3(clamp(p,int2(0,0),image-1),0));return float4(v.rgb*v.a,v.a);}
+float catmull_rom(float x) {x=abs(x);return x<1?(1.5*x-2.5)*x*x+1:x<2?((-0.5*x+2.5)*x-4)*x+2:0;}
+// Clamp premultiplied Catmull-Rom to the four nearest texels to prevent ringing.
+float4 authored(int2 o) {
+ float2 u=(float2(o)+0.5)/factor-0.5,cell=floor(u),f=u-cell;int2 b=int2(cell);
+ float4 sum=0;float total=0;
+ [unroll] for(int y=-1;y<=2;++y) [unroll] for(int x=-1;x<=2;++x) {
+  float w=catmull_rom(f.x-x)*catmull_rom(f.y-y);sum+=texel(b+int2(x,y))*w;total+=w;
+ }
+ float4 n0=texel(b),n1=texel(b+int2(1,0)),n2=texel(b+int2(0,1)),n3=texel(b+int2(1,1));
+ float4 result=clamp(sum/total,min(min(n0,n1),min(n2,n3)),max(max(n0,n1),max(n2,n3)));
+ if(result.a>1.0/1024) result.rgb/=result.a;
+ else {float4 v=source.Load(int3(clamp(int2(round(u)),int2(0,0),image-1),0));result=float4(v.rgb,0);}
+ return saturate(result);
+}
 )";
 // One layer and group of 16 output channels: weights[(tap*inputs+input)*4+k]
 // holds outputs k*4..k*4+3; the final linear layer stores unit slopes. Each
-// batch slot (one tile's colour or alpha pass) owns 16 consecutive slices.
+// batch slot holds the 16 consecutive slices for one colour tile.
 constexpr std::string_view interface_layer_source=R"(
 cbuffer Layer:register(b1) {float4 weights[2304];float4 bias[4];float4 slope[4];uint4 layer;};
 RWTexture2DArray<float4> features_out:register(u0);
@@ -55,6 +72,33 @@ SamplerState sm0:register(s0);SamplerState sm1:register(s1);SamplerState sm2:reg
 Texture2D tx0:register(t0);Texture2D tx1:register(t1);Texture2D tx2:register(t2);Texture2D tx3:register(t3);
 TextureCube cube0:register(t4);TextureCube cube1:register(t5);TextureCube cube2:register(t6);TextureCube cube3:register(t7);
 Texture3D vol0:register(t8);Texture3D vol1:register(t9);Texture3D vol2:register(t10);Texture3D vol3:register(t11);
+#ifdef HUD_PREVIEW
+Texture2D hud0:register(t12);Texture2D hud1:register(t13);Texture2D hud2:register(t14);Texture2D hud3:register(t15);
+float4 premultiply(float4 v) {return float4(v.rgb*v.a,v.a);}
+float4 sample2d(Texture2D src,Texture2D refined,SamplerState sm,float2 uv,uint flags) {
+ [branch] if(!(flags&4)) return src.Sample(sm,uv);
+ uint width,height;src.GetDimensions(width,height);
+ float2 size=float2(width,height),dx=ddx(uv),dy=ddy(uv);
+ float footprint=max(length(dx*size),length(dy*size));
+ float4 base;
+ if(footprint>=1) base=src.SampleGrad(sm,uv,dx,dy);
+ else {
+  float2 p=uv*size-0.5,f=frac(p),step=1/size,corner=(floor(p)+0.5)*step;
+  f=lerp(f,smoothstep(0,1,f),0.65*(1-footprint));
+  float4 a=premultiply(src.SampleLevel(sm,corner,0)),b=premultiply(src.SampleLevel(sm,corner+float2(step.x,0),0));
+  float4 c=premultiply(src.SampleLevel(sm,corner+float2(0,step.y),0)),d=premultiply(src.SampleLevel(sm,corner+step,0));
+  base=lerp(lerp(a,b,f.x),lerp(c,d,f.x),f.y);
+  if(base.a>0) base.rgb/=base.a;
+  else base.rgb=src.SampleLevel(sm,uv,0).rgb;
+ }
+ uint phase=flags>>8;
+ [branch] if(phase) base=lerp(base,refined.SampleGrad(sm,uv,dx,dy),float(phase)/255);
+ return base;
+}
+#define SAMPLE2D(N,uv) sample2d(tx##N,hud##N,sm##N,uv,stages[N].w)
+#else
+#define SAMPLE2D(N,uv) tx##N.Sample(sm##N,uv)
+#endif
 float4 apply_sample_flags(float4 value,uint flags) {
  if(flags&2) value.a=1;
  if((flags&1) && value.a==0) discard;
@@ -122,7 +166,7 @@ void write_alpha(inout R r,uint destination,float v) {
     uint previous=stages[N].y;enabled=stages[previous].x!=0 && stages[previous].x!=5; \
     float4 value=source(r,8+previous,0,false);uv=mode==15?value.ar:value.gb; \
    } \
-   if(enabled) sampled=tx##N.Sample(sm##N,uv); \
+   if(enabled) sampled=SAMPLE2D(N,uv); \
   } \
   if(enabled && mode!=4 && mode!=5) sampled=apply_sample_flags(sampled,stages[N].w); \
   r.t##N=sampled; \
@@ -133,8 +177,12 @@ float4 main(P p):SV_Target {
  r.t0=r.t1=r.t2=r.t3=float4(0,0,0,1);
  TEXTURE(0) TEXTURE(1) TEXTURE(2) TEXTURE(3)
  r.r0.a=stages[0].x?r.t0.a:1;
- // A separate build-time shader for each count removes unused stages.
+#ifdef HUD_PREVIEW
+ // One shader handles all guest combiner counts while new artwork is being enlarged.
+ [loop] for(uint stage=0;stage<(controls.x&255);++stage) {
+#else
  [unroll] for(uint stage=0;stage<COMBINER_COUNT;++stage) {
+#endif
   uint4 words=combiners[stage];uint cf=words.z>>12,af=words.w>>12;
   float3 c0=rgb(r,(words.x>>24)&255,stage,false),c1=rgb(r,(words.x>>16)&255,stage,false);
   float3 c2=rgb(r,(words.x>>8)&255,stage,false),c3=rgb(r,words.x&255,stage,false);
@@ -172,7 +220,8 @@ const char* shader_profile(ShaderKind kind) {
     if(kind==ShaderKind::launch || (kind>=ShaderKind::interface_classify && kind<=ShaderKind::interface_filter)) return "cs_5_0";
     if(kind==ShaderKind::line_geometry) return "gs_5_0";
     if(kind==ShaderKind::clear_pixel || kind==ShaderKind::display_pixel || kind==ShaderKind::video_overlay ||
-       kind==ShaderKind::blit_pixel || kind==ShaderKind::fxaa_pixel ||
+       kind==ShaderKind::blit_pixel || kind==ShaderKind::fxaa_pixel || kind==ShaderKind::movie_display ||
+       kind==ShaderKind::movie_deblock || kind==ShaderKind::hud_preview ||
        (kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8) ||
        (kind>=ShaderKind::color && kind<=ShaderKind::modulate3d)) return "ps_5_0";
     return "vs_5_0";
@@ -190,6 +239,7 @@ std::string shader_source(ShaderKind kind) {
     }
     if(kind>=ShaderKind::combiner0 && kind<=ShaderKind::combiner8)
         return std::format("#define COMBINER_COUNT {}\n",unsigned(kind)-unsigned(ShaderKind::combiner0))+std::string(combiner_source);
+    if(kind==ShaderKind::hud_preview) return "#define HUD_PREVIEW\n"+std::string(combiner_source);
     if(kind>=ShaderKind::fixed0 && kind<=ShaderKind::fixed6) return fixed_transform_source(unsigned(kind)-unsigned(ShaderKind::fixed0));
     switch(kind) {
     case ShaderKind::gui_vertex: return std::string(gui_vertex_source);
@@ -209,10 +259,48 @@ float4 main(uint id:SV_VertexID):SV_Position {float2 p=float2((id<<1)&2,id&2);re
     case ShaderKind::display_vertex:return R"(
 struct P {float4 p:SV_Position;float2 uv:TEXCOORD0;};
 P main(uint id:SV_VertexID) {P o;o.uv=float2((id<<1)&2,id&2);o.p=float4(o.uv*float2(2,-2)+float2(-1,1),0,1);return o;})";
-    case ShaderKind::video_overlay:return R"(
+    case ShaderKind::video_overlay:
+    case ShaderKind::movie_deblock:return std::string(kind==ShaderKind::movie_deblock ? "#define DEBLOCK\n" : "")+R"(
 Texture2D base:register(t0);
 Texture2D<uint4> pairs:register(t1);
 cbuffer Overlay:register(b0) {uint4 source;uint4 destination;uint2 stepXY;uint colorKey;uint keyed;};
+int3 yuv(int2 pixel) {
+    int4 pair=int4(pairs.Load(int3(pixel.x>>1,pixel.y,0)));
+    return int3((pixel.x&1) ? pair.z : pair.x,pair.y,pair.w);
+}
+#ifdef DEBLOCK
+float largest(float3 v) { return max(v.x,max(v.y,v.z)); }
+float3 suppressRinging(int2 pixel,float3 center) {
+    int2 last=int2(source.xy)-1;
+    float3 left=yuv(max(pixel-int2(1,0),0)), right=yuv(min(pixel+int2(1,0),last));
+    float3 up=yuv(max(pixel-int2(0,1),0)), down=yuv(min(pixel+int2(0,1),last));
+    // Pull a weak isolated peak back toward the range of its neighbors.
+    // A continuous line, a smooth ramp, or a strong edge retains its value.
+    float3 low=min(min(left,right),min(up,down)), high=max(max(left,right),max(up,down));
+    float3 residual=clamp(center,low,high)-center;
+    float strength=(1-smoothstep(3,9,largest(abs(residual))))*(1-smoothstep(6,15,largest(high-low)));
+    return clamp(residual,-2,2)*strength;
+}
+float3 seamCorrection(int2 pixel,int2 axis,int coordinate,int length) {
+    // Only the two nearest pixels on each side of an 8-pixel block edge.
+    int distance=((coordinate+4)&7)-4;
+    int boundary=coordinate-distance;
+    if(distance < -2 || distance > 1 || boundary<2 || boundary+1>=length) return 0;
+    int2 edge=pixel-distance*axis;
+    float3 p1=yuv(edge-2*axis), p0=yuv(edge-axis), q0=yuv(edge), q1=yuv(edge+axis);
+    float3 jump=q0-p0;
+    float contrast=largest(abs(jump));
+    float detail=largest(max(abs(p0-p1),abs(q1-q0)));
+    // Follow existing ramps, and fade out near line art or textured detail.
+    float strength=(1-smoothstep(8,24,contrast))*(1-smoothstep(3,9,detail));
+    float3 slope=((p0-p1)+(q1-q0))*0.5;
+    float3 excess=clamp(jump-slope,min(jump,0),max(jump,0));
+    // The chroma blocks in the subsampled movie span 16 picture pixels.
+    if((boundary&15)!=0) excess.yz=0;
+    float weight=(distance==-1 || distance==0) ? 0.30 : 0.10;
+    return (distance<0 ? weight : -weight)*strength*excess;
+}
+#endif
 float4 main(float4 position:SV_Position):SV_Target {
     uint2 pixel=uint2(position.xy);
     float4 original=base.Load(int3(pixel,0));
@@ -223,10 +311,19 @@ float4 main(float4 position:SV_Position):SV_Target {
     uint2 delta=pixel-destination.xy;
     uint2 offset=delta*(stepXY>>20)+((delta*(stepXY&0xfffff))>>20);
     uint2 texel=min(source.xy-1,source.zw+offset);
-    int4 pair=int4(pairs.Load(int3(texel.x>>1,texel.y,0)));
-    int y=298*((texel.x&1 ? pair.z : pair.x)-16), cb=pair.y-128, cr=pair.w-128;
+    int3 sampleYuv=yuv(texel);
+#ifdef DEBLOCK
+    float3 correction=seamCorrection(texel,int2(1,0),texel.x,source.x)
+                     +seamCorrection(texel,int2(0,1),texel.y,source.y)+suppressRinging(texel,sampleYuv);
+    // Retain fractional corrections until the RGB render target quantizes them.
+    float3 filtered=sampleYuv+correction-float3(16,128,128);
+    float y=298*filtered.x,cb=filtered.y,cr=filtered.z;
+    return float4(saturate(float3(y+409*cr,y-100*cb-208*cr,y+516*cb)/(256*255)),1);
+#else
+    int y=298*(sampleYuv.x-16), cb=sampleYuv.y-128, cr=sampleYuv.z-128;
     int3 color=(int3(y+409*cr,y-100*cb-208*cr,y+516*cb)+128)>>8;
     return float4(clamp(color,0,255)/255.0,1);
+#endif
 })";
     case ShaderKind::display_pixel:return R"(
 Texture2D image:register(t0);Texture1D gammaRamp:register(t1);SamplerState filter:register(s0);
@@ -243,6 +340,49 @@ float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
     int3 level=int3(round(saturate(color.rgb)*255));
     return float4(gammaRamp.Load(int2(level.r,0)).r,gammaRamp.Load(int2(level.g,0)).g,
                   gammaRamp.Load(int2(level.b,0)).b,color.a);
+})";
+    case ShaderKind::movie_display:return R"(
+Texture2D image:register(t0);
+Texture1D gammaRamp:register(t1);
+SamplerState filter:register(s0);
+cbuffer Framing:register(b0) {float2 extent;float2 size;}
+
+// Interpolate each axis through the source pixels. Keep each result
+// between its two neighbors so high-contrast outlines do not acquire halos.
+float4 weights(float t) {
+    float t2=t*t, t3=t2*t;
+    return float4(-t+2*t2-t3, 2-5*t2+3*t3, t+4*t2-3*t3, -t2+t3)*0.5;
+}
+float3 upscale(float2 uv) {
+    float2 pixel=uv*size-0.5;
+    int2 origin=int2(floor(pixel)), last=int2(size)-1;
+    float4 wx=weights(frac(pixel.x)), wy=weights(frac(pixel.y));
+    float3 rows[4];
+    [unroll] for(int y=0;y<4;++y) {
+        float3 c[4];
+        [unroll] for(int x=0;x<4;++x)
+            c[x]=image.Load(int3(clamp(origin+int2(x-1,y-1),0,last),0)).rgb;
+        rows[y]=clamp(c[0]*wx.x+c[1]*wx.y+c[2]*wx.z+c[3]*wx.w,min(c[1],c[2]),max(c[1],c[2]));
+    }
+    return clamp(rows[0]*wy.x+rows[1]*wy.y+rows[2]*wy.z+rows[3]*wy.w,
+                 min(rows[1],rows[2]),max(rows[1],rows[2]));
+}
+float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target {
+    float2 source=(uv-0.5)*extent+0.5;
+    float footprint=max(abs(ddx(source.x))*size.x,abs(ddy(source.y))*size.y);
+    float3 rgb;
+    if(any(source<0) || any(source>1)) {
+        // Broad, subdued colors from the same shot fill the unused sides.
+        float2 backdrop=(uv-0.5)*extent/max(extent.x,extent.y)+0.5;
+        rgb=0.35*image.SampleLevel(filter,backdrop,5.5).rgb;
+    } else if(footprint>1.001) {
+        rgb=image.SampleLevel(filter,source,log2(footprint)).rgb;
+    } else {
+        rgb=upscale(source);
+    }
+    int3 level=int3(round(saturate(rgb)*255));
+    return float4(gammaRamp.Load(int2(level.r,0)).r,gammaRamp.Load(int2(level.g,0)).g,
+                  gammaRamp.Load(int2(level.b,0)).b,1);
 })";
     case ShaderKind::blit_pixel:return R"(
 Texture2D image:register(t0);SamplerState filter:register(s0);
@@ -368,7 +508,7 @@ Texture2D<float4> image_in:register(t0);
 float3 input_texel(int2 p) {
  if(any(p<0) || any(p>=extent)) return 0;
  float4 v=image_in.Load(int3(clamp(origin+p,int2(0,0),image-1),0));
- return mode?v.aaa:v.rgb;
+ return v.rgb;
 }
 [numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
  int2 q=int2(id.xy);if(any(q>=extent)) return;
@@ -379,7 +519,7 @@ float3 input_texel(int2 p) {
    a0+=x[c]*weights[(t*3+c)*4];a1+=x[c]*weights[(t*3+c)*4+1];a2+=x[c]*weights[(t*3+c)*4+2];a3+=x[c]*weights[(t*3+c)*4+3];
   }
  }
- store(q,uint(slots.x),a0,a1,a2,a3);
+ store(q,tile_slot,a0,a1,a2,a3);
 })";
     case ShaderKind::interface_conv:return std::string(interface_job_source)+std::string(interface_layer_source)+R"(
 Texture2DArray<float4> features:register(t0);
@@ -407,20 +547,17 @@ Texture2D<float4> colour_in:register(t0);
 Texture2D<float4> source:register(t1);
 Texture2DArray<float4> net:register(t2);
 RWTexture2D<unorm float4> output:register(u0);
+)"+std::string(interface_resample_source)+R"(
 // One x4 network sample: pixel shuffle channel c*16+i*4+j is slice c*4+i of
-// the colour (slots.x) or alpha (slots.y) pass, component j, added to the
+// the colour pass, component j, added to the
 // nearest-upsampled input and clamped to [0,1].
 float4 network(int2 s) {
  int2 e=(s>>2)+halo;int i=s.y&3,j=s.x&3;
  int2 texel=clamp(origin+e,int2(0,0),image-1);
  float3 base=colour_in.Load(int3(texel,0)).rgb;float alpha=source.Load(int3(texel,0)).a;
  float4 result;
- [unroll] for(int c=0;c<3;++c) result[c]=saturate(net.Load(int4(e,slots.x*16+c*4+i,0))[j]+base[c]);
- if(mode) {
-  float a=0;
-  [unroll] for(int c=0;c<3;++c) a+=saturate(net.Load(int4(e,slots.y*16+c*4+i,0))[j]+alpha);
-  result.a=a/3;
- } else result.a=alpha;
+ [unroll] for(int c=0;c<3;++c) result[c]=saturate(net.Load(int4(e,tile_slot*16+c*4+i,0))[j]+base[c]);
+ result.a=alpha;
  return result;
 }
 [numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
@@ -441,27 +578,16 @@ float4 network(int2 s) {
   }
   result=sum/total;result.rgb=result.a>1.0/1024?result.rgb/result.a:plain/total;
  }
- output[target+o]=saturate(result);
+ float4 base=authored(target+o);
+ if(base.a>1.0/1024) base.rgb=lerp(base.rgb,result.rgb,0.45);
+ output[target+o]=base;
 })";
     case ShaderKind::interface_filter:return std::string(interface_job_source)+R"(
 Texture2D<float4> source:register(t0);
 RWTexture2D<unorm float4> output:register(u0);
-float4 texel(int2 p) {float4 v=source.Load(int3(clamp(p,int2(0,0),image-1),0));return float4(v.rgb*v.a,v.a);}
-float catmull_rom(float x) {x=abs(x);return x<1?(1.5*x-2.5)*x*x+1:x<2?((-0.5*x+2.5)*x-4)*x+2:0;}
-// Fallback for soft or tiny textures: premultiplied Catmull-Rom, clamped to
-// the four nearest texels so it cannot ring or invent detail.
+)"+std::string(interface_resample_source)+R"(
 [numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {
- int2 o=int2(id.xy);if(any(o>=image*int(factor))) return;
- float2 u=(float2(o)+0.5)/factor-0.5,cell=floor(u),f=u-cell;int2 b=int2(cell);
- float4 sum=0;float total=0;
- [unroll] for(int y=-1;y<=2;++y) [unroll] for(int x=-1;x<=2;++x) {
-  float w=catmull_rom(f.x-x)*catmull_rom(f.y-y);sum+=texel(b+int2(x,y))*w;total+=w;
- }
- float4 n0=texel(b),n1=texel(b+int2(1,0)),n2=texel(b+int2(0,1)),n3=texel(b+int2(1,1));
- float4 result=clamp(sum/total,min(min(n0,n1),min(n2,n3)),max(max(n0,n1),max(n2,n3)));
- if(result.a>1.0/1024) result.rgb/=result.a;
- else {float4 v=source.Load(int3(clamp(int2(round(u)),int2(0,0),image-1),0));result=float4(v.rgb,0);}
- output[o]=saturate(result);
+ int2 o=int2(id.xy);if(all(o<image*int(factor))) output[o]=authored(o);
 })";
     default:throw std::runtime_error("Shader source requires a vertex program or the pinned GUI backend");
     }

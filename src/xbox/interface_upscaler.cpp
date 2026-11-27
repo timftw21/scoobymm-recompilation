@@ -14,9 +14,9 @@ void checked_ui(HRESULT status, const char* operation) {
 }
 // Mirrors the HLSL Job and Layer constant buffers in shaders.cpp.
 struct JobConstants {
-    std::int32_t image[2]{}, origin[2]{}, extent[2]{}, halo[2]{}, interior[2]{}, slots[2]{};
-    std::uint32_t mode = 0, factor = 1;
-    std::int32_t target[2]{};
+    std::int32_t image[2]{}, origin[2]{}, extent[2]{}, halo[2]{}, interior[2]{};
+    std::uint32_t tile_slot = 0, factor = 1;
+    std::int32_t target[2]{}, padding[2]{};
 };
 static_assert(sizeof(JobConstants) == 64);
 struct LayerConstants {
@@ -250,15 +250,15 @@ std::uint64_t InterfaceUpscaler::run(Job& job) {
     }
 }
 bool InterfaceUpscaler::form_batch() {
-    // Tiles from consecutive jobs share each convolution dispatch; a
-    // transparent tile occupies two slots, colour then alpha.
+    // Coverage uses the original artwork, so transparent tiles also need
+    // just one colour inference.
     batch_.clear(); batch_layer_ = batch_index_ = 0;
     for (auto& job : jobs_) {
         if (job.stage != Job::Stage::network) continue;
-        const unsigned slots = job.decision.transparent ? 2 : 1, tiles_x = divide(job.width, tile_);
-        while (job.next_tile < job.tiles && batch_.size() + slots <= interface_batch) {
+        const unsigned tiles_x = divide(job.width, tile_);
+        while (job.next_tile < job.tiles && batch_.size() < interface_batch) {
             const unsigned tx = job.next_tile % tiles_x, ty = job.next_tile / tiles_x;
-            Entry entry{job.id, job.next_tile, false, {}, {}, {}};
+            Entry entry{job.id, job.next_tile, {}, {}, {}};
             entry.interior[0] = int(std::min(tile_, job.width - tx * tile_));
             entry.interior[1] = int(std::min(tile_, job.height - ty * tile_));
             entry.origin[0] = int(tx * tile_) - int(interface_halo);
@@ -266,7 +266,6 @@ bool InterfaceUpscaler::form_batch() {
             entry.extent[0] = entry.interior[0] + 2 * int(interface_halo);
             entry.extent[1] = entry.interior[1] + 2 * int(interface_halo);
             batch_.push_back(entry);
-            if (slots == 2) { entry.alpha = true; batch_.push_back(entry); }
             create_output(job);
             ++job.next_tile;
         }
@@ -297,9 +296,9 @@ std::uint64_t InterfaceUpscaler::run_batch() {
         auto* job = find(entry.job);
         if (!job) throw std::runtime_error("HUD upscaler batch lost its job");
         auto c = job_constants(entry, *job);
-        c.slots[0] = int(slot); c.mode = entry.alpha;
+        c.tile_slot = slot;
         constants(job_constants_.Get(), &c, sizeof(c));
-        dispatch(first_.Get(), {entry.alpha ? job->source.Get() : job->colour()}, features_[0].output.Get(),
+        dispatch(first_.Get(), {job->colour()}, features_[0].output.Get(),
                  {job_constants_.Get(), layers_[layer_index_[0] + group].Get()}, divide(unsigned(entry.extent[0]), 8),
                  divide(unsigned(entry.extent[1]), 8));
         if (++batch_index_ == batch_.size() * 4) { batch_index_ = 0; batch_layer_ = 1; }
@@ -323,13 +322,12 @@ std::uint64_t InterfaceUpscaler::run_batch() {
     const auto& entry = batch_[batch_index_];
     auto* job = find(entry.job);
     if (!job) throw std::runtime_error("HUD upscaler batch lost its job");
-    const bool alpha = job->decision.transparent;
     auto c = job_constants(entry, *job);
-    c.slots[0] = int(batch_index_); c.slots[1] = int(batch_index_ + (alpha ? 1 : 0)); c.mode = alpha;
+    c.tile_slot = batch_index_;
     constants(job_constants_.Get(), &c, sizeof(c));
     dispatch(compose_.Get(), {job->colour(), job->source.Get(), features_[1].view.Get()}, job->output_view.Get(), {job_constants_.Get()},
              divide(unsigned(entry.interior[0]) * job->factor, 8), divide(unsigned(entry.interior[1]) * job->factor, 8));
-    batch_index_ += alpha ? 2 : 1;
+    ++batch_index_;
     if (++job->composed == job->tiles) job->stage = Job::Stage::mips;
     const auto work = std::uint64_t(entry.interior[0]) * entry.interior[1] * job->factor * job->factor * 64;
     if (batch_index_ >= batch_.size()) { batch_.clear(); batch_layer_ = batch_index_ = 0; }

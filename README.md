@@ -10,7 +10,7 @@
 
 An unofficial native version of the original Xbox game for Windows x64, built around accurate gameplay, original presentation, and enhancements. This fan project is independent of THQ and Warner Bros. You must provide your own Xbox game disc image. Original game files are not distributed here.
 
-**0.2.0 is a development release.** Bugs, slowdowns, and stops in untested parts of the game are still possible. Linux and macOS remain planned targets.
+**0.3.0 is a development release.** Bugs, slowdowns, and stops in untested parts of the game are still possible. Linux and macOS remain planned targets.
 
 ## AI disclosure
 
@@ -26,13 +26,13 @@ AI coding assistants, including Anthropic Claude, have assisted with development
 
 ## Current status
 
-### Changes in 0.2.0
+### Changes in 0.3.0
 
-- **Upscaled HUD** in Recomp Options sharpens HUD, menu, and title artwork with the Real-ESRGAN AI upscaler at 2× internal resolution and above. Results are cached on disk, so artwork seen before is sharp from its first frame.
-- **Skip intro movies** in Recomp Options goes straight to the title screen.
-- Rebind every Xbox control to a key and a controller input on the new **Controls** page of the settings window.
-- **Esc** or the controller **Guide** button now opens the settings window during play, which gains **Restart game** and **Exit game**. Settings that Recomp Options already covers were removed from it, and the Game Files page was redesigned.
-- The mouse pointer hides after three seconds without mouse activity during play.
+- **21:9 ultrawide** joins 4:3 and 16:9 in Recomp Options. The translucent menu backdrop and scene fades now cover the widescreen view. HUD artwork keeps its original proportions.
+- **Movies** use the extra width by trimming encoded black bars where available. The picture keeps its aspect ratio, with a blurred background at the sides. New filters reduce compression artifacts and steady fine details that briefly wobble.
+- **Upscaled HUD** filters new artwork on its first frame. A lighter Real-ESRGAN pass preserves the original transparency and refines the colour in the background. Finished artwork is cached for later sessions.
+- **Ghosts and pickups** follow their original movement timings at higher frame rates. In the library, the blue ghost's hover and the pickups' spin now run at the same speed at 30 and 120 FPS.
+- **Settings** opens on a black background with a larger layout, the project icon beside the game title, and matching gold **Play** and **Return to game** buttons.
 
 Changes in earlier releases are in the [release notes](https://github.com/timftw21/scoobymm-recompilation/releases).
 
@@ -51,7 +51,7 @@ Changes in earlier releases are in the [release notes](https://github.com/timftw
 - Creating and reopening game saves.
 - Saved display, refresh-rate, audio, and game-file settings.
 - Keyboard and controller remapping.
-- Original 4:3 and widescreen 16:9 options; 1×–6× internal resolution, MSAA up to 8×, FXAA, anisotropic filtering up to 16×, and AI-upscaled HUD and menu artwork.
+- Original 4:3, widescreen 16:9 and ultrawide 21:9 options with edge-anchored HUD; 1×–6× internal resolution, MSAA up to 8×, FXAA, anisotropic filtering up to 16×, and AI-upscaled HUD and menu artwork.
 - Refresh limits above the original 30 Hz, including custom rates and Unlimited, with the game clock following real time.
 - Frame captures and CPU/GPU performance reports.
 
@@ -68,7 +68,7 @@ Changes in earlier releases are in the [release notes](https://github.com/timftw
 
 You need a Direct3D 11-capable graphics card and an XISO image of the **Xbox release of Scooby-Doo! Mystery Mayhem (USA, Europe) (En,Fr,De)**. A full raw-disc dump must first be converted to XISO, for example with extract-xiso. The executable is checked against [the supported-target registry](knowledge/supported_target.json).
 
-**[Download the 0.2.0 Windows installer](https://github.com/timftw21/scoobymm-recompilation/releases/download/v0.2.0/scoobymm-0.2.0-windows-x64-setup.exe)** · [Release notes and SHA-256 checksum](https://github.com/timftw21/scoobymm-recompilation/releases/tag/v0.2.0)
+**[Download the 0.3.0 Windows installer](https://github.com/timftw21/scoobymm-recompilation/releases/download/v0.3.0/scoobymm-0.3.0-windows-x64-setup.exe)** · [Release notes and SHA-256 checksum](https://github.com/timftw21/scoobymm-recompilation/releases/tag/v0.3.0)
 
 1. Run the installer and select your Xbox XISO image.
 2. Choose an installation folder. You can keep a copy of the image with the game and create a desktop shortcut.
@@ -104,8 +104,8 @@ Replace the example disc path with your own. Generation verifies the executable 
 
 Display, enhancement, and audio settings are in **Recomp Options** on the game's title and pause menus:
 
-- **Display:** Fullscreen, widescreen 16:9, V-sync, and a frame-rate limit up to 480 Hz or unlimited.
-- **Enhancements:** 1×–6× internal resolution, supported MSAA levels, FXAA, and anisotropic filtering up to 16×. **Upscaled HUD** sharpens HUD, menu and title artwork with the Real-ESRGAN AI upscaler on your GPU at 2× internal resolution and above. New artwork sharpens moments after it first appears, and artwork from earlier sessions is sharp immediately. **Skip intro movies** starts the next session at the title screen. The defaults reproduce the original Xbox game.
+- **Display:** Fullscreen, aspect ratio (4:3, 16:9 or 21:9), V-sync, and a frame-rate limit up to 480 Hz or unlimited. The wider shapes show more of the scene at the sides and keep the HUD at the screen edges. The pause menu stays 4:3. Episode movies use the widescreen space by trimming their encoded black bars. Full-frame movies keep their original composition. A soft, dark blur from the same shot fills any space at the sides, and a cubic filter sharpens enlarged movie frames. Before enlargement, the player softens compression seams and faint speckles. It also stabilizes stationary details that briefly shift by a pixel in the encoded movie. 21:9 is the 64:27 shape of 2560 × 1080 displays. On 3440 × 1440 it leaves 13-pixel bars at each side. At 21:9 the game scene is horizontally softer at the same internal resolution.
+- **Enhancements:** 1×–6× internal resolution, supported MSAA levels, FXAA, and anisotropic filtering up to 16×. **Upscaled HUD** sharpens HUD, menu and title artwork with the Real-ESRGAN AI upscaler on your GPU at 2× internal resolution and above. New artwork is filtered as soon as it appears. The game blends in a light AI refinement while preserving the original transparency, and reuses finished artwork from the disk cache. **Skip intro movies** starts the next session at the title screen. The defaults reproduce the original Xbox game.
 - **Audio:** Master volume, mute, and mute when the window loses focus.
 
 Press **Esc** or the controller **Guide** button to open or close the recompilation's settings window. Preferences save automatically.

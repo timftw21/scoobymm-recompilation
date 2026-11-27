@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <deque>
+#include <limits>
 #include <map>
 #include <optional>
 #include <tuple>
@@ -14,6 +15,13 @@ namespace xbox_native {
 using Microsoft::WRL::ComPtr;
 namespace {
 float real(std::uint32_t bits) {return std::bit_cast<float>(bits);}
+// The SDK's program for pre-transformed (XYZRHW) vertices, at 0x00121AC0 in
+// the D3D section. It writes oPos = v0 * c0 + c1, in guest pixels.
+constexpr std::array<std::array<std::uint32_t,4>,11> screen_program{{
+    {0,0x022000AA,0x0836086C,0x201FF828},{0,0x0020081B,0x0836106C,0x2070F820},{0,0x0420061B,0x083613FC,0x5011F818},
+    {0,0x00200E1B,0x0836106C,0x2070F838},{0,0x0240021B,0x14361800,0x2F20F834},{0,0x0060201B,0x2436106C,0x3070F800},
+    {0,0x0020101B,0x0836106C,0x2070F840},{0,0x0020121B,0x0836106C,0x2070F848},{0,0x0020141B,0x0836106C,0x2070F850},
+    {0,0x0020161B,0x0836106C,0x2070F858},{0,0x0020181B,0x0836106C,0x2070F861}}};
 unsigned attribute_bytes(std::uint32_t format) {
     const auto size=(format>>4)&15,type=format&15;
     if(format==0x16 || format==0x40) return 4;
@@ -37,8 +45,11 @@ struct Gpu::Impl {
     const std::byte* notification_ram = nullptr;
     bool ordered_notifications = false, fifo_reads_notifications = false;
     std::array<std::uint32_t,3> widescreen_buffers{};
+    float widescreen_scale = 1; // 4:3 over the display aspect.
     int hud_side{};
+    bool title_backdrop = false;
     bool interface_draws = false; // Between HUD widget draw markers.
+    bool sampled_art = false; // The current draw samples a texture other than a rendered surface.
     std::array<std::array<std::uint32_t,2048>,8> registers{};
     std::array<std::uint32_t,8> objects{};
     std::array<std::uint32_t,8> classes{};
@@ -75,14 +86,14 @@ struct Gpu::Impl {
         std::vector<std::byte> texels, palette;
         std::uint64_t content = 0; // Hash of the format and bytes, once a HUD draw samples it.
     };
-    // FNV-1a over a texture's key words, texels and palette: the identity
-    // under which its HUD enlargement is cached.
-    static std::uint64_t content_hash(const std::array<std::uint32_t,5>& key,const CachedTexture& texture) {
+    // Upload addresses can change between scenes and sessions. Only the
+    // image layout, pixels and palette determine the enlarged artwork.
+    static std::uint64_t content_hash(std::array<std::uint32_t,5> layout,const CachedTexture& texture) {
         std::uint64_t hash=0xCBF29CE484222325ULL;
         const auto feed=[&](std::span<const std::byte> bytes) {
             for(const auto byte:bytes) hash=(hash^std::to_integer<std::uint64_t>(byte))*0x100000001B3ULL;
         };
-        feed(std::as_bytes(std::span(key)));feed(texture.texels);feed(texture.palette);
+        feed(std::as_bytes(std::span(layout)));feed(texture.texels);feed(texture.palette);
         return hash?hash:1;
     }
     std::map<std::array<std::uint32_t,5>,CachedTexture> textures;
@@ -252,14 +263,15 @@ struct Gpu::Impl {
                 return surface.identifier;
             }
         }
+        sampled_art=true;
         const auto address=reg(method)&0x0FFFFFFF;
         const auto palette_register=reg(method+0x20);
         const std::array key{address,format,image,pitch,palette_register};
         if(linear) view.texture_scales[stage]={1.0f/width,1.0f/height,1.0f/depth,1};
         const auto hud=[&](auto found) {
             auto& entry=found->second;
-            if(interface_draws) {
-                if(!entry.content) entry.content=content_hash(found->first,entry);
+            if(interface_draws && !cube && depth==1 && width<=1024 && height<=1024) {
+                if(!entry.content) entry.content=content_hash({code,width,height,mips,linear?pitch:0},entry);
                 renderer.interface_texture(entry.id,entry.content);
             }
             return entry.id;
@@ -306,6 +318,7 @@ struct Gpu::Impl {
     }
     RenderState state(ProgramView& view) {
         ++texture_draw;
+        sampled_art=false;
         RenderState s;
         const auto horizontal=reg(0x200),vertical=reg(0x204);
         s.scissor_test=true;s.scissor={std::int32_t(horizontal&0xFFFF),std::int32_t(vertical&0xFFFF),
@@ -364,23 +377,59 @@ struct Gpu::Impl {
         }
     }
     enum class VertexSource { arrays, elements, inline_data };
+    // Whether a draw of pre-transformed vertices reaches both sides of the
+    // guest surface.
+    bool spans_width(VertexSource source,std::uint32_t first,std::uint32_t count,std::uint32_t width) {
+        const auto position=reg(0x1760)&255;
+        if((reg(0x1E94)&3)!=2 || !count || count>64 || (position&15)!=2 || !((position>>4)&15) ||
+           program.start+screen_program.size()>program.tokens.size() ||
+           !std::equal(screen_program.begin(),screen_program.end(),program.tokens.begin()+program.start)) return false;
+        const std::byte* data;
+        std::uint32_t stride=0;
+        if(source==VertexSource::inline_data) {
+            for(unsigned attribute=0;attribute<16;++attribute) {
+                const auto format=reg(0x1760+attribute*4)&255;
+                if((format>>4)&15) stride+=(attribute_bytes(format)+3)&~3U;
+            }
+            if(!stride || inline_words.size()*4<std::size_t(count)*stride) return false;
+            data=reinterpret_cast<const std::byte*>(inline_words.data());
+        } else {
+            stride=reg(0x1760)>>8;
+            const auto address=std::uint64_t(reg(0x1720)&0x0FFFFFFF)+std::uint64_t(first)*stride;
+            if(!stride || address>UINT32_MAX) return false;
+            data=static_cast<const std::byte*>(read_dma(static_cast<std::uint32_t>(address),std::size_t(count-1)*stride+4));
+        }
+        float low=std::numeric_limits<float>::infinity(),high=-low;
+        for(std::uint32_t vertex=0;vertex<count;++vertex) {
+            const auto x=real(read_fifo<std::uint32_t>(data+std::size_t(vertex)*stride))*constants[0][0]+constants[1][0];
+            low=std::min(low,x);high=std::max(high,x);
+        }
+        return low<=0 && high>=float(width);
+    }
     void draw(std::uint32_t first,std::uint32_t count,VertexSource source=VertexSource::arrays) {
         const bool inlined = source == VertexSource::inline_data;
         if(!primitive || !count || count>32768 || first>0xFFFFFF-count) throw std::runtime_error("Invalid NV097 draw range");
         const auto& surface=select_target().second;
         ProgramView view{};
         view.depth_scale=depth_max();
+        const auto render_state=state(view);
+        // Fades and cinematic bars span the 4:3 width, and in a wide frame
+        // they span its full width. Artwork keeps its proportions.
         const auto color_address = reg(0x210);
-        if (color_address && std::ranges::find(widescreen_buffers,color_address) != widescreen_buffers.end()) {
-            view.horizontal_scale = .75f;
+        const bool wide_target = color_address && std::ranges::find(widescreen_buffers,color_address) != widescreen_buffers.end();
+        // The title panel's model includes a blended, untextured four-vertex
+        // strip behind the decorative meshes. It uses the fixed transform.
+        const auto mode=reg(0x1E94)&3;
+        const bool menu_shade = title_backdrop && mode == 0 && render_state.blend && primitive == 6 && count == 4;
+        const bool full_width = wide_target && !sampled_art && (menu_shade || spans_width(source,first,count,surface.width));
+        if (wide_target && !full_width) {
+            view.horizontal_scale = widescreen_scale;
             view.horizontal_offset = hud_side * (1.f - view.horizontal_scale);
         }
-        const auto render_state=state(view);
         auto& draw=draws[draw_count];draw.stream_count=0;draw.view=view;draw.packed.clear();
         draw.current=current;draw.constants=constants;draw.count=count;
         draw.state=render_state;
         if (draw.state.color_mask) surface.color_clear->reset();
-        const auto mode=reg(0x1E94)&3;
         std::uint32_t shader;
         if(mode==2) {
             if (!active_shader) active_shader = renderer.prepare_program(program);
@@ -445,6 +494,8 @@ struct Gpu::Impl {
                 << ",\"color_address\":" << reg(0x210) << ",\"depth_address\":" << reg(0x214)
                 << ",\"transform_mode\":" << mode << ",\"horizontal_scale\":" << view.horizontal_scale
                 << ",\"horizontal_offset\":" << view.horizontal_offset
+                << ",\"samples_art\":" << (sampled_art ? "true" : "false")
+                << ",\"full_width\":" << (full_width ? "true" : "false")
                 << ",\"first\":" << first << ",\"vertices\":" << count << ",\"indices\":" << draw.indices.size()
                 << ",\"inline\":" << (inlined ? "true" : "false") << ",\"vertex_inputs\":[";
             for (unsigned input = 0; input < 16; ++input) {
@@ -747,7 +798,10 @@ struct Gpu::Impl {
 Gpu::Gpu(Renderer& renderer,Memory& memory,std::uint32_t semaphore_base,std::span<const GraphicsObject> profile,
          NotificationDelivery delivery):impl_(std::make_unique<Impl>(renderer,memory,*this,semaphore_base,profile,delivery)) {}
 Gpu::~Gpu()=default;
-void Gpu::widescreen_buffers(std::array<std::uint32_t,3> addresses) { impl_->widescreen_buffers = addresses; }
+void Gpu::widescreen_buffers(std::array<std::uint32_t,3> addresses, float scale) {
+    impl_->widescreen_buffers = addresses;
+    impl_->widescreen_scale = scale;
+}
 void Gpu::submit(std::uint32_t begin,std::uint32_t end,std::span<const HudAnchor> anchors) {
     auto& g=*impl_;
     if(end<begin || ((end-begin)&3) || end-begin>4*1024*1024) throw std::runtime_error("Invalid native GPU submission range");
@@ -793,6 +847,7 @@ void Gpu::submit(std::uint32_t begin,std::uint32_t end,std::span<const HudAnchor
         if (anchors.empty()) break;
         g.emit_arrays();
         g.hud_side = anchors.front().side;
+        g.title_backdrop = anchors.front().title_backdrop;
         g.interface_draws = anchors.front().hud_art;
         anchors = anchors.subspan(1);
     }

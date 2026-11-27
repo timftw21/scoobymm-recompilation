@@ -12,7 +12,7 @@ namespace xbox_native {
 // (Gpu, between 0x000770CA and 0x0004A733); each is enlarged once with
 // Real-ESRGAN realesr-animevideov3, or with a clamped Catmull-Rom filter when
 // the artwork is soft (glows, gradients) or tiny. Work runs in bounded GPU
-// steps between frames, so a texture keeps its original image until finished.
+// steps between frames. Draws use an alpha-aware filter until the result is ready.
 // The result keeps normalized texture coordinates; original draws sample it.
 inline constexpr unsigned interface_tile = 64;
 inline constexpr unsigned interface_halo = 12;        // Changes tile interiors by at most 2/255.
@@ -49,8 +49,8 @@ public:
 private:
     struct Job;
     struct Timing { Ptr<ID3D11Query> disjoint, start, finish; std::uint64_t work = 0; bool pending = false; };
-    // One tile's colour or alpha pass in the current batch.
-    struct Entry { std::uint64_t job; unsigned tile; bool alpha; int origin[2], extent[2], interior[2]; };
+    // One colour tile in the current batch. Coverage comes from the source.
+    struct Entry { std::uint64_t job; unsigned tile; int origin[2], extent[2], interior[2]; };
     void collect_timings();
     Job* find(std::uint64_t id);
     bool decide(Job&, bool wait);

@@ -330,7 +330,8 @@ struct PlayDiagnostics::Recording {
                 << ",\"graphics_adapter\":" << json(adapter) << ",\"native_size\":" << dimensions(native) << "," << enhancements
                 << ",\"window_size\":" << dimensions(samples.empty() ? std::array<std::uint32_t, 2>{} : samples.back().window)
                 << ",\"vsync\":" << (settings.vsync ? "true" : "false")
-                << ",\"refresh_rate\":" << settings.refresh_rate << ",\"widescreen\":" << (settings.widescreen ? "true" : "false")
+                << ",\"refresh_rate\":" << settings.refresh_rate << ",\"widescreen\":" << (settings.widescreen() ? "true" : "false")
+                << ",\"aspect_ratio\":" << json(aspect_shape(settings.aspect).name)
                 << ",\"start_scanout\":" << first.scanout << ",\"scanouts\":" << samples.size()
                 << ",\"excluded_capture_scanouts\":" << samples.size() - elapsed.size()
                 << ",\"measured_scanouts_per_second\":" << (measured_ms ? 1000 * elapsed.size() / measured_ms : 0)
@@ -444,7 +445,8 @@ void PlayDiagnostics::capture_frame(Renderer& renderer, Gpu& gpu, const FrameCou
                 << "," << enhancement_json(renderer.enhancements(), renderer.render_size())
                 << ",\"window_size\":" << dimensions(displayed ? renderer.display_size() : std::array<std::uint32_t, 2>{})
                 << ",\"vsync\":" << (window_.settings().vsync ? "true" : "false")
-                << ",\"widescreen\":" << (window_.settings().widescreen ? "true" : "false")
+                << ",\"widescreen\":" << (window_.settings().widescreen() ? "true" : "false")
+                << ",\"aspect_ratio\":" << json(aspect_shape(window_.settings().aspect).name)
                 << ",\"refresh_rate\":" << window_.settings().refresh_rate << ",\"movie_overlay\":" << (video ? "true" : "false")
                 << ",\"draws\":" << draws << ",\"draw_trace_limit\":" << Gpu::draw_trace_limit
                 << ",\"draw_trace_truncated\":" << (draws > Gpu::draw_trace_limit ? "true" : "false")

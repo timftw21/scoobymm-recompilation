@@ -17,11 +17,12 @@ public:
     Gpu(Renderer&,Memory&,std::uint32_t semaphore_base,std::span<const GraphicsObject>,
         NotificationDelivery = NotificationDelivery::on_idle);
     ~Gpu();
-    // A FIFO position where HUD drawing changes: the widget's widescreen edge,
-    // and whether draws from here on belong to HUD widgets (Upscaled HUD).
-    struct HudAnchor { std::uint32_t address; int side; bool hud_art = false; };
+    // Apply the widget's placement and artwork settings at its FIFO position.
+    struct HudAnchor { std::uint32_t address; int side; bool hud_art = false, title_backdrop = false; };
     void submit(std::uint32_t begin,std::uint32_t end,std::span<const HudAnchor> anchors = {});
-    void widescreen_buffers(std::array<std::uint32_t,3> color_addresses);
+    // Draws to these color surfaces narrow by the scale, 4:3 over the display
+    // aspect, and HUD widgets keep to their edge.
+    void widescreen_buffers(std::array<std::uint32_t,3> color_addresses, float scale);
     bool busy();
     void poll_notifications(bool wait = false);
     void wait();

@@ -35,7 +35,9 @@ PlayWindow::PlayWindow(PlayOptions& options) : options_(options), enhanced_(opti
     if (!SDL_InitSubSystem(subsystems)) throw std::runtime_error(SDL_GetError());
     const auto flags = SDL_WINDOW_RESIZABLE | (hidden_ ? SDL_WINDOW_HIDDEN : 0) |
         (options.fullscreen && !hidden_ ? SDL_WINDOW_FULLSCREEN : 0);
-    window_ = SDL_CreateWindow(game_title, options.widescreen ? 854 : 640, 480, flags);
+    // 640, 854 or 1138 pixels wide.
+    const auto& shape = aspect_shape(options.aspect);
+    window_ = SDL_CreateWindow(game_title, (480 * shape.width + shape.height - 1) / shape.height, 480, flags);
     if (!window_) {
         const std::runtime_error failure(SDL_GetError());
         SDL_QuitSubSystem(subsystems);
@@ -77,7 +79,7 @@ void* PlayWindow::native_handle() const {
 }
 
 bool PlayWindow::launcher() {
-    renderer_->begin(0xFF102529);
+    renderer_->begin();
     renderer_->end();
     while (menu_->visible) {
         if (!poll()) return false;

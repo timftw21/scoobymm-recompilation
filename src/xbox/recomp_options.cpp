@@ -50,6 +50,9 @@ struct Category {
     std::vector<Row> rows;
 };
 std::vector<Category> categories() {
+    // Every font0.ft on the disc has the digits and ':'.
+    std::vector<Choice> shapes;
+    for (std::size_t i = 0; i < aspect_shapes.size(); ++i) shapes.push_back({std::string(aspect_shapes[i].name), int(i)});
     std::vector<Choice> rates;
     for (const int rate : {30, 60, 75, 90, 120, 144, 165, 180, 240, 360, 480}) rates.push_back({std::to_string(rate), rate});
     rates.push_back({"unlimited", 0});
@@ -58,7 +61,7 @@ std::vector<Category> categories() {
     return {
         {"display", "DISPLAY", {
             {"fullscreen", switch_choices(), [](const PlayerSettings& s) { return int(s.fullscreen); }, [](PlayerSettings& s, int v) { s.fullscreen = v != 0; }},
-            {"widescreen", switch_choices(), [](const PlayerSettings& s) { return int(s.widescreen); }, [](PlayerSettings& s, int v) { s.widescreen = v != 0; }},
+            {"aspect ratio", shapes, [](const PlayerSettings& s) { return int(s.aspect); }, [](PlayerSettings& s, int v) { s.aspect = AspectRatio(v); }},
             {"vsync", switch_choices(), [](const PlayerSettings& s) { return int(s.vsync); }, [](PlayerSettings& s, int v) { s.vsync = v != 0; }},
             {"frame rate", rates, [](const PlayerSettings& s) { return s.refresh_rate; }, [](PlayerSettings& s, int v) { s.refresh_rate = v; }},
         }},
@@ -135,7 +138,7 @@ std::vector<Word> spec_colors(const Spec& s) {
 constexpr std::array<Word, 2> lit{6, 6}, title_plain{1, 7}, pause_plain{7, 7};
 
 enum class Kind { title, pause };
-enum class Input { updown, sideways, confirm, back, start, stick, pause_open, pause_close };
+enum class Input { updown, sideways, confirm, back, start, stick, pause_open, pause_close, tick };
 // Window specs: the panel's root, the menu window, its first entry, the
 // entries above and below Recomp Options, its last entry, and the Options
 // page with its title, CAMERA and VIBRATION labels, an entry and CAMERA's value.
@@ -218,7 +221,12 @@ std::optional<Layout> resolve(const CompiledModule& module) {
                        {at("_PanelCB_INPUT_LR"), Input::sideways}, {at("_PanelCB_INPUT_TRIANGLE"), Input::back},
                        {at("_PanelCB_INPUT_STICK_NOTOG"), Input::stick}, {at("_PanelCB_INPUT_START"), Input::start},
                        {at("_PanelCB_INPUT_START2"), Input::start}, {at("_PanelCB_INPUT_START3"), Input::start},
-                       {at("_PanelCB_INPUT_START4"), Input::start}};
+                       {at("_PanelCB_INPUT_START4"), Input::start},
+                       // The panel's states run every frame. The menu can return
+                       // without an input, as after quitting a game.
+                       {at("_PanelST_FIRSTLOGIC"), Input::tick}, {at("_PanelST_IN_BOOTUP"), Input::tick},
+                       {at("_PanelST_IN_SAVEGAME"), Input::tick}, {at("_PanelST_RETURN_FROM_SAVEGAME"), Input::tick},
+                       {at("_PanelST_BASICLOGIC"), Input::tick}, {at("_PanelST_LOADING"), Input::tick}};
         // _pPanelLocalData fields.
         l.handles = 0x40;
         l.selector = 0x37C;
@@ -690,6 +698,11 @@ struct RecompOptions::Impl {
         touch();
         finish();
     }
+    // The entry appears with the menu rather than at the first input.
+    void tick() {
+        original(*cpu, *memory);
+        if (!built && panel_ready() && on_menu()) build();
+    }
     void dispatch(Input input) {
         switch (input) {
         case Input::updown: return updown();
@@ -700,6 +713,7 @@ struct RecompOptions::Impl {
         case Input::stick: return stick();
         case Input::pause_open: return pause_open();
         case Input::pause_close: return pause_close();
+        case Input::tick: return tick();
         }
     }
     bool expected_text() const {
@@ -736,6 +750,7 @@ struct RecompOptions::Impl {
         case Input::stick: return &entry<Input::stick>;
         case Input::pause_open: return &entry<Input::pause_open>;
         case Input::pause_close: return &entry<Input::pause_close>;
+        case Input::tick: return &entry<Input::tick>;
         }
         return nullptr;
     }

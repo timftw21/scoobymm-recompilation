@@ -10,7 +10,8 @@ param(
     [ValidateSet(1,2,4,8)][int]$Msaa = 1,
     [switch]$Fxaa,
     [ValidateSet(1,2,4,8,16)][int]$Anisotropy = 1,
-    [switch]$UpscaledHud
+    [switch]$UpscaledHud,
+    [ValidateSet('4:3','16:9','21:9')][string]$Aspect = '16:9'
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path "$PSScriptRoot/..").Path
@@ -25,7 +26,7 @@ Set-Content -LiteralPath "$run/profile/settings.cfg" -Encoding ascii -Value @(
     "render_scale=$RenderScale", "msaa=$Msaa", "fxaa=$([int][bool]$Fxaa)", "anisotropy=$Anisotropy",
     "upscaled_hud=$([int][bool]$UpscaledHud)")
 # Navigate at the original cadence so the same input reaches the same scene at every cap.
-$options = @('--hidden','--mute','--no-vsync','--widescreen','--refresh-rate','30',
+$options = @('--hidden','--mute','--no-vsync','--aspect',$Aspect,'--refresh-rate','30',
              '--storage',"$run/profile",'--report',"$run/session.json")
 if ($Scene -ne 'Movie') {
     $last = if ($Scene -eq 'Menu') { 12 } else { 22 }

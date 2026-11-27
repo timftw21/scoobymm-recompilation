@@ -286,7 +286,11 @@ public:
                     instruction.address == 0xA29FD) && memory->size == 32 && memory->mem.base == ZYDIS_REGISTER_ESI &&
                     memory->mem.index == ZYDIS_REGISTER_NONE && memory->mem.disp.value == 0x68)
                 body << "    auto fp_extent=xbox_native::camera_extent(cpu,memory,esi,0x68U); auto* fp_memory=&fp_extent;\n";
-            else body << "    auto* fp_memory=memory.access(fp_address," << memory->size/8 << ");\n";
+            else if (instruction.frame_step_operand) {
+                body << "    auto step=memory.load<std::uint32_t>(fp_address);\n"
+                     << "    if (cpu.clock && cpu.clock->frame_step) step=cpu.clock->frame_step(cpu.clock->context,step);\n"
+                     << "    auto* fp_memory=&step;\n";
+            } else body << "    auto* fp_memory=memory.access(fp_address," << memory->size/8 << ");\n";
         }
         if (!control) {
             body << "    cpu.floating.instruction=" << pc(instruction.address) << ";\n"

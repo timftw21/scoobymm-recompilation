@@ -48,14 +48,35 @@ struct InputBindings {
     bool operator==(const InputBindings&) const = default;
 };
 
+// The display shape. Wider shapes extend the 4:3 scene at its sides and keep
+// HUD widgets at their authored proportions and edge margins. 21:9 is the
+// 64:27 shape of 2560 × 1080 and 5120 × 2160 displays.
+enum class AspectRatio : int { standard, wide, ultrawide };
+struct AspectShape { std::string_view name; int width, height; };
+inline constexpr std::array<AspectShape, 3> aspect_shapes{{{"4:3", 4, 3}, {"16:9", 16, 9}, {"21:9", 64, 27}}};
+inline constexpr const AspectShape& aspect_shape(AspectRatio aspect) { return aspect_shapes[std::size_t(aspect)]; }
+// Width over height.
+inline constexpr float aspect_value(AspectRatio aspect) {
+    return float(aspect_shape(aspect).width) / float(aspect_shape(aspect).height);
+}
+// How much wider than 4:3 the shape is (1, 4/3 or 16/9), and its inverse.
+inline constexpr float aspect_widening(AspectRatio aspect) {
+    return float(3 * aspect_shape(aspect).width) / float(4 * aspect_shape(aspect).height);
+}
+inline constexpr float aspect_narrowing(AspectRatio aspect) {
+    return float(4 * aspect_shape(aspect).height) / float(3 * aspect_shape(aspect).width);
+}
+
 struct PlayerSettings {
     std::filesystem::path xbe, disc;
     int refresh_rate = 30, volume = 100;
-    bool show_fps{}, muted{}, mute_unfocused{}, widescreen{}, fullscreen{}, vsync = true;
+    AspectRatio aspect{};
+    bool show_fps{}, muted{}, mute_unfocused{}, fullscreen{}, vsync = true;
     bool skip_intro{}; // Skips the boot movies before the title screen.
     RenderEnhancements enhancements;
     InputBindings bindings;
 
+    bool widescreen() const { return aspect != AspectRatio::standard; }
     void load(const std::filesystem::path&);
     void save(const std::filesystem::path&) const;
     void validate_media() const;

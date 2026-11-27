@@ -91,7 +91,7 @@ void restart(int argc, wchar_t* argv[]) {
         i = 3;
     }
     constexpr std::array<std::wstring_view, 4> switches{L"--fullscreen", L"--mute", L"--no-vsync", L"--widescreen"};
-    constexpr std::array<std::wstring_view, 4> valued{L"--refresh-rate", L"--storage", L"--language", L"--shader-cache"};
+    constexpr std::array<std::wstring_view, 5> valued{L"--refresh-rate", L"--storage", L"--language", L"--shader-cache", L"--aspect"};
     for (; i < argc; ++i) {
         const std::wstring_view option = argv[i];
         if (std::ranges::find(switches, option) != switches.end()) append_argument(line, option);
@@ -122,7 +122,8 @@ void usage() {
                  "  --play               Start playing without opening settings first\n"
                  "  --refresh-rate HZ    Rendering cap, or 0 for unlimited\n"
                  "  --refresh-at-scanout N HZ   Change the cap at a repeatable benchmark boundary\n"
-                 "  --widescreen         Use the Xbox widescreen display setting\n"
+                 "  --aspect 4:3|16:9|21:9   Display shape. Wider shapes extend the scene at its sides\n"
+                 "  --widescreen         Same as --aspect 16:9\n"
                  "  --shader-cache DIR   Accepted for compatibility. Player shaders are embedded.\n"
                  "  --storage DIR        Playtest save directory (default data/user)\n"
                  "  --language en|fr|de   Xbox game language\n"
@@ -162,7 +163,8 @@ int wmain(int argc, wchar_t* argv[]) {
             options.disc = root / "Scooby-Doo! Mystery Mayhem/Scooby-Doo! Mystery Mayhem (USA, Europe) (En,Fr,De).xiso.iso";
         }
         options.storage = root / "data/user";
-        bool set_fullscreen = false, set_mute = false, set_no_vsync = false, set_wide = false;
+        bool set_fullscreen = false, set_mute = false, set_no_vsync = false;
+        std::optional<xbox_native::AspectRatio> aspect;
         std::optional<int> refresh;
         std::filesystem::path report_path;
         bool explicit_frame_index = false, capture_at = false, performance_at = false;
@@ -199,7 +201,14 @@ int wmain(int argc, wchar_t* argv[]) {
             if (option == L"--fullscreen") set_fullscreen = true;
             else if (option == L"--mute") set_mute = true;
             else if (option == L"--no-vsync") set_no_vsync = true;
-            else if (option == L"--widescreen") set_wide = true;
+            else if (option == L"--widescreen") aspect = xbox_native::AspectRatio::wide;
+            else if (option == L"--aspect") {
+                using xbox_native::aspect_shapes;
+                const auto name = argument().string();
+                const auto found = std::ranges::find(aspect_shapes, std::string_view(name), &xbox_native::AspectShape::name);
+                if (found == aspect_shapes.end()) throw std::runtime_error("Choose an aspect ratio of 4:3, 16:9 or 21:9");
+                aspect = xbox_native::AspectRatio(found - aspect_shapes.begin());
+            }
             else if (option == L"--settings") options.launcher = true;
             else if (option == L"--play") {} // Any option already skips the launcher.
             else if (option == L"--refresh-rate") refresh = rate();
@@ -241,7 +250,7 @@ int wmain(int argc, wchar_t* argv[]) {
         if (set_fullscreen) options.fullscreen = true;
         if (set_mute) options.muted = true;
         if (set_no_vsync) options.vsync = false;
-        if (set_wide) options.widescreen = true;
+        if (aspect) options.aspect = *aspect;
         if (refresh) options.refresh_rate = *refresh;
         if (options.hidden && options.launcher) throw std::runtime_error("The interactive launcher requires a visible window");
         if (explicit_frame_index && options.capture.empty()) throw std::runtime_error("Frame index requires --frame");

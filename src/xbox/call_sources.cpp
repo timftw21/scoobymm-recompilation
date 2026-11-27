@@ -377,7 +377,8 @@ CallSources trace_call_sources(const Function& fn,const std::map<Word,Word>& rel
             block(start,in,&path,visit);
             for (const auto& c:path.calls) if (!c.direct) {
                 auto& values=choices[c.site];
-                if (std::ranges::find(values,c.target)==values.end()) values.push_back(c.target);
+                if (std::ranges::none_of(values,[&](const PointerValue& value) { return value == c.target; }))
+                    values.push_back(c.target);
                 arguments[c.site].push_back({c.first_argument,c.second_argument,c.third_argument});
             }
         }

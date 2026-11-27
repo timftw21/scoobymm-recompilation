@@ -194,7 +194,13 @@ void GuestGraphics::advance_display(std::uint64_t now) {
     }
 }
 
-VideoOverlay GuestGraphics::video_overlay() const {
+void GuestGraphics::movie_opened(std::string_view disc_path) {
+    ++movie_id_;
+    // Episode reels carry a nominal 640x320 picture inside a 640x480 stream.
+    movie_matte_rows_ = disc_path.starts_with("MOVIES\\EP") ? 80 : 0;
+}
+
+VideoOverlay GuestGraphics::video_overlay() {
     const auto reg = [this](Word offset) { return video_registers_[(offset - video_first) / 4]; };
     const auto packed = reg(video_format), pitch = packed & 0x1FFF;
     const auto width = reg(video_source_size) & 0x7FF, height = reg(video_source_size) >> 16 & 0x7FF;
@@ -205,10 +211,27 @@ VideoOverlay GuestGraphics::video_overlay() const {
         throw std::runtime_error("Unsupported NV2A video overlay format");
     const auto address = reg(video_address);
     const auto bytes = std::size_t(pitch) * (height - 1) + ((width + 1) & ~1U) * 2;
+    const auto* data = static_cast<const std::byte*>(memory_.access(address,bytes));
+    if (movie_matte_rows_ && window_ && window_->settings().aspect != AspectRatio::standard) {
+        // Some shots extend into the encoded matte. Only trim near-black
+        // rows, and remember the smaller matte through cuts and fades.
+        const auto has_picture = [&](unsigned row) {
+            const auto* p = reinterpret_cast<const std::uint8_t*>(data + std::size_t(row)*pitch);
+            for (unsigned x=0; x<width; ++x, p+=2)
+                if (p[0]>24 || p[1]<120 || p[1]>136) return true;
+            return false;
+        };
+        movie_matte_rows_ = std::min(movie_matte_rows_,height/2);
+        for (unsigned y=0; y<movie_matte_rows_; ++y)
+            if (has_picture(y) || has_picture(height-1-y)) {
+                movie_matte_rows_=y;
+                break;
+            }
+    }
     return {{width, height, start_x, start_y, reg(video_dest_point) & 0xFFF, reg(video_dest_point) >> 16 & 0xFFF,
              reg(video_dest_size) & 0xFFF, reg(video_dest_size) >> 16 & 0xFFF, reg(video_step_x), reg(video_step_y),
              reg(video_color_key) & 0xFFFFFF, (packed >> 20) & 1}, pitch,
-            {static_cast<const std::byte*>(memory_.access(address,bytes)),bytes}};
+            {data,bytes},movie_matte_rows_,movie_id_};
 }
 
 void GuestGraphics::composite_video(Image& image, const VideoOverlay& overlay) {
@@ -256,8 +279,9 @@ void GuestGraphics::scanout() {
     bool displayed = false;
     if (window_ && window_->frame_due(video,scanouts_)) {
         if (std::exchange(gamma_dirty_, false)) renderer_->display_gamma(gamma_);
-        // The movie is already composed for the authored 4:3 scanout.
-        displayed = renderer_->display(overlay ? &*overlay : nullptr, !video && presentation_wide_);
+        const auto aspect = video ? window_->settings().aspect : presentation_aspect_;
+        displayed = renderer_->display(overlay ? &*overlay : nullptr,
+                                       aspect == AspectRatio::standard ? 0.f : aspect_value(aspect));
     }
     if (measuring) diagnostics_->end_gpu_work();
     if (diagnostic_capture) {
@@ -278,8 +302,8 @@ void GuestGraphics::scanout() {
         if (measuring) present_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
         ++presentations_;
     } else if (window_) window_->pace_game(video);
-    if (window_ && last_widescreen_ != window_->settings().widescreen) {
-        last_widescreen_ = window_->settings().widescreen;
+    if (window_ && last_aspect_ != window_->settings().aspect) {
+        last_aspect_ = window_->settings().aspect;
         const auto scene = memory_.load<Word>(0x01EED360);
         if (scene) for (const auto slot : {4U,8U}) {
             const auto camera = memory_.load<Word>(scene+slot);
@@ -350,7 +374,7 @@ void GuestGraphics::name_widget(Word handle, Word address) {
             side = 1;
     }
     const auto slot = handle >> 16;
-    widget_anchors_[slot] = {handle,side,name == "INGAME_MAIN_WIN"};
+    widget_anchors_[slot] = {handle,side,name == "INGAME_MAIN_WIN",name == "TITLEWIN02_BGRD_ANIM"};
     if (name == "PAUSE_MAIN_WIN") pause_menu_handle_ = handle;
     else if ((pause_menu_handle_ >> 16) == slot) pause_menu_handle_ = UINT32_MAX;
 }
@@ -362,26 +386,30 @@ bool GuestGraphics::pause_menu_visible() const {
 
 void GuestGraphics::draw_widget(Word widget) {
     int side = 0;
-    if (widget && window_->settings().widescreen) {
+    bool title_backdrop = false;
+    if (widget && window_->settings().widescreen()) {
         const auto handle = memory_.load<Word>(widget+0x88);
         const auto slot = handle >> 16;
-        if (slot < widget_anchors_.size() && widget_anchors_[slot].handle == handle)
+        if (slot < widget_anchors_.size() && widget_anchors_[slot].handle == handle) {
             side = widget_anchors_[slot].side;
+            title_backdrop = widget_anchors_[slot].title_backdrop;
+        }
     }
     // 0x4A70D..0x4A730 draws the HUD tree through 0x77090, whose 0x770CA call
     // precedes each visible widget's draws; the 0x4A733 call (no widget)
     // follows the last. The textures sampled in between are HUD and menu art.
     const bool hud_art = widget && window_ && window_->settings().enhancements.upscaled_hud;
-    if (side == hud_side_ && hud_art == hud_art_) return;
+    if (side == hud_side_ && hud_art == hud_art_ && title_backdrop == title_backdrop_) return;
     hud_side_ = side;
     hud_art_ = hud_art;
+    title_backdrop_ = title_backdrop;
     // The SDK queues draw packets. Record their FIFO position so that a kickoff
     // midway through a widget or a ring wrap preserves the anchor.
     const auto flags = memory_.load<Word>(device+8);
     const auto address = memory_.load<Word>(device + ((flags & 4) ? 0x358 : 0));
     if (!hud_markers_.empty() && hud_markers_.back().address == address)
-        hud_markers_.back() = {address,side,hud_art};
-    else hud_markers_.push_back({address,side,hud_art});
+        hud_markers_.back() = {address,side,hud_art,title_backdrop};
+    else hud_markers_.push_back({address,side,hud_art,title_backdrop});
 }
 
 void GuestGraphics::submit() {
@@ -394,14 +422,14 @@ void GuestGraphics::submit() {
         // initializes the backbuffers at 0x119830 via 0x11A0B2.
         std::array<Word,3> colors{};
         // The title menu overlays a 3D room. Only the pause panel needs a 4:3 canvas.
-        presentation_wide_ = window_ && window_->settings().widescreen && !pause_menu_visible();
-        if (presentation_wide_) {
+        presentation_aspect_ = window_ && !pause_menu_visible() ? window_->settings().aspect : AspectRatio::standard;
+        if (presentation_aspect_ != AspectRatio::standard) {
             for (unsigned i=0; i<colors.size(); ++i) {
                 const auto surface = memory_.load<Word>(device + 0x15F4 + 4*i);
                 if (surface) colors[i] = memory_.load<Word>(surface + 4) & 0x0FFFFFFF;
             }
         }
-        gpu_->widescreen_buffers(colors);
+        gpu_->widescreen_buffers(colors, aspect_narrowing(presentation_aspect_));
         submitting_ = true;
         if (diagnostics_) diagnostics_->begin_gpu_work();
         gpu_->submit(cursor_, end,hud_markers_);

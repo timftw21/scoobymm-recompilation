@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(native_recompiler VERSION 0.2.0 LANGUAGES C CXX)
+project(native_recompiler VERSION 0.3.0 LANGUAGES C CXX)
 
 include(FetchContent)
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
@@ -165,7 +165,7 @@ if(XBOX_GENERATED_SOURCE)
         src/xbox/boot.cpp src/xbox/audio.cpp src/xbox/audio_effects.cpp src/xbox/guest_audio.cpp
         src/xbox/guest_graphics.cpp src/xbox/gpu.cpp src/xbox/render.cpp src/xbox/shaders.cpp
         src/xbox/vertex_program.cpp src/xbox/play_window.cpp src/xbox/play_diagnostics.cpp src/xbox/recomp_options.cpp
-        src/xbox/interface_upscaler.cpp src/xbox/upscaler_model.cpp)
+        src/xbox/interface_upscaler.cpp src/xbox/upscaler_model.cpp src/xbox/movie_filter.cpp)
     target_compile_features(xbox-runtime PUBLIC cxx_std_23)
     add_dependencies(xbox-runtime scoobymm-dsp)
     target_include_directories(xbox-runtime PRIVATE "${dsp56300_SOURCE_DIR}/crates/emu-ffi/include")

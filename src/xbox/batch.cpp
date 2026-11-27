@@ -151,6 +151,7 @@ struct ModuleObject {
     bool relative_data{};
     bool relative_relocations{};
     std::optional<Word> floor_events;
+    std::set<Word> frame_step_operands;
     std::set<Word> data_references;
     std::set<Word> private_words;
     std::set<Word> zero_words;
@@ -210,6 +211,13 @@ ModuleObject read_module(Bytes object, std::string_view name) {
             const std::string_view label(reinterpret_cast<const char*>(field.data()), field.size());
             const auto spelling = label.substr(0, label.find('\0'));
             if (spelling=="_FloorEventManager") module.floor_events=value;
+            // Collectibles load their per-update angle before converting it to radians.
+            // Ghosts add a signed increment to their hover phase. Scale only the
+            // increment, so the original height, direction and random reversals survive.
+            if (spelling=="_Coll_BaseFUNC_Spin" && hex_bytes(slice(section,value+11,3))=="D94508")
+                module.frame_step_operands.insert(value+11);
+            if (spelling=="_Waving" && hex_bytes(slice(section,value+15,18))=="D9826C080000D88270080000D9926C080000")
+                module.frame_step_operands.insert(value+21);
             if (spelling == "_" + std::string(name) + "Register") module.exports.emplace_back(value, logic_register_call);
             if (spelling == "_" + std::string(name) + "Constructor") module.exports.emplace_back(value, logic_constructor_call);
             if (spelling == "_" + std::string(name) + "Destructor") module.destructor = value;
@@ -847,6 +855,8 @@ GeneratedModules generate_modules(const Path& disc, const Xbe& image, const Deco
             const auto lowered = [&] {
                 try {
                     auto fn = module_function(address, module, decoder);
+                    for (const auto site:module.frame_step_operands)
+                        if (auto it=fn.instructions.find(site);it!=fn.instructions.end()) it->second.frame_step_operand=true;
                     const auto& flow = sources.emplace(address,trace_call_sources(fn,module.relocations)).first->second;
                     std::map<Word,const CallSource*> origins;
                     for (const auto& call : flow.calls) {

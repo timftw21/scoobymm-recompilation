@@ -1,5 +1,6 @@
 #include "render.h"
 #include "interface_upscaler.h"
+#include "movie_filter.h"
 #include "shaders.h"
 #include "upscaler_model.h"
 #include <Windows.h>
@@ -303,8 +304,10 @@ struct Renderer::Impl {
     ComPtr<IDXGISwapChain1> swapchain;
     UINT swapchain_flags{};
     ComPtr<ID3D11RenderTargetView> window_view;
+    ComPtr<ID3D11ShaderResourceView> window_icon;
     ComPtr<ID3D11VertexShader> display_vs;
     ComPtr<ID3D11PixelShader> display_ps;
+    ComPtr<ID3D11PixelShader> movie_display_ps;
     ComPtr<ID3D11Texture1D> display_gamma;
     ComPtr<ID3D11ShaderResourceView> display_gamma_view;
     struct VideoTexture {
@@ -313,11 +316,12 @@ struct Renderer::Impl {
         ComPtr<ID3D11RenderTargetView> target;
         UINT width{}, height{};
         DXGI_FORMAT format{};
-        void resize(ID3D11Device* device, UINT w, UINT h, DXGI_FORMAT image_format, bool renderable) {
+        void resize(ID3D11Device* device, UINT w, UINT h, DXGI_FORMAT image_format, bool renderable, bool mipmaps=false) {
             if (width == w && height == h && format == image_format) return;
             format = image_format;
             D3D11_TEXTURE2D_DESC desc{};
-            desc.Width=w; desc.Height=h; desc.MipLevels=1; desc.ArraySize=1;
+            desc.Width=w; desc.Height=h; desc.MipLevels=mipmaps ? 0 : 1; desc.ArraySize=1;
+            desc.MiscFlags=mipmaps ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
             desc.Format=format; desc.SampleDesc.Count=1;
             desc.BindFlags=D3D11_BIND_SHADER_RESOURCE | (renderable ? D3D11_BIND_RENDER_TARGET : 0);
             checked(device->CreateTexture2D(&desc,nullptr,texture.ReleaseAndGetAddressOf()),"Video texture");
@@ -327,6 +331,8 @@ struct Renderer::Impl {
         }
     } video_pairs, video_composite, native_copy, fxaa_image;
     ComPtr<ID3D11PixelShader> video_ps;
+    ComPtr<ID3D11PixelShader> movie_deblock_ps;
+    MovieFilter movie_filter;
     ComPtr<ID3D11Buffer> video_constants;
     ComPtr<ID3D11SamplerState> display_sampler;
     ComPtr<ID3D11RasterizerState> display_raster;
@@ -355,6 +361,7 @@ struct Renderer::Impl {
         ID3D11PixelShader* pixel{};
         D3D11_PRIMITIVE_TOPOLOGY topology{};
         std::array<ID3D11ShaderResourceView*,12> textures{};
+        bool hud_preview_bound=false;
         UINT stencil_reference{};
         ID3D11GeometryShader* geometry{};
     } bound;
@@ -395,12 +402,20 @@ struct Renderer::Impl {
     // are kept by content, so artwork reloaded into new allocations reuses
     // them, and replace the texture's view when drawn. hud_factor is 0 when off.
     std::unique_ptr<InterfaceUpscaler> upscaler;
+    ComPtr<ID3D11PixelShader> hud_preview;
     UINT hud_factor = 0;
-    struct Enlargement { ComPtr<ID3D11ShaderResourceView> view; std::size_t bytes; std::uint64_t used; };
+    struct Enlargement {
+        ComPtr<ID3D11ShaderResourceView> view;
+        std::size_t bytes;
+        std::uint64_t used;
+        std::chrono::steady_clock::time_point ready;
+    };
     std::map<std::uint64_t, Enlargement> enlargements;
     std::size_t enlarged_bytes = 0;
     static constexpr std::size_t enlarged_capacity = 256 * 1024 * 1024;
-    std::vector<std::uint64_t> texture_content = std::vector<std::uint64_t>(1); // Indexed by texture id.
+    // Map nodes are stable. Link uploaded texture IDs once, and unlink them on eviction.
+    struct HudTexture { std::uint64_t content{}; Enlargement* art{}; };
+    std::vector<HudTexture> hud_textures = std::vector<HudTexture>(1);
     std::vector<std::array<std::uint32_t,2>> texture_sizes = std::vector<std::array<std::uint32_t,2>>(1); // Uploaded 2D textures.
     std::uint64_t presented = 0;
     std::chrono::steady_clock::time_point last_present{};
@@ -418,7 +433,7 @@ struct Renderer::Impl {
     static_assert(sizeof(HudDiskHeader) == 60);
     struct HudSave { ComPtr<ID3D11Texture2D> staging; std::filesystem::path path; HudDiskHeader header; };
     std::vector<HudSave> hud_saves;
-    void add_enlargement(std::uint64_t content, ComPtr<ID3D11ShaderResourceView> view, std::size_t bytes);
+    void add_enlargement(std::uint64_t content, ComPtr<ID3D11ShaderResourceView> view, std::size_t bytes, bool refine = false);
     std::filesystem::path hud_disk_path(std::uint64_t content) const;
     HudDiskHeader hud_disk_header(unsigned width, unsigned height, bool network) const;
     bool load_enlargement(std::uint64_t content, unsigned width, unsigned height);
@@ -430,7 +445,7 @@ struct Renderer::Impl {
             textures.push_back(std::move(view));
             texture_dimensions.push_back(dimension);
             target_images.push_back(image);
-            texture_content.push_back(0);
+            hud_textures.emplace_back();
             texture_sizes.push_back({});
             return static_cast<unsigned>(textures.size() - 1);
         }
@@ -439,14 +454,27 @@ struct Renderer::Impl {
         textures[id] = std::move(view);
         texture_dimensions[id] = dimension;
         target_images[id] = image;
-        texture_content[id] = 0;
+        hud_textures[id] = {};
         texture_sizes[id] = {};
         return id;
     }
-    ID3D11ShaderResourceView* sampled_view(unsigned id) {
-        if (hud_factor && texture_content[id]) {
-            const auto found = enlargements.find(texture_content[id]);
-            if (found != enlargements.end()) { found->second.used = presented; return found->second.view.Get(); }
+    ID3D11ShaderResourceView* sampled_view(unsigned id, unsigned& flags,ID3D11ShaderResourceView*& refinement) {
+        if (hud_textures[id].content) {
+            if (auto* cached=hud_textures[id].art) {
+                auto& art=*cached;
+                art.used=presented;
+                if(art.ready!=std::chrono::steady_clock::time_point{}) {
+                    const double elapsed=std::chrono::duration<double>(last_present-art.ready).count();
+                    if(elapsed<0.1) {
+                        refinement=art.view.Get();
+                        flags|=4u | (static_cast<unsigned>(255*std::clamp(elapsed/0.1,0.,1.))<<8);
+                        return textures[id].Get();
+                    }
+                    art.ready={};
+                }
+                return art.view.Get();
+            }
+            flags|=4u; // Reconstruct from the original on the very first draw.
         }
         return textures[id].Get();
     }
@@ -720,7 +748,7 @@ struct Renderer::Impl {
     void unbind_textures() {
         if(std::exchange(geometry_bound,false)) context->GSSetShader(nullptr,nullptr,0);
         bound = {};
-        std::array<ID3D11ShaderResourceView*,12> empty{};
+        std::array<ID3D11ShaderResourceView*,16> empty{};
         context->PSSetShaderResources(0,static_cast<UINT>(empty.size()),empty.data());
     }
     void select_target(std::uint32_t id) {
@@ -922,6 +950,31 @@ void Renderer::copy_to_main() {
 }
 ID3D11Device* Renderer::native_device() const {return impl_->device.Get();}
 ID3D11DeviceContext* Renderer::native_context() const {return impl_->context.Get();}
+ID3D11ShaderResourceView* Renderer::window_icon() {
+    auto& r = *impl_;
+    if (r.window_icon) return r.window_icon.Get();
+    const auto icon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
+    if (!icon) throw std::runtime_error("Cannot load the application icon");
+    ComScope scope;
+    ComPtr<IWICBitmap> bitmap;
+    checked(image_factory()->CreateBitmapFromHICON(icon, &bitmap), "Application icon bitmap");
+    ComPtr<IWICBitmapSource> rgba;
+    checked(WICConvertBitmapSource(GUID_WICPixelFormat32bppRGBA, bitmap.Get(), &rgba), "Application icon conversion");
+    D3D11_TEXTURE2D_DESC desc{};
+    checked(rgba->GetSize(&desc.Width, &desc.Height), "Application icon dimensions");
+    extent(desc.Width, desc.Height);
+    desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    std::vector<BYTE> pixels(desc.Width * desc.Height * 4);
+    checked(rgba->CopyPixels(nullptr, desc.Width * 4, static_cast<UINT>(pixels.size()), pixels.data()), "Application icon pixels");
+    const D3D11_SUBRESOURCE_DATA data{pixels.data(), desc.Width * 4, 0};
+    ComPtr<ID3D11Texture2D> texture;
+    checked(r.device->CreateTexture2D(&desc, &data, &texture), "Application icon texture");
+    checked(r.device->CreateShaderResourceView(texture.Get(), nullptr, &r.window_icon), "Application icon view");
+    return r.window_icon.Get();
+}
 void Renderer::attach_window(void* native_window) {
     auto& r=*impl_;
     if(r.window || !native_window || !IsWindow(static_cast<HWND>(native_window)))
@@ -944,6 +997,8 @@ void Renderer::attach_window(void* native_window) {
     checked(factory->MakeWindowAssociation(window,DXGI_MWA_NO_ALT_ENTER),"Window association");
     const auto ps=r.shader(ShaderKind::display_pixel);
     checked(r.device->CreatePixelShader(ps.data(),ps.size(),nullptr,&r.display_ps),"Display pixel shader");
+    const auto movie=r.shader(ShaderKind::movie_display);
+    checked(r.device->CreatePixelShader(movie.data(),movie.size(),nullptr,&r.movie_display_ps),"Movie display shader");
     D3D11_RASTERIZER_DESC raster{};raster.FillMode=D3D11_FILL_SOLID;raster.CullMode=D3D11_CULL_NONE;raster.DepthClipEnable=true;
     checked(r.device->CreateRasterizerState(&raster,&r.display_raster),"Display rasterizer");
     D3D11_DEPTH_STENCIL_DESC depth{};
@@ -960,6 +1015,8 @@ void Renderer::attach_window(void* native_window) {
     display_gamma(identity);
     const auto video=r.shader(ShaderKind::video_overlay);
     checked(r.device->CreatePixelShader(video.data(),video.size(),nullptr,&r.video_ps),"Video overlay shader");
+    const auto deblock=r.shader(ShaderKind::movie_deblock);
+    checked(r.device->CreatePixelShader(deblock.data(),deblock.size(),nullptr,&r.movie_deblock_ps),"Movie deblocking shader");
     D3D11_BUFFER_DESC overlay{};
     static_assert(sizeof(VideoOverlay::Geometry)==48);
     overlay.ByteWidth=sizeof(VideoOverlay::Geometry);
@@ -973,7 +1030,7 @@ void Renderer::display_gamma(std::span<const std::array<std::byte, 3>, 256> gamm
     for (unsigned i=0;i<data.size();++i) data[i]={gamma[i][0],gamma[i][1],gamma[i][2],std::byte{255}};
     r.context->UpdateSubresource(r.display_gamma.Get(),0,nullptr,data.data(),0,0);
 }
-bool Renderer::display(const VideoOverlay* video, bool widescreen) {
+bool Renderer::display(const VideoOverlay* video, float shape) {
     auto& r=*impl_;
     if(!r.window || !r.ended || r.recording) throw std::runtime_error("Display the completed main target on its attached window");
     RECT rectangle{};if(!GetClientRect(r.window,&rectangle)) throw std::runtime_error("Cannot read window dimensions");
@@ -1004,7 +1061,7 @@ bool Renderer::display(const VideoOverlay* video, bool widescreen) {
         r.window_width=width;r.window_height=height;
     }
     auto output=r.window_view.Get();
-    const float aspect = widescreen ? 16.f / 9 : float(main.width) / main.height;
+    const float aspect = shape > 0 ? shape : float(main.width) / main.height;
     const float image_height = std::min(float(height), width / aspect), image_width = image_height * aspect;
     const D3D11_VIEWPORT viewport{(width-image_width)/2,(height-image_height)/2,image_width,image_height,0,1};
     r.context->RSSetState(r.display_raster.Get());r.context->OMSetDepthStencilState(r.display_depth.Get(),0);
@@ -1012,6 +1069,7 @@ bool Renderer::display(const VideoOverlay* video, bool widescreen) {
     r.context->IASetInputLayout(nullptr);r.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     r.context->VSSetShader(r.display_vs.Get(),nullptr,0);r.context->PSSetShader(r.display_ps.Get(),nullptr,0);
     auto sampler=r.display_sampler.Get();
+    float movie_scale=1.f;
     if (video) {
         const auto& geo=video->geometry;
         const auto pairs=(geo.width+1)/2;
@@ -1019,8 +1077,7 @@ bool Renderer::display(const VideoOverlay* video, bool widescreen) {
             video->pairs.size() < std::uint64_t(video->pitch)*(geo.height-1)+pairs*4)
             throw std::runtime_error("Video overlay storage is too small");
         r.video_pairs.resize(r.device.Get(),pairs,geo.height,DXGI_FORMAT_R8G8B8A8_UINT,false);
-        r.video_composite.resize(r.device.Get(),main.width,main.height,DXGI_FORMAT_R8G8B8A8_UNORM,true);
-        r.context->UpdateSubresource(r.video_pairs.texture.Get(),0,nullptr,video->pairs.data(),video->pitch,0);
+        r.video_composite.resize(r.device.Get(),main.width,main.height,DXGI_FORMAT_R8G8B8A8_UNORM,true,true);
         r.context->UpdateSubresource(r.video_constants.Get(),0,nullptr,&geo,0,0);
         auto target=r.video_composite.target.Get();
         auto constants=r.video_constants.Get();
@@ -1028,7 +1085,19 @@ bool Renderer::display(const VideoOverlay* video, bool widescreen) {
         const D3D11_VIEWPORT native{0,0,float(main.width),float(main.height),0,1};
         r.context->OMSetRenderTargets(1,&target,nullptr);
         r.context->RSSetViewports(1,&native);
-        r.context->PSSetShader(r.video_ps.Get(),nullptr,0);
+        // The XMV player programs a 639x479 overlay on the 640x480 scanout.
+        const bool full_frame=!geo.keyed && geo.width==geo.dest_width && geo.height==geo.dest_height &&
+            geo.dest_width>=main.width-1 && geo.dest_width<=main.width &&
+            geo.dest_height>=main.height-1 && geo.dest_height<=main.height &&
+            geo.left==0 && geo.top==0 && geo.start_x==0 && geo.start_y==0 &&
+            geo.step_x==(1u<<20) && geo.step_y==(1u<<20);
+        const auto matte=full_frame && video->matte_rows<main.height/2 ? video->matte_rows : 0;
+        movie_scale=std::min(image_width/main.width,image_height/(main.height-2*matte));
+        const bool enlarged=full_frame && movie_scale>1.001f;
+        if(!enlarged) r.movie_filter.reset();
+        const auto pixels=enlarged ? r.movie_filter.frame(*video) : video->pairs;
+        r.context->UpdateSubresource(r.video_pairs.texture.Get(),0,nullptr,pixels.data(),video->pitch,0);
+        r.context->PSSetShader(enlarged ? r.movie_deblock_ps.Get() : r.video_ps.Get(),nullptr,0);
         r.context->PSSetConstantBuffers(0,1,&constants);
         r.context->PSSetShaderResources(0,2,inputs.data());
         r.context->Draw(3,0);
@@ -1037,7 +1106,19 @@ bool Renderer::display(const VideoOverlay* video, bool widescreen) {
     r.context->OMSetRenderTargets(1,&output,nullptr);
     const float black[4]={0,0,0,1};r.context->ClearRenderTargetView(output,black);
     r.context->RSSetViewports(1,&viewport);
-    r.context->PSSetShader(r.display_ps.Get(),nullptr,0);
+    if (video) {
+        const std::array framing{image_width/(main.width*movie_scale),image_height/(main.height*movie_scale),
+                                 float(main.width),float(main.height)};
+        if (framing[0]>1.00001f || framing[1]>1.00001f || movie_scale<1.f)
+            r.context->GenerateMips(texture);
+        auto constants=r.blit_constants.Get();
+        r.context->UpdateSubresource(constants,0,nullptr,framing.data(),0,0);
+        r.context->PSSetConstantBuffers(0,1,&constants);
+        r.context->PSSetShader(r.movie_display_ps.Get(),nullptr,0);
+    } else {
+        r.movie_filter.reset();
+        r.context->PSSetShader(r.display_ps.Get(),nullptr,0);
+    }
     const std::array textures{texture,r.display_gamma_view.Get()};
     r.context->PSSetShaderResources(0,static_cast<UINT>(textures.size()),textures.data());
     r.context->PSSetSamplers(0,1,&sampler);r.context->Draw(3,0);
@@ -1063,25 +1144,27 @@ void Renderer::Impl::finish_enlargements(double target_ms) {
     for(auto& [content,result]:upscaler->step(false,target_ms)) {
         ++(result.network?stats.hud_network:stats.hud_filtered);
         save_enlargement(content,result);
-        add_enlargement(content,std::move(result.view),result.bytes);
+        add_enlargement(content,std::move(result.view),result.bytes,true);
     }
 }
-void Renderer::Impl::add_enlargement(std::uint64_t content,ComPtr<ID3D11ShaderResourceView> view,std::size_t bytes) {
+void Renderer::Impl::add_enlargement(std::uint64_t content,ComPtr<ID3D11ShaderResourceView> view,std::size_t bytes,bool refine) {
     if(const auto found=enlargements.find(content);found!=enlargements.end()) enlarged_bytes-=found->second.bytes;
     enlarged_bytes+=bytes;
-    enlargements.insert_or_assign(content,Enlargement{std::move(view),bytes,presented});
+    const auto entry=enlargements.insert_or_assign(content,Enlargement{std::move(view),bytes,presented,refine?last_present:std::chrono::steady_clock::time_point{}}).first;
+    for(auto& texture:hud_textures) if(texture.content==content) texture.art=&entry->second;
     // Keep enlargements within their budget, least recently drawn first.
     while(enlarged_bytes>enlarged_capacity && enlargements.size()>1) {
         const auto oldest=std::ranges::min_element(enlargements,{},[](const auto& item){return item.second.used;});
+        for(auto& texture:hud_textures) if(texture.art==&oldest->second) texture={};
         enlarged_bytes-=oldest->second.bytes;
         enlargements.erase(oldest);
     }
 }
 std::filesystem::path Renderer::Impl::hud_disk_path(std::uint64_t content) const {
-    return hud_disk/std::format("{:016X}-{}.hud",content,hud_factor);
+    return hud_disk/std::format("{:016X}-{}-v2.hud",content,hud_factor);
 }
 Renderer::Impl::HudDiskHeader Renderer::Impl::hud_disk_header(unsigned w,unsigned h,bool network) const {
-    HudDiskHeader header{{'S','C','M','M','H','U','D','1'},1,hud_factor,w,h,network,{}};
+    HudDiskHeader header{{'S','C','M','M','H','U','D','1'},2,hud_factor,w,h,network,{}};
     for(unsigned i=0;i<32;++i)
         header.model[i]=static_cast<std::uint8_t>(std::stoul(std::string(upscaler_model_sha256.substr(i*2,2)),nullptr,16));
     return header;
@@ -1189,11 +1272,15 @@ void Renderer::Impl::configure_hud() {
     if(factor==hud_factor) return;
     if(upscaler) upscaler->clear();
     enlargements.clear();enlarged_bytes=0;
-    std::ranges::fill(texture_content,0);
+    std::ranges::fill(hud_textures,HudTexture{});
     unbind_textures();
     hud_factor=0;
     if(!factor) return;
     try {
+        if(!hud_preview) {
+            const auto code=shader(ShaderKind::hud_preview);
+            checked(device->CreatePixelShader(code.data(),code.size(),nullptr,&hud_preview),"HUD preview shader");
+        }
         if(!upscaler) upscaler=std::make_unique<InterfaceUpscaler>(device.Get(),context.Get());
         hud_factor=factor;
     } catch(const std::exception& error) {
@@ -1207,8 +1294,14 @@ void Renderer::interface_texture(std::uint32_t id,std::uint64_t content) {
     if(!r.hud_factor || !content || id>=r.textures.size() || r.texture_dimensions[id]!=1 || r.target_images[id]) return;
     const auto [width,height]=r.texture_sizes[id];
     if(!width || !height || std::max(width,height)>1024) return;
-    r.texture_content[id]=content;
-    if(r.enlargements.contains(content) || r.upscaler->queued(content) || r.load_enlargement(content,width,height)) return;
+    auto& texture=r.hud_textures[id];
+    if(texture.content==content) return;
+    texture={content,nullptr};
+    if(const auto found=r.enlargements.find(content); found!=r.enlargements.end()) {
+        texture.art=&found->second;
+        return;
+    }
+    if(r.upscaler->queued(content) || r.load_enlargement(content,width,height)) return;
     r.upscaler->request(content,r.textures[id],width,height,r.hud_factor);
     ++r.stats.hud_requests;
 }
@@ -1228,7 +1321,7 @@ void Renderer::release_texture(std::uint32_t id) {
     r.texture_bytes -= r.uploaded_bytes.at(id);
     r.uploaded_bytes.erase(id);
     r.textures[id].Reset();
-    r.texture_content[id] = 0;
+    r.hud_textures[id] = {};
     r.free_textures.push_back(id);
 }
 std::uint32_t Renderer::upload(const TextureData& texture) {
@@ -1727,6 +1820,8 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     constants.fog = color(state.fog_color); constants.alpha[0] = float(state.alpha_reference & 255);
     constants.controls={state.combiner_control,state.final_inputs[0],state.final_inputs[1],state.alpha_test?state.alpha_function:0x207};
     std::array<ID3D11ShaderResourceView*, 12> views{};
+    std::array<ID3D11ShaderResourceView*, 4> refinements{};
+    bool preview_hud=false;
     std::array<ID3D11SamplerState*, 4> samplers{};
     for (unsigned i = 0; i < 4; ++i) {
         const auto mode=state.texture_modes[i];
@@ -1737,12 +1832,13 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
             throw std::runtime_error("Copy the active render target before sampling its contents");
         if(sampled && r.texture_dimensions[state.textures[i]]!=(mode==3?3U:mode==2?2U:1U))
             throw std::runtime_error("Texture resource dimension does not match its shader mode");
+        auto sample_flags=std::uint32_t(state.alpha_kill[i]) | (std::uint32_t(state.texture_alpha_one[i])<<1);
         if(sampled) {
             // A multisampled surface is read through its resolve.
             if(auto* image=r.target_images[state.textures[i]]; image && image->dirty) r.resolve(*image);
-            views[i+(mode==3?4:mode==2?8:0)] = r.sampled_view(state.textures[i]);
+            views[i+(mode==3?4:mode==2?8:0)] = r.sampled_view(state.textures[i],sample_flags,refinements[i]);
+            preview_hud|=(sample_flags&4u)!=0;
         }
-        const auto sample_flags=std::uint32_t(state.alpha_kill[i]) | (std::uint32_t(state.texture_alpha_one[i])<<1);
         constants.stages[i]={mode,state.texture_sources[i],state.texture_clip[i],sample_flags};
         samplers[i] = pipeline.samplers[i].Get();
     }
@@ -1810,7 +1906,8 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     const auto simple=simple_combiner(state);
     const auto layout = streams?streams->layout.native.Get():program?program->layout.Get():r.layout.Get();
     const auto vertex = program?program->vertex.Get():r.vs.Get();
-    const auto pixel = simple<r.simple_combiners.size()?r.simple_combiners[simple].Get():r.combiners[state.combiner_control&255].Get();
+    const auto pixel = preview_hud?r.hud_preview.Get():simple<r.simple_combiners.size()?
+        r.simple_combiners[simple].Get():r.combiners[state.combiner_control&255].Get();
     auto& bound = r.bound;
     if (!bound.pipeline) {
         auto program_buffer = r.program_constants.Get(), factor_buffer = r.factor_buffer.Get();
@@ -1839,6 +1936,10 @@ void Renderer::Impl::draw(const RenderState& state,Bytes vertex_bytes,std::size_
     if (!bound.pipeline || bound.textures!=views) {
         r.context->PSSetShaderResources(0,static_cast<UINT>(views.size()),views.data());
         bound.textures=views;
+    }
+    if(preview_hud || bound.hud_preview_bound) {
+        r.context->PSSetShaderResources(12,static_cast<UINT>(refinements.size()),refinements.data());
+        bound.hud_preview_bound=preview_hud;
     }
     if (bound.pipeline!=&pipeline || bound.stencil_reference!=state.stencil_reference) {
         r.context->OMSetDepthStencilState(pipeline.depth.Get(),state.stencil_reference);

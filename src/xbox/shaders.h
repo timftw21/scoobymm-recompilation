@@ -8,7 +8,8 @@ enum class ShaderKind : unsigned {
     combiner0,combiner1,combiner2,combiner3,combiner4,combiner5,combiner6,combiner7,combiner8,
     fixed0,fixed1,fixed2,fixed3,fixed4,fixed5,fixed6,vertex,launch,
     color,modulate2d,modulate_cube,modulate3d,video_overlay,blit_pixel,fxaa_pixel,line_geometry,
-    interface_classify,interface_bleed,interface_conv_first,interface_conv,interface_compose,interface_filter,count
+    interface_classify,interface_bleed,interface_conv_first,interface_conv,interface_compose,interface_filter,
+    movie_display,movie_deblock,hud_preview,count
 };
 struct ShaderBinary {Bytes bytes;bool compiled=false;bool uses_tokens=false;};
 struct StaticVertex {VertexProgram program;Bytes bytes;};

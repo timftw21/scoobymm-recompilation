@@ -7,6 +7,7 @@
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+struct ID3D11ShaderResourceView;
 
 namespace xbox_native {
 struct VideoOverlay {
@@ -18,6 +19,8 @@ struct VideoOverlay {
     } geometry;
     std::uint32_t pitch;
     Bytes pairs;
+    unsigned matte_rows{}; // Encoded black rows at each edge of a letterboxed movie.
+    unsigned movie{}; // Changes on every successful movie open, including replays.
 };
 struct Image {
     std::uint32_t width, height;
@@ -135,7 +138,9 @@ public:
     void resize(std::uint32_t width, std::uint32_t height);
     void attach_window(void* native_window);
     void display_gamma(std::span<const std::array<std::byte, 3>, 256> gamma);
-    bool display(const VideoOverlay* video = nullptr, bool widescreen = false); // Scale the completed scanout to the window.
+    // Scale the completed scanout to the window at the given width over
+    // height, or at the main target's own shape.
+    bool display(const VideoOverlay* video = nullptr, float aspect = 0);
     // Window renderers apply a request when they next display a frame. Applied
     // values are limited to what the adapter supports.
     void enhance(const RenderEnhancements&);
@@ -145,6 +150,7 @@ public:
     void present(bool vsync);
     ID3D11Device* native_device() const;
     ID3D11DeviceContext* native_context() const;
+    ID3D11ShaderResourceView* window_icon();
     void prepare(const RenderState&); // Cached D3D11 states; shaders are built ahead of time.
     std::uint32_t prepare_program(const VertexProgram&, bool launch = false);
     std::uint32_t prepare_fixed(const FixedTransform& = {});

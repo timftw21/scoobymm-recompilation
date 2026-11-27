@@ -28,6 +28,7 @@ std::string key_name(int code) {
     return name.empty() ? std::format("Key {}", code) : name;
 }
 constexpr ImVec4 success_color{.47f,.85f,.55f,1}, error_color{1,.48f,.42f,1};
+constexpr ImVec4 title_gold{1,.82f,.3f,1};
 
 // Shortens a path from its middle so its file name stays visible.
 std::string elide_path(const std::string& text, std::size_t root, float width) {
@@ -377,22 +378,27 @@ bool SettingsMenu::draw(bool playing, DiagnosticKeys& keys, bool measuring) {
     const auto area = ImGui::GetMainViewport()->WorkSize;
     bool play = false, changed = false;
     if (visible) {
-        const auto width = std::min(790.f, std::max(1.f,area.x - 16));
-        const auto height = std::min(480.f, std::max(1.f,area.y - 16));
+        const auto width = std::min(890.f, std::max(1.f,area.x - 16));
+        const auto height = std::min(540.f, std::max(1.f,area.y - 16));
         ImGui::SetNextWindowPos({area.x / 2, area.y / 2}, ImGuiCond_Always, {.5f,.5f});
         ImGui::SetNextWindowSize({width, height});
+        ImGui::PushFont(nullptr,18);
         ImGui::Begin("Mystery Mayhem settings", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove);
-        ImGui::PushFont(nullptr,22);
-        ImGui::TextColored({1,.82f,.3f,1}, "Scooby-Doo! Mystery Mayhem");
+        ImGui::PushFont(nullptr,24);
+        const float icon_size = ImGui::GetFrameHeight();
+        ImGui::Image(renderer_.window_icon(), {icon_size, icon_size});
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(title_gold, "Scooby-Doo! Mystery Mayhem");
         ImGui::PopFont();
         ImGui::Separator();
         // Display, enhancement and audio settings are in the game's Recomp Options menu.
         constexpr std::array pages{"Game Files","General","Controls","Diagnostics"};
         const float body = std::max(40.f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() - 4);
         constexpr auto child_flags = ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened;
-        ImGui::BeginChild("Navigation",{std::min(140.f,width * .28f),body}, child_flags);
+        ImGui::BeginChild("Navigation",{std::min(158.f,width * .28f),body}, child_flags);
         for (int i = 0; i < static_cast<int>(pages.size()); ++i)
-            if (ImGui::Selectable(pages[i],page_ == i,0,{0,30})) { page_ = i; capture_ = {}; }
+            if (ImGui::Selectable(pages[i],page_ == i,0,{0,34})) { page_ = i; capture_ = {}; }
         ImGui::EndChild();
         ImGui::SameLine();
         ImGui::BeginChild("Page",{0, body}, child_flags);
@@ -432,7 +438,13 @@ bool SettingsMenu::draw(bool playing, DiagnosticKeys& keys, bool measuring) {
             if (!message.empty()) ImGui::TextWrapped("%s", message.c_str());
         } catch (const std::exception& error) { message = error.what(); }
         ImGui::EndChild();
-        if (ImGui::Button(playing ? "Return to game" : "Play")) {
+        ImGui::PushStyleColor(ImGuiCol_Button, title_gold);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{1,.88f,.47f,1});
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4{.90f,.70f,.21f,1});
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{.09f,.07f,.03f,1});
+        const bool pressed = ImGui::Button(playing ? "Return to game" : "Play");
+        ImGui::PopStyleColor(4);
+        if (pressed) {
             try {
                 if (!playing) s.validate_media();
                 visible = false;
@@ -471,6 +483,7 @@ bool SettingsMenu::draw(bool playing, DiagnosticKeys& keys, bool measuring) {
         }
         confirm_dialog();
         ImGui::End();
+        ImGui::PopFont();
         if (changed) {
             renderer_.enhance(s.enhancements);
             try { s.save(file_); }

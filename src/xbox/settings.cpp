@@ -95,7 +95,13 @@ void PlayerSettings::load(const std::filesystem::path& file) {
         else if (key == "show_fps") next.show_fps = number(0, 1) != 0;
         else if (key == "muted") next.muted = number(0, 1) != 0;
         else if (key == "mute_unfocused") next.mute_unfocused = number(0, 1) != 0;
-        else if (key == "widescreen") next.widescreen = number(0, 1) != 0;
+        else if (key == "aspect_ratio") {
+            const auto found = std::ranges::find(aspect_shapes, std::string_view(value), &AspectShape::name);
+            if (found == aspect_shapes.end()) throw invalid();
+            next.aspect = AspectRatio(found - aspect_shapes.begin());
+        }
+        // Earlier releases saved a 16:9 switch.
+        else if (key == "widescreen") next.aspect = number(0, 1) ? AspectRatio::wide : AspectRatio::standard;
         else if (key == "fullscreen") next.fullscreen = number(0, 1) != 0;
         else if (key == "vsync") next.vsync = number(0, 1) != 0;
         else if (key == "skip_intro") next.skip_intro = number(0, 1) != 0;
@@ -127,7 +133,7 @@ void PlayerSettings::save(const std::filesystem::path& file) const {
         out << "xbe=" << path_text(xbe) << "\ndisc=" << path_text(disc)
             << "\nrefresh_rate=" << refresh_rate << "\nvolume=" << volume
             << "\nshow_fps=" << show_fps << "\nmuted=" << muted << "\nmute_unfocused=" << mute_unfocused
-            << "\nwidescreen=" << widescreen << "\nfullscreen=" << fullscreen << "\nvsync=" << vsync
+            << "\naspect_ratio=" << aspect_shape(aspect).name << "\nfullscreen=" << fullscreen << "\nvsync=" << vsync
             << "\nrender_scale=" << enhancements.scale << "\nmsaa=" << enhancements.samples
             << "\nfxaa=" << enhancements.fxaa << "\nanisotropy=" << enhancements.anisotropy
             << "\nupscaled_hud=" << enhancements.upscaled_hud
